@@ -70,6 +70,23 @@ def console():
         s.assert_console_clean()
 
 
+def window():
+    # marks bracket exactly what the console printed between them
+    with with_ship() as s:
+        a = s.dojo.mark()
+        out = s.dojo.run("~&  'alpha-line'  ~")
+        assert "alpha-line" in out, out
+        b = s.dojo.mark()
+        s.dojo.run("~&  'beta-line'  ~")
+        between = s.dojo.between(a, b)
+        assert "alpha-line" in between and "beta-line" not in between, between
+        assert "beta-line" in s.dojo.since(b), s.dojo.since(b)
+        assert s.dojo.grep_between(a, b, [r"alpha-line"]) and not s.dojo.grep(b, [r"alpha-line"])
+        s.dojo.assert_clean(b, [r"alpha-line"])
+        raises(lambda: s.dojo.assert_clean_between(a, b, [r"alpha-line"]), "not clean")
+        assert s.dojo.run("(add 2 2)").strip() == "4"
+
+
 def crash_caught():
     def run():
         with with_ship(crash_check=True) as s:
@@ -89,7 +106,7 @@ def crash_unwatched():
         raises(s.absolve, "no crash check")
 
 
-for check in (roles, axe, console, crash_caught, crash_absolved, crash_unwatched):
+for check in (roles, axe, console, window, crash_caught, crash_absolved, crash_unwatched):
     try:
         check()
         print(f"pass {check.__name__}", flush=True)

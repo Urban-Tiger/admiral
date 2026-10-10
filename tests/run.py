@@ -549,7 +549,7 @@ def harness(ship, name):
     return _harness[name]
 
 
-for _check in ("roles", "axe", "console", "crash_caught", "crash_absolved", "crash_unwatched"):
+for _check in ("roles", "axe", "console", "window", "crash_caught", "crash_absolved", "crash_unwatched"):
     @case("harness", _check.replace("_", "-"))
     def _(ship, c, _check=_check):
         why = harness(ship, _check)

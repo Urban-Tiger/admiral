@@ -90,7 +90,6 @@ T_COMMIT = 300  # a first build of a big desk takes minutes; a timeout aborts it
 T_RUN = 15
 T_HTTP = 3  # the status probe's GET; a dead origin must not stall the card
 T_DOJO = 60  # a dojo command's budget; past it the command is aborted, so builds need room
-T_HARNESS = 15
 T_CHOP = 900  # roll copies the snapshot into the new epoch — minutes on a big pier
 
 
@@ -3794,9 +3793,11 @@ def cmd_help(name: str | None = None) -> None:
 # Wrap a test in with_ship (authed) or with_anon (no login); both launch a browser,
 # build the helper `s`, and always tear the browser down. The `s` object exposes raw
 # Playwright handles (s.page/ctx/browser), s.goto/shot/post/assert_no_page_errors,
-# and s.dojo to read the ship's dojo pane (run/tail/mark/since/runlog/grep/
+# and s.dojo to drive and read the ship's console (run/tail/mark/since/runlog/grep/
 # assert_clean) — assert frontend with locators, backend with s.dojo.since(mark)
-# against a marker dropped before the action.
+# against a mark taken before the action. A mark is the daemon ring's byte watermark
+# (see ring_mark): free to take, nothing typed into the dojo, and the window it opens
+# is exactly the bytes the console printed after it.
 #
 #   screen reader   s.by_role / click_role / fill_role / expect_name / a11y_tree,
 #                   s.assert_a11y (axe-core, needs network)
@@ -3824,128 +3825,89 @@ def argv_flag(name: str) -> str | None:
     return sys.argv[i + 1] if i + 1 < len(sys.argv) else None
 
 
-def run_dojo(ship: Ship, cmd: str, timeout_secs: int | None = None) -> str:
-    # run a dojo command synchronously by re-invoking ourselves as `<ship> dojo`.
-    #
-    # `--` before CMD, always. Every urbit thread is named -<thread>, so without it
-    # `run("-time ~s5")` dies in the ARGUMENT PARSER with "Unknown flag: -time" and
-    # never reaches the ship — a failure the test then reads as a dojo fault.
-    #
-    # The outer timeout is a backstop, not the budget: dojo_one owns the real deadline
-    # and can legitimately spend accept + run, so only a wedged ssh or a hung daemon
-    # should ever trip this. Without it a test hangs forever instead of failing.
-    t = timeout_secs if timeout_secs is not None else T_DOJO
-    r = subprocess.run([sys.executable, str(SELF), ship.name, "dojo", "-t", str(t), "--", cmd],
-                       capture_output=True, text=True, cwd=str(REPO), timeout=2 * t + 30)
-    if r.returncode != 0:
-        raise RuntimeError(f"dojo failed: {(r.stderr or r.stdout or '').strip()}")
-    return r.stdout
-
-
 def harness_capture(ship: Ship, cfg: Config, lines: int = 200) -> str:
     host = host_for(ship, cfg)
     return tail_n(capture_pane(host, ship, LINE_BYTES * lines).rstrip("\n"), lines)
 
 
 class Dojo:
+    # the ship's console, for a test: run commands, and read what the console printed
+    # between two marks. Marks are ring watermarks, so a window is a byte range of the
+    # raw pty stream rendered through the same terminal emulator `slog` uses — a
+    # concurrent writer's output lands in the window only if it printed inside it.
     def __init__(self, ship: Ship, cfg: Config):
         self.ship = ship
         self.cfg = cfg
-        self._mark_n = 0
-        self.run_mark = ""
+        self.host = host_for(ship, cfg)
+        self.run_mark: int | None = None
 
     def run(self, cmd: str, timeout_secs: int | None = None) -> str:
-        return run_dojo(self.ship, cmd, timeout_secs)
+        # type cmd into the dojo and return its transcript (the result, then every line
+        # the ship printed while it ran). `-name` threads need no `--`: nothing parses
+        # this as a flag.
+        return dojo_one(self.ship, cmd, self.cfg, timeout=timeout_secs or T_DOJO, log=lambda m: None)
 
     def tail(self, n: int = 40) -> str:
         return "\n".join(harness_capture(self.ship, self.cfg, n).rstrip("\n").split("\n")[-n:])
 
-    def mark(self) -> str:
-        mid = f"HARNESS-{os.getpid()}-{self._mark_n}-{int(time.time() * 1000)}"
-        self._mark_n += 1
-        run_dojo(self.ship, f"'{mid}'", T_HARNESS)
-        # the first mark a test places doubles as the run-start mark, so a later
-        # runlog()/grep() captures from here without a second round-trip.
-        if not self.run_mark:
-            self.run_mark = mid
-        return mid
+    def mark(self) -> int:
+        # the console's current byte watermark. Costs one socket ping; the first one a
+        # test takes doubles as the run-start mark runlog()/grep() read from.
+        total = ring_mark(self.host, self.ship)
+        if total < 0:
+            raise RuntimeError(f'ship "{self.ship.name}" runs a daemon too old for watermarked '
+                               f"capture — `{INVOKE} {self.ship.name} engine-upgrade`")
+        if self.run_mark is None:
+            self.run_mark = total
+        return total
 
-    def since(self, mid: str, n: int = 5000) -> str:
-        txt = harness_capture(self.ship, self.cfg, n)
-        i = txt.rfind(mid)
-        return txt if i < 0 else txt[i + len(mid):]
+    def _raw(self, mark: int) -> str:
+        # raw pty bytes past `mark`. The ring holds the last RING_MAX bytes, so a mark
+        # older than that is gone for good: a hard error, never a silently shorter window.
+        total, raw = capture_at(self.host, self.ship, mark)
+        if total - mark > RING_MAX:
+            raise RuntimeError(f"dojo mark {mark} is {total - mark} bytes back; the daemon's "
+                               f"{RING_MAX // (1024 * 1024)}MB ring no longer holds it — read "
+                               f"`{INVOKE} {self.ship.name} slog` instead, or mark closer to the action")
+        return raw
 
-    def runlog(self, n: int = 5000) -> str:
-        # lazy: the run-start mark is a dojo round-trip, so only pay for it the
-        # first time a test actually reads the ambient log. A browser-only test
-        # never calls runlog/grep and so never touches the dojo at setup.
-        if not self.run_mark:
-            self.run_mark = self.mark()
-        return self.since(self.run_mark, n)
+    def since(self, mark: int) -> str:
+        # everything the console printed after `mark`, rendered
+        return render_transcript(self._raw(mark))
 
-    def grep(self, mark: str | None, patterns: list[Pattern], n: int = 5000) -> list[str]:
-        hay = self.since(mark, n) if mark else self.runlog(n)
+    def between(self, start: int, end: int) -> str:
+        # what the console printed between two marks: the start window minus its tail
+        # past `end`. Output a concurrent writer adds after `end` is excluded, so the
+        # bracket a test draws around its own action stays its own.
+        if end < start:
+            raise RuntimeError(f"dojo between: end mark {end} precedes start mark {start}")
+        head, tail = self._raw(start), self._raw(end)
+        return render_transcript(head[:len(head) - len(tail)] if tail else head)
+
+    def runlog(self) -> str:
+        # the console since the first mark this test took (taken now if it never did)
+        if self.run_mark is None:
+            self.mark()
+        return self.since(self.run_mark)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _hits(hay: str, patterns: list[Pattern]) -> list[str]:
         pats = [re.compile(p) if isinstance(p, str) else p for p in patterns]
         return [l for l in hay.split("\n") if any(p.search(l) for p in pats)]
 
-    # ── bracketed capture ────────────────────────────────────────────────────
-    # `since`/`grep` take a single START mark and read to the end of the ring, so
-    # under a CONCURRENT dojo writer (another agent spamming the pane) two things
-    # break: (1) trailing spam after our output bloats the window, and (2) if the
-    # ~4000-line ring evicts the start mark, `rfind` returns -1 and `since`
-    # silently hands back the WHOLE buffer (pure spam) — a false miss, no error.
-    #
-    # `between` brackets the window with BOTH a start and an end sentinel and
-    # reads only the slice between them, so interleaved spam outside the bracket
-    # is excluded and an evicted sentinel is a hard error, not a silent miss.
-    # Pair with `mark()` before and after the dojo work, then capture promptly:
-    #
-    #       a = s.dojo.mark()
-    #       ... clicks / s.dojo.run(...) ...
-    #       b = s.dojo.mark()
-    #       hits = s.dojo.grep_between(a, b, [r"dong!", r"ding!"])
-    def between(self, start: str, end: str, n: int = 5000, tries: int = 4) -> str:
-        # a capture taken mid-burst (a concurrent writer streaming into the pane)
-        # can render torn — the end sentinel not yet flushed, or the snapshot
-        # caught between cursor moves. Re-capture a few times to ride out the
-        # burst into the next lull. The start sentinel, once evicted from the ring,
-        # is gone for good (oldest bytes drop first), so a missing START is a hard
-        # error immediately; only a missing END is worth retrying.
-        for attempt in range(tries):
-            txt = harness_capture(self.ship, self.cfg, n)
-            i = txt.find(start)
-            if i < 0:
-                raise RuntimeError(
-                    f"dojo start sentinel {start!r} not in the captured window — "
-                    "either it scrolled out of the ring, or it fell outside the "
-                    f"{LINE_BYTES}-bytes-per-line tail this capture rendered "
-                    f"(n={n}). Shrink the bracket (fewer/cheaper ops between the "
-                    "two mark() calls) or raise n.")
-            i += len(start)
-            j = txt.find(end, i)
-            if j >= 0:
-                return txt[i:j]
-            if attempt < tries - 1:
-                time.sleep(1)
-        raise RuntimeError(
-            f"dojo end sentinel {end!r} not found after the start sentinel in "
-            f"{tries} captures — end mark never printed (did mark() run after the "
-            "action?), or the pane never settled")
+    def grep(self, mark: int | None, patterns: list[Pattern]) -> list[str]:
+        return self._hits(self.since(mark) if mark is not None else self.runlog(), patterns)
 
-    def grep_between(self, start: str, end: str, patterns: list[Pattern],
-                     n: int = 5000) -> list[str]:
-        hay = self.between(start, end, n)
-        pats = [re.compile(p) if isinstance(p, str) else p for p in patterns]
-        return [l for l in hay.split("\n") if any(p.search(l) for p in pats)]
+    def grep_between(self, start: int, end: int, patterns: list[Pattern]) -> list[str]:
+        return self._hits(self.between(start, end), patterns)
 
-    def assert_clean_between(self, start: str, end: str,
-                             patterns: list[Pattern], n: int = 5000) -> None:
-        hits = self.grep_between(start, end, patterns, n)
+    def assert_clean(self, mark: int | None, patterns: list[Pattern]) -> None:
+        hits = self.grep(mark, patterns)
         if hits:
             raise RuntimeError("dojo not clean:\n" + "\n".join(hits))
 
-    def assert_clean(self, mark: str | None, patterns: list[Pattern], n: int = 5000) -> None:
-        hits = self.grep(mark, patterns, n)
+    def assert_clean_between(self, start: int, end: int, patterns: list[Pattern]) -> None:
+        hits = self.grep_between(start, end, patterns)
         if hits:
             raise RuntimeError("dojo not clean:\n" + "\n".join(hits))
 
@@ -3998,7 +3960,7 @@ class Harness:
         self.console_benign = CONSOLE_BENIGN
         self.console_blame: dict[str, tuple[str, ...]] = {}
         self.console_fatal: set[str] | None = None  # None: every kind fails
-        self._crash_mark: str | None = None
+        self._crash_mark: int | None = None
         self._crash_patterns: list[Pattern] = []
         page.on("pageerror", self._on_pageerror)
         page.on("console", self._on_console)
@@ -4243,9 +4205,8 @@ def setup(*, ship: str | None = None, auth: bool = True, base: str | None = None
         page.on("console", lambda m: print("[console]", m.text))
     if auth:
         _login(ctx, base, code)
-    # run_mark (the start marker scoping runlog()) is set lazily on first
-    # runlog/grep call — see Dojo.runlog. Setup itself never hits the dojo when
-    # the `code` override is set, so a browser-only test stays sub-second.
+    # setup never types into the dojo: the code override skips the +code read, and a
+    # mark is a socket ping, so a browser-only test stays sub-second.
     return h
 
 

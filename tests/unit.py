@@ -491,6 +491,56 @@ class Upsert(unittest.TestCase):
                                 "mnemonic": "a b"})
 
 
+class HarnessDojo(unittest.TestCase):
+    # Dojo windows over a simulated daemon ring: capture_at and ring_mark are swapped
+    # for fakes that serve a growing byte stream, so marks and slices can be checked
+    # exactly without a ship
+    def setUp(self):
+        self.stream = ""
+        self.saved = (A.ring_mark, A.capture_at)
+        A.ring_mark = lambda h, s: len(self.stream)
+        A.capture_at = lambda h, s, off: (len(self.stream), self.stream[max(off, len(self.stream) - A.RING_MAX):])
+        cfg = A.Config([A.Ship("zod", A.PierConfig())], [], {})
+        self.d = A.Dojo(cfg.ships[0], cfg)
+
+    def tearDown(self):
+        A.ring_mark, A.capture_at = self.saved
+
+    def test_windows(self):
+        # the dojo paints its prompt, and output arrives on fresh rows after it
+        self.stream += "~zod:dojo> "
+        a = self.d.mark()
+        self.assertEqual(self.d.run_mark, a)
+        self.stream += "\r\nalpha\r\n~zod:dojo> "
+        b = self.d.mark()
+        self.stream += "\r\nbeta\r\n~zod:dojo> "
+        self.assertIn("alpha", self.d.since(a))
+        self.assertIn("beta", self.d.since(a))
+        self.assertNotIn("alpha", self.d.since(b))
+        between = self.d.between(a, b)
+        self.assertIn("alpha", between)
+        self.assertNotIn("beta", between)
+        self.assertEqual(self.d.grep_between(a, b, [r"alp"]), ["alpha"])
+        self.assertEqual(self.d.grep(None, [r"bet"]), ["beta"])  # runlog: from the first mark
+        self.d.assert_clean(b, [r"alpha"])
+        with self.assertRaises(RuntimeError):
+            self.d.assert_clean_between(a, b, [r"alpha"])
+        with self.assertRaises(RuntimeError):
+            self.d.between(b, a)
+
+    def test_evicted_mark_is_an_error(self):
+        a = self.d.mark()
+        self.stream += "x" * (A.RING_MAX + 10)
+        with self.assertRaises(RuntimeError) as cm:
+            self.d.since(a)
+        self.assertIn("no longer holds it", str(cm.exception))
+
+    def test_legacy_daemon_refused(self):
+        A.ring_mark = lambda h, s: A.RING_NOMARK
+        with self.assertRaises(RuntimeError):
+            self.d.mark()
+
+
 class RcBlocks(unittest.TestCase):
     def test_write_strip_remove(self):
         with tempfile.TemporaryDirectory() as d:

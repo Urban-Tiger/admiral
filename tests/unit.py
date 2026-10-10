@@ -27,8 +27,8 @@ def cmd(flags=(), positionals=()):
 
 class FakeHost(A.Host):
     # a Host whose exec answers from a canned table instead of running anything
-    def __init__(self, answers=None):
-        super().__init__("fake", "/root", "fake@box")
+    def __init__(self, answers=None, ssh="fake@box"):
+        super().__init__("fake", "/root", ssh)
         self.answers = answers or {}
         self.calls = []
 
@@ -186,10 +186,10 @@ class Render(unittest.TestCase):
     def test_sizes_and_versions(self):
         self.assertEqual(A.print_size(512 * 1024), "512 MB")
         self.assertEqual(A.print_size(3 * 1024 * 1024), "3.0 GB")
-        self.assertEqual(A.version_status(None), ("-", "down"))
-        self.assertEqual(A.version_status((1, 2, None)), ("legacy", "stale"))
-        self.assertEqual(A.version_status((1, 2, A.VERSION)), (A.VERSION, "current"))
-        self.assertEqual(A.version_status((1, 2, "0.0.1")), ("0.0.1", "stale"))
+        self.assertEqual(A.version_status(None, False), ("-", "down"))
+        self.assertEqual(A.version_status(None, True), ("legacy", "stale"))
+        self.assertEqual(A.version_status(A.VERSION, True), (A.VERSION, "current"))
+        self.assertEqual(A.version_status("0.0.1", True), ("0.0.1", "stale"))
 
     def test_parse_since(self):
         self.assertEqual(A.parse_since("5m"), 300)
@@ -275,6 +275,60 @@ class Engine(unittest.TestCase):
         self.assertEqual(A.IDX.size, 16)
         off, t = A.IDX.unpack(A.IDX.pack(42, 1.5))
         self.assertEqual((off, t), (42, 1.5))
+
+    def test_pty_read_parses_header_and_index(self):
+        ship = A.Ship("zod", A.PierConfig(path="p"))
+        host = FakeHost({"python3": "77 900 2\n0 1.5\n400 2.5\nraw\nbytes"}, ssh=None)
+        self.assertEqual(A.pty_read(host, ship, 0), (77, 900, [(0, 1.5), (400, 2.5)], "raw\nbytes"))
+        self.assertEqual(A.pty_read(FakeHost({"python3": "0 0 0\n"}, ssh=None), ship, 0), (0, 0, [], ""))
+        self.assertEqual(A.pty_read(FakeHost(ssh=None), ship, 0), (0, 0, [], ""))
+
+    def test_report_routes_streams(self):
+        import contextlib
+        results = [A.FanResult("a", True, "note", value="out\n"), A.FanResult("b", False, "", err="boom"),
+                   A.FanResult("c", True, "", value="")]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = A.report(results, header=sys.stdout)
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), "=== ship: a ===\nout\n=== ship: b ===\n=== ship: c ===\n")
+        self.assertEqual(err.getvalue(), "note\nboom\n")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(A.report(results[:1]), 0)
+        self.assertEqual((out.getvalue(), err.getvalue()), ("out\n", "note\n"))
+
+    def test_vere_argv(self):
+        ship = A.Ship("zod", A.PierConfig(path="/p"))
+        self.assertEqual(A.vere_argv(ship, FakeHost({"test": OSError()}), "roll", "--loom", "31"),
+                         ["urbit", "roll", "--loom", "31", "/p"])
+        self.assertEqual(A.vere_argv(ship, FakeHost({"test": ""}), "next"), ["/p/.run", "next"])
+
+    def test_offline_restarts_after_failure(self):
+        # a failing op still restarts the ship, and the error says so
+        calls = []
+        ship = A.Ship("zod", A.PierConfig(path="/p"))
+        host = FakeHost(ssh=None)
+        saved = (A.pier_exists, A.daemon_status, A.daemon_stop, A.daemon_start, A.assert_port_match)
+        try:
+            A.pier_exists = lambda h, s: True
+            A.daemon_status = lambda h, s: (1, 2, A.VERSION)
+            A.assert_port_match = lambda h, s, st: None
+            A.daemon_stop = lambda s, h: calls.append("stop") or True
+            A.daemon_start = lambda s, h: calls.append("start") or (3, 4, A.VERSION)
+
+            def op():
+                calls.append("op")
+                raise RuntimeError("disk full")
+            with self.assertRaises(RuntimeError) as cm:
+                A.offline(ship, host, calls.append, "chop", False, op)
+            self.assertIn("chop failed, restarted (daemon 3 child 4): disk full", str(cm.exception))
+            self.assertEqual([c for c in calls if c in ("stop", "op", "start")], ["stop", "op", "start"])
+            calls.clear()
+            self.assertEqual(A.offline(ship, host, calls.append, "next", True, lambda: "ok"), "ok")
+            self.assertNotIn("start", calls)
+        finally:
+            A.pier_exists, A.daemon_status, A.daemon_stop, A.daemon_start, A.assert_port_match = saved
 
     def test_running_http_port(self):
         host = FakeHost({"ps": "/p/.run --loom 31 --http-port 8080 /p\n"})

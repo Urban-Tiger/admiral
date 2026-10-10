@@ -697,7 +697,7 @@ def cook_pty(raw: str, stamps: list[tuple[int, float]], base: int) -> list[str]:
 
     def emit(rows: list[str], when: float) -> None:
         for r in rows:
-            text = _PROMPT_RE.sub("", r).rstrip()
+            text = PROMPT_PREFIX.sub("", r).rstrip()
             if text:  # blank + prompt-only redraw rows carry nothing
                 out.append(f"{fmt_stamp(when)}\t{text}")
 
@@ -717,7 +717,25 @@ def fmt_stamp(t: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t)) + f".{int(t % 1 * 1000):03d}"
 
 
-_PROMPT_RE = re.compile(r"^~[a-z-]+:dojo> ?")
+PROMPT_PREFIX = re.compile(r"^(?:~[a-z][a-z0-9-]*:dojo[^ >]*> ?)+")  # strip leading prompt paint(s)
+
+
+def pty_read(host: Host, ship: Ship, offset: int) -> tuple[int, int, list[tuple[int, float]], str]:
+    # one `__pty-read`: (inode, size, [(offset, time)] index records, raw bytes past
+    # `offset`). inode 0 means no `.pty` on the host — a daemon predating the tee, or a
+    # ship never booted under one.
+    out = eng(host, ship, "__pty-read", str(offset), check=False)
+    head, _, body = out.partition("\n")
+    parts = head.split()
+    if len(parts) != 3:
+        return (0, 0, [], "")
+    ino, size, nrecs = (int(x) for x in parts)
+    stamps: list[tuple[int, float]] = []
+    for _ in range(nrecs):
+        line, _, body = body.partition("\n")
+        o, _, w = line.partition(" ")
+        stamps.append((int(o), float(w)))
+    return (ino, size, stamps, body)
 
 
 def console_sync(host: Host, ship: Ship, rebuild: bool = False,
@@ -741,13 +759,7 @@ def console_sync(host: Host, ship: Ship, rebuild: bool = False,
     if rebuild or not have_mark:
         log.unlink(missing_ok=True)
 
-    out = eng(host, ship, "__pty-read", str(offset), check=False)
-    head, _, body = out.partition("\n")
-    parts = head.split()
-    if len(parts) != 3:
-        raise RuntimeError("no console log on this ship — its daemon predates the pty "
-                           f"tee (v{CONSOLE_MIN_VERSION}). run: admiral {ship.name} engine-upgrade")
-    cur_ino, size, nrecs = int(parts[0]), int(parts[1]), int(parts[2])
+    cur_ino, size, stamps, body = pty_read(host, ship, offset)
     if cur_ino == 0:
         raise RuntimeError("no console log on this ship — its daemon predates the pty "
                            f"tee (v{CONSOLE_MIN_VERSION}). run: admiral {ship.name} engine-upgrade")
@@ -759,10 +771,7 @@ def console_sync(host: Host, ship: Ship, rebuild: bool = False,
     if inode and cur_ino != inode:
         offset = 0
         log.unlink(missing_ok=True)
-        out = eng(host, ship, "__pty-read", "0", check=False)
-        head, _, body = out.partition("\n")
-        parts = head.split()
-        cur_ino, size, nrecs = int(parts[0]), int(parts[1]), int(parts[2])
+        cur_ino, size, stamps, body = pty_read(host, ship, 0)
 
     # a first cook with a big backlog: seed from the tail rather than hang (see
     # CONSOLE_SEED_MAX). Never on --rebuild — that is the command whose entire job is to
@@ -774,16 +783,8 @@ def console_sync(host: Host, ship: Ship, rebuild: bool = False,
              f"({(size - CONSOLE_SEED_MAX) // 1024}KB of older output skipped — "
              f"`slog --rebuild` cooks all of it)")
         offset = seed
-        out = eng(host, ship, "__pty-read", str(seed), check=False)
-        head, _, body = out.partition("\n")
-        parts = head.split()
-        cur_ino, size, nrecs = int(parts[0]), int(parts[1]), int(parts[2])
+        cur_ino, size, stamps, body = pty_read(host, ship, seed)
 
-    stamps: list[tuple[int, float]] = []
-    for _ in range(nrecs):
-        line, _, body = body.partition("\n")
-        o, _, w = line.partition(" ")
-        stamps.append((int(o), float(w)))
     if not body:
         return log
     # Only cook up to the last newline: a chunk can split an escape sequence, and half a
@@ -1026,6 +1027,12 @@ def running_http_port(host: Host, pid: int) -> tuple[bool, int | None]:
     return (True, int(m.group(1)) if m else None)
 
 
+def misconfig_brief(ship: Ship, actual: int | None) -> str:
+    # the status/info line for a running ship whose live port is not this config's
+    return (f"running on port {shown_port(actual)}, not {shown_port(ship.pier.port)} "
+            f"— another {CONFIG} owns this pier")
+
+
 def misconfig_msg(ship: Ship, actual: int | None) -> str:
     return (
         f'ship "{ship.name}" is misconfigured: it is running on --http-port '
@@ -1223,7 +1230,6 @@ def pending_deletes(ship: Ship, desk: Desk, cfg: Config) -> list[str]:
 
 
 # ── dojo driver: drive one dojo pane (host-routed) ────────────────────────────
-DOJO_PROMPT_RE = re.compile(r":dojo[^>]*>\s*$")  # a live dojo prompt at end of line
 DOJO_INPUT_MAX = 1000  # the pty drops a line's keystrokes past byte 1023 (measured)
 DOJO_OUTPUT_MAX = 400  # transcript lines `dojo` prints; slog keeps every one
 DOJO_RENDER_MAX = 512 * 1024  # transcript bytes pyte renders; the rest is regex-cleaned
@@ -1458,8 +1464,6 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
         sync_thread = threading.Thread(target=_do_sync)
         sync_thread.start()
 
-    prompt = re.compile(r"^(?:~[a-z][a-z0-9-]*:dojo[^ >]*> ?)+")
-
     if ring_mark(host, ship) < 0:
         # a daemon predating C_CAPTURE_AT answers every capture with the WHOLE ring under
         # a RING_NOMARK total, and every invariant below breaks at once. Refuse plainly
@@ -1495,7 +1499,7 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
             now = time.monotonic()
             if total != last_total:
                 last_total, last_change = total, now
-            rows = [prompt.sub("", l).rstrip() for l in _regex_clean(SPINNER.sub("", raw)).split("\n")]
+            rows = [PROMPT_PREFIX.sub("", l).rstrip() for l in _regex_clean(SPINNER.sub("", raw)).split("\n")]
             if any(r == echo for r in rows):
                 accepted = True
                 break
@@ -1554,7 +1558,7 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
             # the drive itself put there. Input-row paints of the command (whole or
             # partial, from typing and resends) can only sit BEFORE the commit echo —
             # after it, an identical row is real output (`[1 2 3]` prints itself).
-            stripped = [prompt.sub("", l).rstrip() for l in text.split("\n")]
+            stripped = [PROMPT_PREFIX.sub("", l).rstrip() for l in text.split("\n")]
             echo_i = next((i for i, s in enumerate(stripped) if s == echo), -1)
             out = []
             for i, s in enumerate(stripped):
@@ -1677,17 +1681,22 @@ def fan_exit(results: list[FanResult]) -> int:
     return 1 if any(not r.ok for r in results) else 0
 
 
-def report_dojo(results: list[FanResult]) -> int:
-    # status log -> stderr, command output -> stdout. returns the exit code.
+def report(results: list[FanResult], header: Any = None) -> int:
+    # the one printer for a fanned command: status log + errors -> stderr, each ship's
+    # output -> stdout. With several ships a `=== ship: x ===` line precedes each; it
+    # goes to `header` (stderr by default, so stdout stays the bare output; slog and
+    # capture put it on stdout so a grep over many ships keeps its labels). Returns the
+    # exit code.
+    header = header or sys.stderr
     many = len(results) > 1
     for r in results:
         if many:
-            sys.stderr.write(f"=== ship: {r.ship} ===\n")
+            header.write(f"=== ship: {r.ship} ===\n")
         err = "\n".join(x for x in [r.log, "" if r.ok else (r.err or "")] if x)
         if err:
             sys.stderr.write(err + "\n")
         if r.ok and r.value:
-            sys.stdout.write(r.value + "\n")
+            sys.stdout.write(r.value.rstrip("\n") + "\n")
     return fan_exit(results)
 
 
@@ -1729,7 +1738,7 @@ def probe_ship(ship: Ship, cfg: Config, host: Host, probe: bool = False) -> Ship
     pane = len(pane_text.strip()) > 0
     nonblank = [l for l in pane_text.split("\n") if l.strip()]
     last = nonblank[-1] if nonblank else ""
-    dojo = bool(DOJO_PROMPT_RE.search(last))
+    dojo = bool(PROMPT_ROW.match(last.strip()))
     pier = pier_exists(host, ship)
 
     responsive: bool | None = None
@@ -1887,7 +1896,7 @@ def cmd_dojo(a: Parsed) -> None:
     def work(ship, host, log):
         return truncate_output(dojo_one(ship, command, a.cfg, timeout=timeout, log=log, yes=yes), ship)
 
-    sys.exit(report_dojo(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
 
 COMMIT_ERROR = re.compile(r"^(crud: |syntax error|bail: |-find\.|-mint|nest-fail|mint-|"
@@ -1974,7 +1983,7 @@ def cmd_commit(a: Parsed) -> None:
 def cmd_code(a: Parsed) -> None:
     results = fan(select_ships(a.selector, a.cfg), a.cfg,
                   lambda ship, host, log: fetch_code(ship, a.cfg, log))
-    sys.exit(report_dojo(results))
+    sys.exit(report(results))
 
 
 def cmd_exec(a: Parsed) -> None:
@@ -1990,7 +1999,7 @@ def cmd_exec(a: Parsed) -> None:
         return host.exec("sh", ["-c", cmd], timeout_ms=timeout * 1000).rstrip("\n")
 
     results = fan(select_ships(a.selector, a.cfg), a.cfg, work)
-    sys.exit(report_dojo(results))
+    sys.exit(report(results))
 
 
 def cmd_slog(a: Parsed) -> None:
@@ -2011,11 +2020,7 @@ def cmd_slog(a: Parsed) -> None:
 
     def work(ship, host, log):
         if raw:
-            out = eng(host, ship, "__pty-read", "0", check=False)
-            head, _, body = out.partition("\n")
-            for _ in range(int(head.split()[2]) if len(head.split()) == 3 else 0):
-                _, _, body = body.partition("\n")
-            return body
+            return pty_read(host, ship, 0)[3]
         path = console_sync(host, ship, rebuild=rebuild)
         text = path.read_text(errors="replace") if path.exists() else ""
         if since:
@@ -2030,16 +2035,7 @@ def cmd_slog(a: Parsed) -> None:
 
     if follow:
         return slog_follow(a, work)
-    results = fan(select_ships(a.selector, a.cfg), a.cfg, work)
-    many = len(results) > 1
-    for r in results:
-        if many:
-            sys.stdout.write(f"=== ship: {r.ship} ===\n")
-        if r.ok and r.value is not None:
-            sys.stdout.write(r.value.rstrip("\n") + "\n")
-        elif not r.ok:
-            sys.stderr.write(f"{r.ship}: {r.err}\n")
-    sys.exit(fan_exit(results))
+    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work), header=sys.stdout))
 
 
 def parse_since(s: str) -> float:
@@ -2085,16 +2081,7 @@ def cmd_capture(a: Parsed) -> None:
             return tail_n(capture_pane(host, ship, LINE_BYTES * nlines).rstrip("\n"), nlines)
         return capture_pane(host, ship)  # the daemon's whole scrollback ring buffer
 
-    results = fan(select_ships(a.selector, a.cfg), a.cfg, work)
-    many = len(results) > 1
-    for r in results:
-        if many:
-            sys.stdout.write(f"=== ship: {r.ship} ===\n")
-        if r.ok and r.value is not None:
-            sys.stdout.write(r.value.rstrip("\n") + "\n")
-        elif not r.ok:
-            sys.stderr.write(f"{r.ship}: {r.err}\n")
-    sys.exit(fan_exit(results))
+    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work), header=sys.stdout))
 
 
 def cmd_status(a: Parsed) -> None:
@@ -2117,13 +2104,11 @@ def print_status(ships: list[Ship], results: list[FanResult], cfg: Config) -> No
 
     def ver_cell(v: ShipState) -> str:
         # version baked into the running daemon vs this control file's VERSION.
-        if not v.daemon:
+        running, status = version_status(v.version, v.daemon)
+        if status == "down":
             return paint("-", "red", on)
-        if v.version is None:
-            return paint("legacy (stale)", "yellow", on)
-        cur = v.version == VERSION
-        return paint(f"v{v.version} ({'current' if cur else 'stale'})",
-                     "green" if cur else "yellow", on)
+        label = running if running == "legacy" else f"v{running}"
+        return paint(f"{label} ({status})", "green" if status == "current" else "yellow", on)
 
     namew = max((len(s.name) for s in ships), default=0)
     statew = max((len(r.value.verdict) for r in results if r.ok and r.value),
@@ -2149,9 +2134,7 @@ def print_status(ships: list[Ship], results: list[FanResult], cfg: Config) -> No
         out.append(f"    {signals}")
         out.append(f"    host {host_cell}   pier {pier}   code {code}")
         if v and v.misconfigured:
-            out.append("    " + paint(
-                f"↳ running on port {shown_port(v.running_port)}, not {shown_port(ship.pier.port)} "
-                f"— another {CONFIG} owns this pier", "red", on))
+            out.append("    " + paint("↳ " + misconfig_brief(ship, v.running_port), "red", on))
         out.append("")
     sys.stdout.write("\n".join(out) + "\n")
 
@@ -2212,9 +2195,7 @@ def cmd_info(a: Parsed) -> None:
         ("web", sig(st.http, on)),
     ]
     if st.misconfigured:
-        rows.append(("misconfig", paint(
-            f"running on port {shown_port(st.running_port)}, but {CONFIG} says {shown_port(ship.pier.port)} "
-            f"— another config owns this pier", "red", on)))
+        rows.append(("misconfig", paint(misconfig_brief(ship, st.running_port), "red", on)))
     w = max(len(k) for k, _ in rows)
     for k, v in rows:
         if not k and not v:
@@ -2327,7 +2308,7 @@ def cmd_run(a: Parsed) -> None:
         st = daemon_start(ship, host)
         return f"running (daemon {st[0]} child {st[1]})"
 
-    sys.exit(report_dojo(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
 
 def cmd_exit(a: Parsed) -> None:
@@ -2341,7 +2322,7 @@ def cmd_exit(a: Parsed) -> None:
         eng(host, ship, "__kill", check=False)
         return "exited"
 
-    sys.exit(report_dojo(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
 
 def cmd_version(a: Parsed) -> None:
@@ -2364,14 +2345,14 @@ def cmd_version(a: Parsed) -> None:
     sys.exit(fan_exit(results))
 
 
-def version_status(st: tuple[int, int, str | None] | None) -> tuple[str, str]:
-    # (running, status) cells for one ship's daemon_status. status is one of
-    # current / stale / down, where a pre-versioning daemon reports as "legacy".
-    if st is None:
+def version_status(version: str | None, up: bool) -> tuple[str, str]:
+    # (running, status) for a ship's daemon engine. status is one of current / stale /
+    # down, where a pre-versioning daemon (no version in its pong) reports as "legacy".
+    if not up:
         return ("-", "down")
-    if st[2] is None:
+    if version is None:
         return ("legacy", "stale")
-    return (st[2], "current" if st[2] == VERSION else "stale")
+    return (version, "current" if version == VERSION else "stale")
 
 
 def print_versions(results: list[FanResult]) -> None:
@@ -2383,7 +2364,7 @@ def print_versions(results: list[FanResult]) -> None:
             rows.append([r.ship, "?", VERSION, f"error: {r.err or ''}", "?", "?"])
             continue
         st, vere, kelvin = r.value
-        running, status = version_status(st)
+        running, status = version_status(st[2] if st else None, st is not None)
         rows.append([r.ship, running, VERSION, status, vere, kelvin])
 
     def cell(s: str) -> str:
@@ -2434,7 +2415,7 @@ def cmd_engine_upgrade(a: Parsed) -> None:
         now = daemon_start(ship, host)
         return f"upgraded {old} -> v{VERSION} via restart (daemon {now[0]} child {now[1]})"
 
-    sys.exit(report_dojo(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
 
 def event_log_dir(ship: Ship, host: Host) -> str:
@@ -2469,6 +2450,48 @@ def log_size_kb(host: Host, ship: Ship) -> int:
     return du_kb(host, [event_log_dir(ship, host)])[0]
 
 
+def vere_argv(ship: Ship, host: Host, verb: str, *extra: str) -> list[str]:
+    # an offline vere utility (roll / chop / next) against the pier. A docked
+    # <pier>/.run self-locates its pier and rejects an explicit one ("invalid
+    # command"); only a bare `urbit` needs the pier argument.
+    binary = vere_binary(ship, host)
+    target = [] if binary != "urbit" else [pier_dir(ship, host)]
+    return [binary, verb, *extra, *target]
+
+
+def offline(ship: Ship, host: Host, log: Callable[[str], None], what: str,
+            stay_down: bool, op: Callable[[], str]) -> str:
+    # run `op` with the pier offline: stop a running ship first (its lock keeps vere's
+    # utilities out), restart it afterward even when op raised, unless --stay-down or it
+    # was already down. Returns op's one-line result with the restart appended; a
+    # failure raises with the same suffix, so the message always says where the ship
+    # was left.
+    if not pier_exists(host, ship):
+        raise RuntimeError(f"no pier at {pier_dir(ship, host)} — nothing to {what}")
+    st = daemon_status(host, ship)
+    if st:
+        assert_port_match(host, ship, st)
+    was_running = st is not None
+    if was_running:
+        log(f"stopping for {what}")
+        if not daemon_stop(ship, host):
+            raise RuntimeError(f"ship did not shut down for {what} — try `{INVOKE} {ship.name} exit`, then rerun")
+    failure: Exception | None = None
+    result = ""
+    try:
+        result = op()
+    except Exception as e:
+        failure = e
+    restarted = ""
+    if was_running and not stay_down:
+        log("restarting")
+        now = daemon_start(ship, host)
+        restarted = f", restarted (daemon {now[0]} child {now[1]})"
+    if failure is not None:
+        raise RuntimeError(f"{what} failed{restarted or ' — ship left down'}: {failure}")
+    return result + restarted
+
+
 def cmd_chop(a: Parsed) -> None:
     # Shrink each ship's pier by truncating its event log — offline, so this is the
     # one maintenance command with downtime. Order matters and is roll FIRST: roll
@@ -2480,48 +2503,27 @@ def cmd_chop(a: Parsed) -> None:
     stay_down = bool(a.flags.get("--stay-down"))
 
     def work(ship, host, log):
-        if not pier_exists(host, ship):
-            raise RuntimeError(f"no pier at {pier_dir(ship, host)} — nothing to chop")
-        st = daemon_status(host, ship)
-        if st:
-            assert_port_match(host, ship, st)
-        was_running = st is not None
-        if was_running:
-            log("stopping for chop")
-            if not daemon_stop(ship, host):
-                raise RuntimeError(f"ship did not shut down for chop — try `{INVOKE} {ship.name} exit`, then rerun")
+        def op() -> str:
+            loom = ["--loom", str(ship.pier.loom)] if ship.pier.loom is not None else []
+            before, before_kb = epoch_names(host, ship), log_size_kb(host, ship)
+            try:
+                log("rolling a new epoch")
+                argv = vere_argv(ship, host, "roll", *loom)
+                host.exec(argv[0], argv[1:], timeout_ms=T_CHOP * 1000)
+                log("chopping old epochs")
+                argv = vere_argv(ship, host, "chop", *loom)
+                host.exec(argv[0], argv[1:], timeout_ms=T_CHOP * 1000)
+            finally:
+                after, after_kb = epoch_names(host, ship), log_size_kb(host, ship)
+            deleted = [e for e in before if e not in after]
+            size = f"{before_kb // 1024} MB -> {after_kb // 1024} MB"
+            if deleted:
+                return f"rolled + chopped {len(deleted)} epoch{'s' if len(deleted) != 1 else ''}, {size}"
+            return f"rolled; nothing to chop yet ({len(after)} epochs, two are always kept), {size}"
 
-        binary = vere_binary(ship, host)
-        # a docked <pier>/.run self-locates its pier and rejects an explicit one
-        # ("invalid command"); only a bare `urbit` needs the pier argument.
-        target = [] if binary != "urbit" else [pier_dir(ship, host)]
-        loom = ["--loom", str(ship.pier.loom)] if ship.pier.loom is not None else []
-        before, before_kb = epoch_names(host, ship), log_size_kb(host, ship)
-        failure: Exception | None = None
-        try:
-            log("rolling a new epoch")
-            host.exec(binary, ["roll", *loom, *target], timeout_ms=T_CHOP * 1000)
-            log("chopping old epochs")
-            host.exec(binary, ["chop", *loom, *target], timeout_ms=T_CHOP * 1000)
-        except Exception as e:
-            failure = e
-        after, after_kb = epoch_names(host, ship), log_size_kb(host, ship)
+        return offline(ship, host, log, "chop", stay_down, op)
 
-        restarted = ""
-        if was_running and not stay_down:
-            log("restarting")
-            now = daemon_start(ship, host)
-            restarted = f", restarted (daemon {now[0]} child {now[1]})"
-        if failure is not None:
-            raise RuntimeError(f"roll/chop failed{restarted or ' — ship left down'}: {failure}")
-
-        deleted = [e for e in before if e not in after]
-        size = f"{before_kb // 1024} MB -> {after_kb // 1024} MB"
-        if deleted:
-            return f"rolled + chopped {len(deleted)} epoch{'s' if len(deleted) != 1 else ''}, {size}{restarted}"
-        return f"rolled; nothing to chop yet ({len(after)} epochs, two are always kept), {size}{restarted}"
-
-    sys.exit(report_dojo(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
 
 def cmd_vere_upgrade(a: Parsed) -> None:
@@ -2533,40 +2535,15 @@ def cmd_vere_upgrade(a: Parsed) -> None:
     stay_down = bool(a.flags.get("--stay-down"))
 
     def work(ship, host, log):
-        if not pier_exists(host, ship):
-            raise RuntimeError(f"no pier at {pier_dir(ship, host)} — nothing to upgrade")
-        st = daemon_status(host, ship)
-        if st:
-            assert_port_match(host, ship, st)
-        was_running = st is not None
-        if was_running:
-            log("stopping for next")
-            if not daemon_stop(ship, host):
-                raise RuntimeError(f"ship did not shut down for next — try `{INVOKE} {ship.name} exit`, then rerun")
-
-        binary = vere_binary(ship, host)
-        # a docked <pier>/.run self-locates its pier and rejects an explicit one
-        # ("invalid command"); only a bare `urbit` needs the pier argument.
-        target = [] if binary != "urbit" else [pier_dir(ship, host)]
-        failure: Exception | None = None
-        out = ""
-        try:
+        def op() -> str:
             log("downloading next runtime")
-            out = host.exec(binary, ["next", *target], timeout_ms=T_CHOP * 1000).strip()
-        except Exception as e:
-            failure = e
+            argv = vere_argv(ship, host, "next")
+            out = host.exec(argv[0], argv[1:], timeout_ms=T_CHOP * 1000).strip()
+            return out.splitlines()[-1] if out else "next complete"
 
-        restarted = ""
-        if was_running and not stay_down:
-            log("restarting")
-            now = daemon_start(ship, host)
-            restarted = f", restarted (daemon {now[0]} child {now[1]})"
-        if failure is not None:
-            raise RuntimeError(f"next failed{restarted or ' — ship left down'}: {failure}")
-        summary = out.splitlines()[-1] if out else "next complete"
-        return f"{summary}{restarted}"
+        return offline(ship, host, log, "next", stay_down, op)
 
-    sys.exit(report_dojo(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
 
 def cmd_boot(a: Parsed) -> None:

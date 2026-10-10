@@ -1,8 +1,12 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+#
 # admiral's test suite, run against a live ship from the nearest admiral.toml
 # (found by walking up from the current directory, like admiral itself).
 #
-#   tests/run.py <ship> [--group cli|dojo|commit|attach|harness] [--case <name>]
+#   uv run tests/run.py <ship> [--group cli|dojo|commit|attach|harness] [--case <name>]
 #
 # A fake ship is the right target: the suite nukes nothing, but it leaves dojo
 # variables, desks %admiral-test and %admiral-yes, and a stream of aborted evals.

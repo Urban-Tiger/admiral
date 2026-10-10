@@ -276,6 +276,9 @@ def load_config(file: Path | None = None) -> Config:
         )
     try:
         import tomllib
+    except ImportError:
+        raise RuntimeError(f"admiral needs python 3.11+ (this is {sys.version.split()[0]}, no tomllib)")
+    try:
         cfg = tomllib.loads(raw)
     except Exception as e:
         raise RuntimeError(f"{CONFIG}: invalid TOML: {e}")
@@ -2004,6 +2007,25 @@ def desk_suspended(ship: Ship, desk: Desk, cfg: Config, log: Callable[[str], Non
     return bool(status and status.group(1) == "suspended" and bill)
 
 
+def ring_settle(host: Host, ship: Ship, mark: int, quiet: float = 1.0, limit: float = 6.0) -> str:
+    # what the console prints after `mark`, read until it has been quiet for `quiet`
+    # seconds (or `limit` in all), rendered with prompt paint stripped. For output that
+    # trails a command's prompt: gall rebuilds a committed desk in events of its own, so
+    # its "reloading %app" and build errors can land after the dojo has already returned.
+    end = time.monotonic() + limit
+    last_total, last_change = -1, time.monotonic()
+    while True:
+        total, raw = capture_at(host, ship, mark)
+        now = time.monotonic()
+        if total != last_total:
+            last_total, last_change = total, now
+        if now - last_change >= quiet or now >= end:
+            break
+        time.sleep(0.1)
+    rows = [PROMPT_PREFIX.sub("", l).rstrip() for l in render_transcript(raw).split("\n")]
+    return "\n".join(r for r in rows if r and not DOJO_NOISE.match(r))
+
+
 def cmd_commit(a: Parsed) -> None:
     desk = resolve_desk(a.pos[0], a.cfg)
     remount = bool(a.flags.get("--remount"))
@@ -2028,6 +2050,13 @@ def cmd_commit(a: Parsed) -> None:
             dojo_one(ship, f"|unmount %{desk.name}", a.cfg, log=log)
             dojo_one(ship, f"|mount %{desk.name}", a.cfg, log=log)
         out = dojo_one(ship, f"|commit %{desk.name}", a.cfg, timeout=timeout, desk=desk, log=log)
+        # the commit itself returns at hood's ack; gall's reloads and build errors follow
+        # in later events. Wait for the console to go quiet so they count toward THIS
+        # commit's verdict rather than leaking into the next command's transcript.
+        if any(l.startswith(("+ /", "- /", ": /")) for l in out.split("\n")):
+            late = ring_settle(host, ship, ring_mark(host, ship))
+            if late:
+                out = out + "\n" + late
         ok, verdict, reloaded = commit_verdict(desk, out)
         # a desk that just reloaded an agent is running; only an idle verdict needs +vats
         if ok and not reloaded and desk_suspended(ship, desk, a.cfg, log):

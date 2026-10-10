@@ -1864,15 +1864,20 @@ class Cmd:
     examples: list[str] | None = None
     complete: Callable[[Config | None], list[str]] | None = None
     notes: Callable[[Config | None], str] | None = None
+    ship: bool = True        # takes a <ship> selector and a loaded config; init/enrich don't
 
 
 @dataclass
 class Parsed:
     cmd: Cmd
     selector: str | None
-    cfg: Config
+    cfg: Config | None       # None only for a shipless command (init has no config yet)
     flags: dict[str, Any]
     pos: list[str]
+
+
+def by_name(name: str) -> Cmd | None:
+    return next((c for c in COMMANDS if c.name == name), None)
 
 
 def flag_brief(f: Flag) -> str:
@@ -1886,7 +1891,7 @@ def pos_brief(p: Pos) -> str:
 
 def usage_line(c: Cmd) -> str:
     return " ".join([
-        "Usage:", INVOKE, "<ship>", c.name,
+        "Usage:", INVOKE, *(["<ship>"] if c.ship else []), c.name,
         *[flag_brief(f) for f in c.flags], *[pos_brief(p) for p in c.positionals],
     ])
 
@@ -2689,20 +2694,24 @@ def cmd_complete(words: list[str]) -> None:
     except Exception:
         cfg = None
     cmd_names = [c.name for c in COMMANDS]
+    shipless = [c.name for c in COMMANDS if not c.ship]
 
     if len(before) == 0:
         ships = [s.name for s in cfg.ships] if cfg else []
-        return emit([*ships, "help", "init", "enrich", "unenrich"])
-    if len(before) == 1:
-        if before[0] == "help":
-            return emit(cmd_names)
-        return emit([*cmd_names, "help"])
-    sub = before[1]
-    if sub == "help":
+        return emit([*ships, "help", *shipless])
+    if before[0] == "help":
         return emit(cmd_names)
-    cmd = next((c for c in COMMANDS if c.name == sub), None)
-    if not cmd:
-        return
+    cmd = by_name(before[0])
+    if cmd and not cmd.ship:
+        pass  # a shipless command: its flags follow directly
+    elif len(before) == 1:
+        return emit([*(n for n in cmd_names if n not in shipless), "help"])
+    elif before[1] == "help":
+        return emit(cmd_names)
+    else:
+        cmd = by_name(before[1])
+        if not cmd or not cmd.ship:
+            return
     flag_names = []
     for f in cmd.flags:
         flag_names.extend([f.name, f.alias] if f.alias else [f.name])
@@ -2798,68 +2807,47 @@ def rc_remove_block(p: Path, tag: str) -> None:
         p.write_text(_rc_strip(p.read_text(), tag))
 
 
-def _toggle_opts(args: list[str], cmd: str) -> tuple[str, bool, str | None]:
-    # parse [bash|zsh] [--no-persist] [--rc PATH]; shell defaults to $SHELL's basename.
-    shell, persist, override = None, True, None
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == "--no-persist":
-            persist = False
-        elif a == "--rc":
-            i += 1
-            if i >= len(args):
-                raise RuntimeError(f"{cmd}: --rc needs a path")
-            override = args[i]
-        elif a in ("bash", "zsh"):
-            shell = a
-        else:
-            raise RuntimeError(f"{cmd}: unexpected arg {a!r} (usage: {cmd} [bash|zsh] [--no-persist] [--rc PATH])")
-        i += 1
-    shell = shell or os.path.basename(os.environ.get("SHELL", ""))
+def _shell_arg(a: Parsed) -> str:
+    # [bash|zsh] positional, else $SHELL's basename
+    shell = a.pos[0] if a.pos else os.path.basename(os.environ.get("SHELL", ""))
     if shell not in ("bash", "zsh"):
-        raise RuntimeError(f'{cmd}: specify a shell — eval "$({INVOKE} {cmd} <bash|zsh>)"')
-    return shell, persist, override
+        raise UsageError(a.cmd, f'specify a shell — eval "$({INVOKE} {a.cmd.name} <bash|zsh>)"')
+    return shell
 
 
-def cmd_enrich(args: list[str]) -> str:
+def cmd_enrich(a: Parsed) -> None:
     # Enrich the shell with the combined feature (command alias + tab-completion) as ONE rc
     # managed block, and emit a snippet the CURRENT shell must `eval` for immediate effect.
     # Idempotent: re-enriching refreshes the block. `--no-persist` affects only this shell.
-    shell, persist, override = _toggle_opts(args, "enrich")
-    if not persist:
+    shell = _shell_arg(a)
+    if a.flags.get("--no-persist"):
         sys.stderr.write(f"{NAME}: enriched in this shell only (not saved to an rc file)\n")
-        return _installed_install(shell) + "\n"
-    p = rc_path(shell, override)
-    refresh = rc_present(p, "installed")
-    rc_write_block(p, "installed", _installed_install(shell))
-    sys.stderr.write(
-        f"{NAME}: shell enriched with command alias + tab-completion\n"
-        f"  {'refreshed in' if refresh else 'saved to'}: {p}\n"
-        f"  active now in this shell, and in every new shell\n"
-        f"  run `{NAME} help` to get started\n")
-    return _installed_install(shell) + "\n"
+    else:
+        p = rc_path(shell, a.flags.get("--rc"))
+        refresh = rc_present(p, "installed")
+        rc_write_block(p, "installed", _installed_install(shell))
+        sys.stderr.write(
+            f"{NAME}: shell enriched with command alias + tab-completion\n"
+            f"  {'refreshed in' if refresh else 'saved to'}: {p}\n"
+            f"  active now in this shell, and in every new shell\n"
+            f"  run `{NAME} help` to get started\n")
+    sys.stdout.write(_installed_install(shell) + "\n")
 
 
-def cmd_unenrich(args: list[str]) -> str:
+def cmd_unenrich(a: Parsed) -> None:
     # Remove the managed block and emit an uninstall snippet for the CURRENT shell.
     # `--no-persist` only cleans this shell.
-    shell, persist, override = _toggle_opts(args, "unenrich")
-    if not persist:
+    shell = _shell_arg(a)
+    if a.flags.get("--no-persist"):
         sys.stderr.write(f"{NAME}: enrichment removed from this shell only\n")
-        return _installed_uninstall(shell) + "\n"
-    p = rc_path(shell, override)
-    if rc_present(p, "installed"):
-        rc_remove_block(p, "installed")
-        sys.stderr.write(
-            f"{NAME}: shell enrichment removed\n"
-            f"  removed from: {p}\n"
-            f"  cleared from this shell too\n")
     else:
-        sys.stderr.write(
-            f"{NAME}: was not enriched in {p}\n"
-            f"  cleared this shell anyway\n")
-    return _installed_uninstall(shell) + "\n"
+        p = rc_path(shell, a.flags.get("--rc"))
+        if rc_present(p, "installed"):
+            rc_remove_block(p, "installed")
+            sys.stderr.write(f"{NAME}: shell enrichment removed\n  removed from: {p}\n  cleared from this shell too\n")
+        else:
+            sys.stderr.write(f"{NAME}: was not enriched in {p}\n  cleared this shell anyway\n")
+    sys.stdout.write(_installed_uninstall(shell) + "\n")
 
 
 # ── interactive wizard: step-by-step prompts + TOML emit (init / add) ─────────
@@ -3057,7 +3045,6 @@ def wizard_ship(name: str, existing: Ship | None, existing_hosts: list[str]) -> 
 # the wizard would have prompted for, validated through the same rules. The scriptable
 # path: `admiral sampel-palnet add --host drain --port 8080`. (init keeps its own bare-key
 # flag set since it is a top-level verb that also takes --name/--desk/--src.)
-INIT_FLAGS = {"name", "host", "ssh", "root", "desk", "src", *(f.key for f in FIELDS)}
 
 # the per-ship field flags, shared by the `add` and `edit` Cmd entries. All are strings
 # (typed when applied, through field_from_text) so add/edit can carry every field.
@@ -3069,26 +3056,6 @@ SHIP_FIELD_FLAGS: list[Flag] = [
 ]
 
 _UNSET = object()  # "flag not provided" — distinct from an explicit empty/None value
-
-
-def _kv_flags(verb: str, args: list[str], allowed: set[str]) -> dict[str, str]:
-    # parse `--key value` pairs for the top-level `init` verb (it doesn't use the Cmd
-    # framework). Rejects unknown flags + bare positionals so a typo never silently no-ops.
-    out: dict[str, str] = {}
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if not a.startswith("--"):
-            raise RuntimeError(f"{verb}: unexpected argument {a!r} (flags look like --name <val>; see `{INVOKE} help`)")
-        key = a[2:]
-        if key not in allowed:
-            raise RuntimeError(f"{verb}: unknown flag {a!r} (allowed: {', '.join('--' + k for k in sorted(allowed))})")
-        i += 1
-        if i >= len(args):
-            raise RuntimeError(f"{verb}: {a} needs a value")
-        out[key] = args[i]
-        i += 1
-    return out
 
 
 def resolve_upsert_name(selector: str, cfg: Config, *, must_exist: bool) -> str:
@@ -3206,7 +3173,7 @@ def _validate_written(p: Path) -> None:
         raise RuntimeError(f"wrote {p} but it failed validation: {e}")
 
 
-def cmd_init(args: list[str]) -> None:
+def cmd_init(a: Parsed) -> None:
     # Wizard (or --flags): create admiral.toml in the current directory (one host? + one
     # ship + one desk), the minimum a working config needs. With no flags in a terminal it
     # prompts; pass --name ... (or run without a tty) to drive it non-interactively.
@@ -3218,7 +3185,7 @@ def cmd_init(args: list[str]) -> None:
         # this directory down and split the project's ships across two files.
         raise RuntimeError(f"{REPO / CONFIG} already governs this directory — use "
                            f"`{INVOKE} <ship> add` to add a ship to it, or init outside that tree")
-    kv = _kv_flags("init", args, INIT_FLAGS)
+    kv = {k.lstrip("-"): v for k, v in a.flags.items()}
 
     if kv or not sys.stdin.isatty():
         if not kv:
@@ -3633,31 +3600,47 @@ COMMANDS: list[Cmd] = [
     ),
 ]
 
-# commands that take no ship: `help <name>` explains them like the rest.
-TOPICS: dict[str, tuple[str, str, str, list[str]]] = {
-    "init": (f"{INVOKE} init [--name <ship> --path <pier> --port <port> --http <url> --desk <desk> --src <dir> ...]",
-             "create admiral.toml in this directory",
-             ("Write a new admiral.toml here with one ship and, optionally, one desk. In a "
-              "terminal with no flags it is a wizard; with flags (or no terminal) it takes "
-              f"--name plus any field add takes, and --desk / --src for the desk. Refuses when "
-              f"admiral.toml already exists: use `{INVOKE} <ship> add` for more ships.\n\n"
-              "admiral finds its config by walking up from the current directory to the nearest "
-              "admiral.toml (or .admiral.toml), like git finds .git."),
-             [f"{INVOKE} init",
-              f"{INVOKE} init --name zod --path piers/zod --port 8080 --http http://localhost:8080"]),
-    "enrich": (f"{INVOKE} enrich [bash|zsh] [--no-persist] [--rc <file>]",
-               "add an `admiral` command and tab completion to your shell",
-               ("Print shell code that defines an `admiral` function (so you type `admiral`, "
-                "not ./admiral.py) and tab completion for ships, commands, desks and flags. By "
-                "default it is also saved to ~/.bashrc or ~/.zshrc; --no-persist keeps it to "
-                "this shell, --rc picks another file. Undo with unenrich."),
-               ['eval "$(./admiral.py enrich)"']),
-    "unenrich": (f"{INVOKE} unenrich [bash|zsh] [--no-persist] [--rc <file>]",
-                 "remove what enrich added",
-                 "Print shell code that removes the `admiral` function and its completion, and "
-                 "take the block back out of the rc file enrich wrote it to.",
-                 ['eval "$(./admiral.py unenrich)"']),
-}
+ENRICH_FLAGS = [Flag("--no-persist", "bool", "this shell only; don't touch the rc file"),
+                Flag("--rc", "str", "the rc file to edit instead of ~/.bashrc or ~/.zshrc", ph="<file>")]
+SHELL_POS = [Pos("shell", False, "bash or zsh (default: your $SHELL)")]
+
+COMMANDS += [
+    Cmd(
+        name="init", summary=f"create {CONFIG} in this directory", ship=False,
+        flags=[Flag("--name", "str", "the first ship's name, without ~", ph="<ship>"),
+               Flag("--desk", "str", "a desk to list (default base; \"\" for none)", ph="<desk>"),
+               Flag("--src", "str", "the desk's source dir, relative to here (default .)", ph="<dir>"),
+               *SHIP_FIELD_FLAGS],
+        positionals=[],
+        details=("Write a new admiral.toml here with one ship and, optionally, one desk. In a "
+                 "terminal with no flags it is a wizard; with flags (or no terminal) it takes "
+                 f"--name plus any field add takes, and --desk / --src for the desk. Refuses when "
+                 f"admiral.toml already exists: use `{INVOKE} <ship> add` for more ships.\n\n"
+                 "admiral finds its config by walking up from the current directory to the nearest "
+                 "admiral.toml (or .admiral.toml), like git finds .git."),
+        examples=[f"{INVOKE} init",
+                  f"{INVOKE} init --name zod --path piers/zod --port 8080 --http http://localhost:8080"],
+        run=cmd_init,
+    ),
+    Cmd(
+        name="enrich", summary=f"add an `{NAME}` command and tab completion to your shell", ship=False,
+        flags=ENRICH_FLAGS, positionals=SHELL_POS,
+        details=(f"Print shell code that defines an `{NAME}` function (so you type `{NAME}`, "
+                 f"not {INVOKE}) and tab completion for ships, commands, desks and flags. By "
+                 "default it is also saved to ~/.bashrc or ~/.zshrc; --no-persist keeps it to "
+                 "this shell, --rc picks another file. Undo with unenrich."),
+        examples=[f'eval "$({INVOKE} enrich)"'],
+        run=cmd_enrich,
+    ),
+    Cmd(
+        name="unenrich", summary="remove what enrich added", ship=False,
+        flags=ENRICH_FLAGS, positionals=SHELL_POS,
+        details=(f"Print shell code that removes the `{NAME}` function and its completion, and "
+                 "take the block back out of the rc file enrich wrote it to."),
+        examples=[f'eval "$({INVOKE} unenrich)"'],
+        run=cmd_unenrich,
+    ),
+]
 
 
 # ── help rendering ─────────────────────────────────────────────────────────────
@@ -3721,9 +3704,11 @@ def help_menu() -> None:
         flags = ["[opts]"] if len(c.flags) > 1 else [flag_brief(f) for f in c.flags]
         return " ".join([c.name, *flags, *[pos_brief(p) for p in c.positionals]])
 
-    sigs = [sig(c) for c in COMMANDS]
+    with_ship = [c for c in COMMANDS if c.ship]
+    without = ", ".join(gray(c.name) for c in COMMANDS if not c.ship)
+    sigs = [sig(c) for c in with_ship]
     w = max(*(len(s) for s in sigs), len("help [command]"))
-    rows = "\n".join(f"{sigs[i].ljust(w)}  {c.summary}" for i, c in enumerate(COMMANDS))
+    rows = "\n".join(f"{sigs[i].ljust(w)}  {c.summary}" for i, c in enumerate(with_ship))
     sys.stderr.write(f"""
 {bold(f"{CLI}: urbit ship manager")} {gray(f"v{VERSION}")}
 
@@ -3749,7 +3734,7 @@ Commands
 {rows}
 {'help [command]'.ljust(w)}  this menu, or everything about one command
 
-Without a ship: {gray("init")}, {gray("enrich")}, {gray("unenrich")}. {gray(f"{inv} help <name>")} explains each.
+Without a ship: {without}. {gray(f"{inv} help <name>")} explains each.
 
 {config_line}
 
@@ -3761,20 +3746,14 @@ shell enrichment {installed_state}. paste to toggle: {enrich_cmd}{enrich_blurb}
 def cmd_help(name: str | None = None) -> None:
     if not name:
         return help_menu()
-    c = next((x for x in COMMANDS if x.name == name), None)
+    c = by_name(name)
     W = HELP_WIDTH
     color = is_tty(sys.stderr)
     bold = lambda s: paint(s, "bold", color)
     gray = lambda s: paint(s, "gray", color)
     if not c:
-        if name not in TOPICS:
-            sys.stderr.write(f'no command "{name}"; {INVOKE} help lists them\n')
-            sys.exit(1)
-        usage, summary, details, examples = TOPICS[name]
-        out = ["", f"{bold(f'{CLI} {name}')} — {summary}", "", f"Usage: {usage}", ""]
-        out += wrap(details, W) + ["", "Examples"] + ["  " + gray(e) for e in examples] + [""]
-        sys.stderr.write("\n".join(out) + "\n")
-        return
+        sys.stderr.write(f'no command "{name}"; {INVOKE} help lists them\n')
+        sys.exit(1)
     try:
         cfg: Config | None = load_config()
     except Exception:
@@ -5068,7 +5047,7 @@ def main() -> None:
     first = argv[0] if argv else None
     # bare `admiral` → status over every ship in the config.
     if first is None:
-        status = next(c for c in COMMANDS if c.name == "status")
+        status = by_name("status")
         return status.run(Parsed(cmd=status, selector=None, cfg=load_config(), flags={}, pos=[]))
     # engine mode: hidden host-local pty subcommands own argv[0]. No config load.
     if first in ENGINE_SUBS:
@@ -5077,30 +5056,27 @@ def main() -> None:
         return cmd_help(argv[1] if len(argv) > 1 else None)
     if first in ("-h", "--help"):
         return help_menu()
-    # hidden completion subcommands (not in the menu): they own argv[0].
+    # hidden completion subcommand (not in the menu): it owns argv[0].
     if first == "__complete":
         return cmd_complete(argv[1:])
-    if first == "enrich":
-        sys.stdout.write(cmd_enrich(argv[1:]))
-        return
-    if first == "unenrich":
-        sys.stdout.write(cmd_unenrich(argv[1:]))
-        return
-    # config wizards (top-level verbs, no ship selector).
-    if first == "init":
-        return cmd_init(argv[1:])
+    # commands that take no ship (init, enrich, unenrich) own argv[0] too. init has no
+    # config to load yet, so none of them get one.
+    shipless = by_name(first)
+    if shipless and not shipless.ship:
+        flags, pos = parse_args(shipless, argv[1:])
+        return shipless.run(Parsed(cmd=shipless, selector=None, cfg=None, flags=flags, pos=pos))
 
     selector = argv[0]
-    if any(c.name == selector for c in COMMANDS):
+    if by_name(selector):
         raise RuntimeError(f"`{selector}` needs a ship first: {INVOKE} <ship> {' '.join(argv)}")
     # no command after the selector → status (the default command).
     subcmd = argv[1] if len(argv) > 1 else "status"
     args = argv[2:]
     if subcmd == "help":
         return cmd_help(args[0] if args else None)
-    cmd = next((c for c in COMMANDS if c.name == subcmd), None)
-    if not cmd:
-        subs = "|".join(c.name for c in COMMANDS)
+    cmd = by_name(subcmd)
+    if not cmd or not cmd.ship:
+        subs = "|".join(c.name for c in COMMANDS if c.ship)
         raise RuntimeError(f'Unknown subcommand "{subcmd}" ({subs})  —  try: {INVOKE} help')
     cfg = load_config()
     flags, pos = parse_args(cmd, args)

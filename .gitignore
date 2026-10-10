@@ -1,0 +1,6 @@
+# local config (use admiral.example.toml as a template)
+admiral.toml
+.admiral.toml
+# admiral's per-repo script/test dir
+.admiral/
+__pycache__/

@@ -1,0 +1,22 @@
+# admiral config — see `./admiral.py help` and this script's header for the full schema.
+# Copy to admiral.toml and edit for your local ships.
+
+[ships.sampel-palnet]
+http = "http://localhost:8080"
+pier = { path = "piers/sampel-palnet", port = 8080 }
+# pier = { path = "copy-of-prod", port = 8081, local = true }
+#   local = true boots vere with -L (fake networking). Pin it on a COPIED pier whose
+#   original still runs elsewhere: one boot with real ames double-boots that ship.
+# mnemonic = "word word word word word word"
+# master-ticket = "~sampel-ticket-sampel-ticket"
+# code = "lidlut-tabwed-pillex-ridrup"      # +code, without the ~
+
+# a desk admiral syncs from a source dir with `./admiral.py <ship> commit <name>`
+[[desks]]
+name = "my-desk"
+src = "desk"
+
+# the fixture desk tests/run.py commits against; see that file's header
+[[desks]]
+name = "admiral-test"
+src = "tests/desk"

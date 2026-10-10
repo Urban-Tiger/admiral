@@ -36,7 +36,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 from pathlib import Path
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
@@ -111,10 +111,108 @@ class PierConfig:
                               # never forget it.
 
 
-# every key `pier = { ... }` may carry. Config load rejects anything else, because
-# add/edit rewrite that table from these fields alone — see the parse below.
-PIER_KEYS = frozenset(f.name for f in fields(PierConfig))
+# ── ship fields ──────────────────────────────────────────────────────────────
+# The one table behind everything that handles a ship's settings: config load
+# validates against it, add/edit take a --flag per row, the wizard asks a question per
+# row, and the TOML writer renders from it. A new setting is one new row.
+@dataclass(frozen=True)
+class Field:
+    key: str                  # TOML key, and the --flag name ("master-ticket")
+    attr: str                 # attribute on Ship (or on PierConfig when pier)
+    kind: str                 # "str" | "int" | "bool"
+    desc: str                 # the --flag's help
+    prompt: str               # the wizard's question
+    hint: str                 # what a good value looks like; the error for a bad one
+    ph: str = "<val>"         # value placeholder in usage
+    pier: bool = False        # lives in the ship's `pier = { ... }` table
+    lo: int = 1               # int range, inclusive
+    hi: int = 2**31
+    ok: Callable[[str], bool] | None = None  # str check beyond "is a string"
 
+
+FIELDS: list[Field] = [
+    Field("http", "http", "str", "http origin playwright/login targets",
+          "http origin playwright/login targets",
+          'must be a non-empty hostname or URL (e.g. "example.com")', ph="<url>",
+          ok=lambda s: bool(s.strip()) and not re.search(r"\s", s)),
+    Field("path", "path", "str", "pier path (relative to the host root, or absolute)",
+          "pier path (relative to the host root, or absolute)", "must be a string",
+          ph="<path>", pier=True),
+    Field("port", "port", "int", "http bind port on the box (1-65535)", "http port on the box",
+          "must be an integer 1-65535", ph="<port>", pier=True, hi=65535),
+    Field("ames", "ames", "int", "ames UDP port; pin it so peers' lanes survive a restart",
+          "ames UDP port", "must be an integer 1-65535", ph="<port>", pier=True, hi=65535),
+    Field("loom", "loom", "int", "loom size (memory pages, power of 2)",
+          "loom size (memory pages, power of 2; blank = vere default)",
+          "must be a positive integer", ph="<pages>", pier=True),
+    Field("local", "local", "bool", "boot with -L (fake networking) — pin it for a COPIED pier "
+          "whose original still runs elsewhere", "boot with -L (fake networking)",
+          "must be a boolean", ph="<true|false>", pier=True),
+    Field("code", "code", "str", "+code override (skips the live dojo read)",
+          "+code override (skips the live dojo read; blank = read live)",
+          'must be a +code key (e.g. "ralnyt-botwyc-batnyt-dozzod")', ph="<code>",
+          ok=lambda s: bool(CODE_RE.match(s))),
+    Field("master-ticket", "master_ticket", "str", "ship master ticket (key material)",
+          "master ticket (key material; blank = none)",
+          'must be a ticket like "~ralnyt-botwyc-batnyt-dozzod"', ph="<ticket>",
+          ok=lambda s: bool(TICKET_RE.match(s))),
+    Field("mnemonic", "mnemonic", "str", "BIP39 mnemonic seed phrase (quote it)",
+          "mnemonic (BIP39 seed words; blank = none)",
+          "must be a space-separated word list (BIP39 mnemonic)", ph="<words>",
+          ok=lambda s: bool(MNEMONIC_RE.match(s))),
+]
+# every key `pier = { ... }` may carry. Config load rejects anything else, because
+# add/edit rewrite that table from these fields alone — see load_config.
+PIER_KEYS = frozenset(f.key for f in FIELDS if f.pier)
+
+# what the wizard asks, in order (port before http so a local ship's http can default
+# to it). ames and local are niche and flag-only — but an existing ship's values for
+# them survive an edit untouched, see wizard_ship.
+WIZARD_KEYS = ("port", "http", "loom", "path", "code", "master-ticket", "mnemonic")
+
+
+def field_error(f: Field, v: Any) -> str | None:
+    # why a typed value is not acceptable for f, or None. None itself is always fine:
+    # every field is optional (an absent `local` reads as false).
+    if v is None:
+        return None
+    if f.kind == "int":
+        bad = not isinstance(v, int) or isinstance(v, bool) or v < f.lo or v > f.hi
+    elif f.kind == "bool":
+        bad = not isinstance(v, bool)
+    else:
+        bad = not isinstance(v, str) or (f.ok is not None and not f.ok(v))
+    return f"{f.hint}, got {v!r}" if bad else None
+
+
+def field_from_text(f: Field, raw: str) -> tuple[Any, str | None]:
+    # a --flag or wizard answer -> (typed value, error). "" unsets the field.
+    if raw == "":
+        return (None, None)
+    v: Any = raw
+    if f.kind == "int":
+        try:
+            v = int(raw)
+        except ValueError:
+            return (None, f"{f.hint}, got {raw!r}")
+    elif f.kind == "bool":
+        word = raw.strip().lower()
+        if word not in ("true", "yes", "on", "1", "false", "no", "off", "0"):
+            return (None, f"{f.hint}, got {raw!r}")
+        v = word in ("true", "yes", "on", "1")
+    return (v, field_error(f, v))
+
+
+def field_get(ship: "Ship", f: Field) -> Any:
+    return getattr(ship.pier if f.pier else ship, f.attr)
+
+
+def make_ship(name: str, host: str | None, values: dict[str, Any]) -> "Ship":
+    # a Ship from field values keyed by attr; a missing or empty value is unset.
+    pier = PierConfig(**{f.attr: (bool(values.get(f.attr)) if f.kind == "bool" else values.get(f.attr))
+                         for f in FIELDS if f.pier})
+    return Ship(name=name, pier=pier, host=host,
+                **{f.attr: values.get(f.attr) or None for f in FIELDS if not f.pier})
 
 @dataclass
 class Ship:
@@ -183,18 +281,13 @@ def load_config(file: Path | None = None) -> Config:
     except Exception as e:
         raise RuntimeError(f"{CONFIG}: invalid TOML: {e}")
 
-    def is_map(o: Any) -> bool:
-        return isinstance(o, dict)
-
     ships_raw = cfg.get("ships")
-    if not is_map(ships_raw) or not ships_raw:
+    if not isinstance(ships_raw, dict) or not ships_raw:
         raise RuntimeError(f'{CONFIG}: "ships" must be a non-empty table of [ships.<name>] entries')
     # desks: OPTIONAL. A config with no desks is valid — it just can't commit.
     desks_raw = cfg.get("desks", [])
     if not isinstance(desks_raw, list):
         raise RuntimeError(f'{CONFIG}: "desks" must be an array of {{ name, src }} entries')
-
-    win_re, desk_re, code_re = SHIP_NAME_RE, DESK_NAME_RE, CODE_RE
 
     # hosts: a table of REMOTE machines, keyed by name (the local machine is
     # implicit — a ship with no "host" runs locally, root = REPO). Validate first
@@ -202,12 +295,12 @@ def load_config(file: Path | None = None) -> Config:
     hosts: dict[str, Host] = {}
     hosts_raw = cfg.get("hosts")
     if hosts_raw is not None:
-        if not is_map(hosts_raw):
+        if not isinstance(hosts_raw, dict):
             raise RuntimeError(f'{CONFIG}: "hosts" must be a table of [hosts.<name>] entries')
         for hname, h in hosts_raw.items():
             if hname == "local":
                 raise RuntimeError(f'{CONFIG}: hosts["local"] is reserved — the local machine is implicit (omit "host", or set it to "local")')
-            if not is_map(h):
+            if not isinstance(h, dict):
                 raise RuntimeError(f'{CONFIG}: hosts["{hname}"] must be a table {{ ssh, root }}')
             if not h.get("ssh") or not isinstance(h["ssh"], str):
                 raise RuntimeError(f'{CONFIG}: hosts["{hname}"] missing "ssh" target')
@@ -219,10 +312,10 @@ def load_config(file: Path | None = None) -> Config:
 
     ships: list[Ship] = []
     for sname, ship in ships_raw.items():
-        if not is_map(ship):
+        if not isinstance(ship, dict):
             raise RuntimeError(f'{CONFIG}: ships["{sname}"] must be a table {{ pier, http, ... }}')
-        if not win_re.match(sname):
-            raise RuntimeError(f'{CONFIG}: ship name "{sname}" must match {win_re.pattern}')
+        if not SHIP_NAME_RE.match(sname):
+            raise RuntimeError(f'{CONFIG}: ship name "{sname}" must match {SHIP_NAME_RE.pattern}')
         # host: top-level hosts key; empty/"local"/None => the local machine.
         host = ship.get("host") or None
         if host is not None and host != "local" and host not in hosts:
@@ -232,64 +325,36 @@ def load_config(file: Path | None = None) -> Config:
             )
         # pier: optional table of where the ship's pier lives + its boot params.
         pier = ship.get("pier") or {}
-        if not is_map(pier):
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"].pier must be a table {{ {", ".join(PIER_KEYS)} }}')
+        if not isinstance(pier, dict):
+            raise RuntimeError(f'{CONFIG}: ships["{sname}"].pier must be a table {{ {", ".join(sorted(PIER_KEYS))} }}')
         # Reject keys we don't know rather than ignoring them. `add`/`edit` rewrite
-        # this table by re-rendering the fields below, so a key we merely ignored
-        # would be silently DELETED the next time anyone edited the ship — the
-        # config would lose settings without ever saying so. Refusing here means a
-        # typo (or a setting from a newer admiral) is loud instead of load-bearing.
+        # this table from FIELDS alone, so a key we merely ignored would be silently
+        # DELETED the next time anyone edited the ship — the config would lose settings
+        # without ever saying so. Refusing here means a typo (or a setting from a newer
+        # admiral) is loud instead of load-bearing.
         unknown = sorted(set(pier) - PIER_KEYS)
         if unknown:
             raise RuntimeError(
                 f'{CONFIG}: ships["{sname}"].pier has unknown key(s) {", ".join(unknown)} '
                 f'(known: {", ".join(sorted(PIER_KEYS))}). admiral would drop these on the '
                 f'next `add`/`edit`, so it refuses to run instead.')
-        if pier.get("path") is not None and not isinstance(pier["path"], str):
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"].pier.path must be a string')
-        port = pier.get("port")
-        if port is not None and (not isinstance(port, int) or isinstance(port, bool) or port < 1 or port > 65535):
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"].pier.port must be an integer 1-65535, got {port}')
-        ames = pier.get("ames")
-        if ames is not None and (not isinstance(ames, int) or isinstance(ames, bool) or ames < 1 or ames > 65535):
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"].pier.ames must be an integer 1-65535, got {ames}')
-        loom = pier.get("loom")
-        if loom is not None and (not isinstance(loom, int) or isinstance(loom, bool) or loom < 1):
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"].pier.loom must be a positive integer, got {loom}')
-        local = pier.get("local", False)
-        if not isinstance(local, bool):
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"].pier.local must be a boolean, got {local}')
-        code = ship.get("code")
-        if code is not None and (not isinstance(code, str) or not code_re.match(code)):
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"].code must be a +code key (e.g. "ralnyt-botwyc-batnyt-dozzod")')
-        http = ship.get("http")
-        if http is not None and (not isinstance(http, str) or not http.strip() or re.search(r"\s", http)):
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"].http must be a non-empty hostname or URL (e.g. "example.com")')
-        ticket = ship.get("master-ticket")
-        if ticket is not None and (not isinstance(ticket, str) or not TICKET_RE.match(ticket)):
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"].master-ticket must be a ticket like "~ralnyt-botwyc-batnyt-dozzod"')
-        mnemonic = ship.get("mnemonic")
-        if mnemonic is not None and (not isinstance(mnemonic, str) or not MNEMONIC_RE.match(mnemonic)):
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"].mnemonic must be a space-separated word list (BIP39 mnemonic)')
-
-        ships.append(Ship(
-            name=sname,
-            host=host,
-            pier=PierConfig(path=pier.get("path"), port=port, loom=loom, ames=ames, local=local),
-            http=http or None,
-            code=code or None,
-            master_ticket=ticket or None,
-            mnemonic=mnemonic or None,
-        ))
+        values: dict[str, Any] = {}
+        for f in FIELDS:
+            v = (pier if f.pier else ship).get(f.key)
+            err = field_error(f, v)
+            if err:
+                raise RuntimeError(f'{CONFIG}: ships["{sname}"].{"pier." if f.pier else ""}{f.key} {err}')
+            values[f.attr] = v
+        ships.append(make_ship(sname, host, values))
 
     desks: list[Desk] = []
     for i, desk in enumerate(desks_raw):
-        if not is_map(desk):
+        if not isinstance(desk, dict):
             raise RuntimeError(f"{CONFIG}: desks[{i}] must be a table {{ name, src }}")
         if not desk.get("name"):
             raise RuntimeError(f'{CONFIG}: desks[{i}] missing "name"')
-        if not desk_re.match(desk["name"]):
-            raise RuntimeError(f'{CONFIG}: desks[{i}].name "{desk["name"]}" must match {desk_re.pattern}')
+        if not DESK_NAME_RE.match(desk["name"]):
+            raise RuntimeError(f'{CONFIG}: desks[{i}].name "{desk["name"]}" must match {DESK_NAME_RE.pattern}')
         desks.append(Desk(name=desk["name"], src=desk.get("src", ".")))
 
     cfg = Config(ships=ships, desks=desks, hosts=hosts)
@@ -2890,36 +2955,28 @@ def render_host_block(name: str, ssh: str, root: str) -> str:
     return f"[hosts.{name}]\nssh = {_toml_str(ssh)}\nroot = {_toml_str(root)}"
 
 
-def render_ship_block(name: str, *, host: str | None, http: str | None,
-                      path: str | None, port: int | None, loom: int | None,
-                      code: str | None, ames: int | None = None,
-                      local: bool = False,
-                      master_ticket: str | None = None,
-                      mnemonic: str | None = None) -> str:
-    lines = [f"[ships.{name}]"]
-    if http:
-        lines.append(f"http = {_toml_str(http)}")
-    if host and host != "local":
-        lines.append(f"host = {_toml_str(host)}")
-    pier = []
-    if path:
-        pier.append(f"path = {_toml_str(path)}")
-    if port is not None:
-        pier.append(f"port = {port}")
-    if ames is not None:
-        pier.append(f"ames = {ames}")
-    if loom is not None:
-        pier.append(f"loom = {loom}")
-    if local:
-        pier.append("local = true")
+def render_ship_block(ship: Ship) -> str:
+    # the [ships.<name>] table. Unset fields are left out, a false `local` too (absent
+    # reads as false), and the pier fields share one inline table after http/host.
+    def lit(f: Field, v: Any) -> str:
+        return _toml_str(v) if f.kind == "str" else ("true" if f.kind == "bool" else str(v))
+
+    lines = [f"[ships.{ship.name}]"]
+    pier: list[str] = []
+    pier_at = 0
+    for f in FIELDS:
+        v = field_get(ship, f)
+        if f.pier:
+            pier_at = pier_at or len(lines)
+            if v is not None and v is not False:
+                pier.append(f"{f.key} = {lit(f, v)}")
+            continue
+        if v is not None:
+            lines.append(f"{f.key} = {lit(f, v)}")
+        if f.key == "http" and ship.host and ship.host != "local":
+            lines.append(f"host = {_toml_str(ship.host)}")
     if pier:
-        lines.append("pier = { " + ", ".join(pier) + " }")
-    if code:
-        lines.append(f"code = {_toml_str(code)}")
-    if master_ticket:
-        lines.append(f"master-ticket = {_toml_str(master_ticket)}")
-    if mnemonic:
-        lines.append(f"mnemonic = {_toml_str(mnemonic)}")
+        lines.insert(pier_at, "pier = { " + ", ".join(pier) + " }")
     return "\n".join(lines)
 
 
@@ -2937,9 +2994,16 @@ class HostDraft:
 
 @dataclass
 class ShipDraft:
-    block: str            # the [ships.<name>] TOML
-    name: str
+    ship: Ship
     new_host: HostDraft | None = None  # a remote host defined inline, to also emit
+
+    @property
+    def name(self) -> str:
+        return self.ship.name
+
+    @property
+    def block(self) -> str:
+        return render_ship_block(self.ship)
 
 
 def _wizard_host() -> HostDraft:
@@ -2955,7 +3019,7 @@ def _wizard_host() -> HostDraft:
 def wizard_ship(name: str, existing: Ship | None, existing_hosts: list[str]) -> ShipDraft:
     # prompt for one ship's fields (the NAME is already chosen — it's the selector).
     # `existing` is the current record when EDITING (its values become the [defaults]),
-    # or None when adding. Returns the rendered block + any new host drafted inline.
+    # or None when adding. Returns the drafted Ship + any new host drafted inline.
     new_host: HostDraft | None = None
     cur_host = (existing.host if existing else None) or "local"
     host_choice = cur_host
@@ -2966,38 +3030,25 @@ def wizard_ship(name: str, existing: Ship | None, existing_hosts: list[str]) -> 
             new_host = _wizard_host()
             host_choice = new_host.name
 
-    cur_port = existing.pier.port if existing else None
-    port = ask_int("http port on the box", default=cur_port if cur_port is not None else 80,
-                   lo=1, hi=65535, optional=True)
-    cur_http = existing.http if existing else None
-    http_default = cur_http or (f"http://localhost:{port}" if (port and host_choice == "local") else None)
-    http = ask("http origin playwright/login targets", default=http_default, optional=True,
-               validate=lambda s: None if s.strip() and not re.search(r"\s", s) else "no spaces; a host or URL")
-    loom = ask_int("loom size (memory pages, power of 2; blank = vere default)",
-                   default=(existing.pier.loom if existing else None), lo=1, optional=True)
-    path = ask("pier path (relative to the host root, or absolute)",
-               default=(existing.pier.path if existing else None) or f".piers/{name}", optional=True)
-    code = ask("+code override (skips the live dojo read; blank = read live)",
-               default=(existing.code if existing else None), optional=True,
-               validate=lambda s: None if CODE_RE.match(s) else "a +code key, e.g. ralnyt-botwyc-batnyt-dozzod")
-    ticket = ask("master ticket (key material; blank = none)",
-                 default=(existing.master_ticket if existing else None), optional=True,
-                 validate=lambda s: None if TICKET_RE.match(s) else "a ticket, e.g. ~ralnyt-botwyc-batnyt-dozzod")
-    mnemonic = ask("mnemonic (BIP39 seed words; blank = none)",
-                   default=(existing.mnemonic if existing else None), optional=True,
-                   validate=lambda s: None if MNEMONIC_RE.match(s) else "a space-separated word list")
-
-    # ames and local aren't prompted for — both are niche — but an existing ship's
-    # pinned ames port and its -L pin must survive being re-rendered here, or the wizard
-    # would quietly unset them. Dropping `local` is the dangerous one: the next `run`
-    # boots a copied pier onto REAL ames and double-boots the ship it was copied from,
-    # which is the entire failure the flag exists to make unforgettable.
-    block = render_ship_block(name, host=host_choice, http=http, path=path,
-                              port=port, ames=(existing.pier.ames if existing else None),
-                              loom=loom, code=code,
-                              local=(existing.pier.local if existing else False),
-                              master_ticket=ticket, mnemonic=mnemonic)
-    return ShipDraft(block=block, name=name, new_host=new_host)
+    # start from the existing record, so the fields the wizard never asks about (ames,
+    # local) survive an edit. Dropping `local` would be the dangerous one: the next
+    # `run` boots a copied pier onto REAL ames and double-boots the ship it was copied
+    # from, which is the entire failure the flag exists to make unforgettable.
+    values: dict[str, Any] = {f.attr: field_get(existing, f) for f in FIELDS} if existing else {}
+    for key in WIZARD_KEYS:
+        f = next(f for f in FIELDS if f.key == key)
+        cur = values.get(f.attr)
+        default = None if cur is None else str(cur)
+        if default is None and key == "port":
+            default = "80"
+        if default is None and key == "http" and values.get("port") and host_choice == "local":
+            default = f"http://localhost:{values['port']}"
+        if default is None and key == "path":
+            default = f".piers/{name}"
+        raw = ask(f.prompt, default=default, optional=True,
+                  validate=lambda s, f=f: field_from_text(f, s)[1])
+        values[f.attr] = field_from_text(f, raw or "")[0]
+    return ShipDraft(make_ship(name, host_choice, values), new_host)
 
 
 # ── non-interactive driver: same TOML emit, fields from --flags (for LLMs/scripts) ─
@@ -3006,25 +3057,15 @@ def wizard_ship(name: str, existing: Ship | None, existing_hosts: list[str]) -> 
 # the wizard would have prompted for, validated through the same rules. The scriptable
 # path: `admiral sampel-palnet add --host drain --port 8080`. (init keeps its own bare-key
 # flag set since it is a top-level verb that also takes --name/--desk/--src.)
-INIT_FLAGS = {"name", "host", "http", "port", "ames", "loom", "local", "path", "code",
-              "master-ticket", "mnemonic", "ssh", "root", "desk", "src"}
+INIT_FLAGS = {"name", "host", "ssh", "root", "desk", "src", *(f.key for f in FIELDS)}
 
 # the per-ship field flags, shared by the `add` and `edit` Cmd entries. All are strings
-# (port/loom are range-checked when applied) so add/edit can carry every editable field.
+# (typed when applied, through field_from_text) so add/edit can carry every field.
 SHIP_FIELD_FLAGS: list[Flag] = [
     Flag("--host", "str", "host the ship runs on (a hosts.<name>, or 'local')", ph="<host>"),
     Flag("--ssh", "str", "ssh target when defining a NEW remote --host (needs --root)", ph="<user@box>"),
     Flag("--root", "str", "absolute base dir when defining a NEW remote --host (needs --ssh)", ph="<dir>"),
-    Flag("--http", "str", "http origin playwright/login targets", ph="<url>"),
-    Flag("--port", "str", "http bind port on the box (1-65535)", ph="<port>"),
-    Flag("--ames", "str", "ames UDP port; pin it so peers' lanes survive a restart", ph="<port>"),
-    Flag("--loom", "str", "loom size (memory pages, power of 2)", ph="<pages>"),
-    Flag("--local", "str", "boot with -L (fake networking) — pin it for a COPIED pier "
-                           "whose original still runs elsewhere", ph="<true|false>"),
-    Flag("--path", "str", "pier path (relative to the host root, or absolute)", ph="<path>"),
-    Flag("--code", "str", "+code override (skips the live dojo read)", ph="<code>"),
-    Flag("--master-ticket", "str", "ship master ticket (key material)", ph="<ticket>"),
-    Flag("--mnemonic", "str", "BIP39 mnemonic seed phrase (quote it)", ph="<words>"),
+    *(Flag(f"--{f.key}", "str", f.desc, ph=f.ph) for f in FIELDS),
 ]
 
 _UNSET = object()  # "flag not provided" — distinct from an explicit empty/None value
@@ -3050,25 +3091,6 @@ def _kv_flags(verb: str, args: list[str], allowed: set[str]) -> dict[str, str]:
     return out
 
 
-def coerce_int(verb: str, key: str, raw: Any, lo: int, hi: int) -> int:
-    try:
-        n = int(raw)
-    except (TypeError, ValueError):
-        raise RuntimeError(f"{verb}: --{key} must be a whole number (got {raw!r})")
-    if n < lo or n > hi:
-        raise RuntimeError(f"{verb}: --{key} must be between {lo} and {hi} (got {n})")
-    return n
-
-
-def coerce_bool(verb: str, key: str, raw: Any) -> bool:
-    s = str(raw).strip().lower()
-    if s in ("true", "yes", "on", "1"):
-        return True
-    if s in ("false", "no", "off", "0", ""):
-        return False
-    raise RuntimeError(f"{verb}: --{key} must be true or false (got {raw!r})")
-
-
 def resolve_upsert_name(selector: str, cfg: Config, *, must_exist: bool) -> str:
     # the selector for add/edit/delete IS the ship name.
     name = selector.lstrip("~")
@@ -3083,15 +3105,13 @@ def ship_draft_upsert(verb: str, name: str, get: Callable[[str], Any],
                       existing: Ship | None, existing_hosts: list[str]) -> ShipDraft:
     # build a ShipDraft for an UPSERT: each field takes its provided value (via get(key),
     # which returns _UNSET when the flag was omitted), else the existing record's value
-    # when editing, else the unset default. --host may be "local", an existing host, or a
-    # NEW host name (then --ssh + --root are required to define it inline).
+    # when editing, else unset. --host may be "local", an existing host, or a NEW host
+    # name (then --ssh + --root are required to define it inline).
     def pick(key: str, cur: Any) -> Any:
         v = get(key)
         return cur if v is _UNSET else v
 
-    ssh, root = get("ssh"), get("root")
-    ssh = None if ssh is _UNSET else ssh
-    root = None if root is _UNSET else root
+    ssh, root = pick("ssh", None), pick("root", None)
     host = pick("host", (existing.host if existing else None)) or "local"
     new_host: HostDraft | None = None
     if host == "local":
@@ -3110,36 +3130,17 @@ def ship_draft_upsert(verb: str, name: str, get: Callable[[str], Any],
             raise RuntimeError(f"{verb}: --root {root!r} must be an absolute path")
         new_host = HostDraft(host, ssh, root)
 
-    port = pick("port", existing.pier.port if existing else None)
-    if port is not None and not isinstance(port, int):
-        port = coerce_int(verb, "port", port, 1, 65535)
-    ames = pick("ames", existing.pier.ames if existing else None)
-    if ames is not None and not isinstance(ames, int):
-        ames = coerce_int(verb, "ames", ames, 1, 65535)
-    loom = pick("loom", existing.pier.loom if existing else None)
-    if loom is not None and not isinstance(loom, int):
-        loom = coerce_int(verb, "loom", loom, 1, 2**31)
-    local = pick("local", existing.pier.local if existing else False)
-    if not isinstance(local, bool):
-        local = coerce_bool(verb, "local", local)
-    http = pick("http", existing.http if existing else None)
-    if http is not None and (not http.strip() or re.search(r"\s", http)):
-        raise RuntimeError(f"{verb}: --http must be a non-empty host or URL with no spaces (got {http!r})")
-    path = pick("path", existing.pier.path if existing else None)
-    code = pick("code", existing.code if existing else None)
-    if code is not None and not CODE_RE.match(code):
-        raise RuntimeError(f"{verb}: --code must be a +code key, e.g. ralnyt-botwyc-batnyt-dozzod (got {code!r})")
-    ticket = pick("master-ticket", existing.master_ticket if existing else None)
-    if ticket is not None and not TICKET_RE.match(ticket):
-        raise RuntimeError(f"{verb}: --master-ticket must be a ticket, e.g. ~ralnyt-botwyc-batnyt-dozzod (got {ticket!r})")
-    mnemonic = pick("mnemonic", existing.mnemonic if existing else None)
-    if mnemonic is not None and not MNEMONIC_RE.match(mnemonic):
-        raise RuntimeError(f"{verb}: --mnemonic must be a space-separated word list (got {mnemonic!r})")
-
-    block = render_ship_block(name, host=host, http=http, path=path, port=port, ames=ames,
-                              loom=loom, code=code, local=local,
-                              master_ticket=ticket, mnemonic=mnemonic)
-    return ShipDraft(block=block, name=name, new_host=new_host)
+    values: dict[str, Any] = {}
+    for f in FIELDS:
+        raw = get(f.key)
+        if raw is _UNSET:
+            values[f.attr] = field_get(existing, f) if existing else None
+            continue
+        v, err = field_from_text(f, raw)
+        if err:
+            raise RuntimeError(f"{verb}: --{f.key} {err}")
+        values[f.attr] = v
+    return ShipDraft(make_ship(name, host, values), new_host)
 
 
 def upsert_ship_block(text: str, name: str, block: str) -> str:

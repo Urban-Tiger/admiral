@@ -363,17 +363,41 @@ class ConfigFile(unittest.TestCase):
         return A.load_config(p)
 
     def test_round_trip(self):
-        block = A.render_ship_block("zod", host="box", http="http://localhost:8080", path="piers/zod",
-                                    port=8080, loom=31, code="lidlut-tabwed-pillex-ridrup", ames=31337,
-                                    local=True, master_ticket="~sampel-ticket", mnemonic="a b c")
+        want = A.Ship("zod", A.PierConfig("piers/zod", 8080, 31, 31337, True), host="box",
+                      http="http://localhost:8080", code="lidlut-tabwed-pillex-ridrup",
+                      master_ticket="~sampel-ticket", mnemonic="a b c")
+        block = A.render_ship_block(want)
         text = A.render_host_block("box", "u@box", "/home/u") + "\n\n" + block + "\n\n" + A.render_desk_block("d", "src")
         cfg = self.load(text)
         [ship] = cfg.ships
-        self.assertEqual(ship, A.Ship("zod", A.PierConfig("piers/zod", 8080, 31, 31337, True), host="box",
-                                      http="http://localhost:8080", code="lidlut-tabwed-pillex-ridrup",
-                                      master_ticket="~sampel-ticket", mnemonic="a b c"))
+        self.assertEqual(ship, want)
         self.assertEqual(cfg.hosts["box"], A.Host("box", "/home/u", "u@box"))
         self.assertEqual(cfg.desks, [A.Desk("d", "src")])
+
+    def test_render_block_shape(self):
+        # host survives without http; unset fields and a false local are left out
+        self.assertEqual(A.render_ship_block(A.Ship("z", A.PierConfig(), host="drain")),
+                         '[ships.z]\nhost = "drain"')
+        self.assertEqual(A.render_ship_block(A.Ship("z", A.PierConfig(port=1, local=False), host="local")),
+                         "[ships.z]\npier = { port = 1 }")
+        self.assertEqual(A.render_ship_block(A.Ship("z", A.PierConfig(), http="h", code="lidlut-tabwed-pillex-ridrup")),
+                         '[ships.z]\nhttp = "h"\ncode = "lidlut-tabwed-pillex-ridrup"')
+        # every Field round-trips through the writer and the loader
+        full = A.Ship("z", A.PierConfig("p", 2, 3, 4, True), http="h", code="lidlut-tabwed-pillex-ridrup",
+                      master_ticket="~ralnyt-botwyc", mnemonic="x y")
+        self.assertEqual(self.load(A.render_ship_block(full)).ships[0], full)
+
+    def test_field_from_text(self):
+        port = next(f for f in A.FIELDS if f.key == "port")
+        local = next(f for f in A.FIELDS if f.key == "local")
+        self.assertEqual(A.field_from_text(port, "8080"), (8080, None))
+        self.assertEqual(A.field_from_text(port, ""), (None, None))
+        self.assertIsNotNone(A.field_from_text(port, "x")[1])
+        self.assertIsNotNone(A.field_from_text(port, "70000")[1])
+        self.assertEqual(A.field_from_text(local, "Yes"), (True, None))
+        self.assertEqual(A.field_from_text(local, "0"), (False, None))
+        self.assertIsNotNone(A.field_from_text(local, "maybe")[1])
+        self.assertEqual(sorted(A.PIER_KEYS), ["ames", "local", "loom", "path", "port"])
 
     def test_minimal(self):
         cfg = self.load("[ships.zod]\n")

@@ -35,7 +35,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 ADMIRAL = str(REPO / "admiral.py")
 sys.path.insert(0, str(REPO))
-import admiral  # noqa: E402  (the config walk-up, socket paths)
+import admiral as adm  # noqa: E402  (the config walk-up, socket paths)
 DESK = REPO / "tests" / "desk"
 PROBE_AGENT = DESK / "app" / "admiral-probe.hoon"
 
@@ -70,12 +70,12 @@ def dojo(ship, command, *flags, timeout=120):
 
 def sock(ship):
     # the ship's socket, from whichever admiral.toml the walk-up from here finds
-    cfg = admiral.load_config()
-    entry = admiral.resolve_ship(ship, cfg)
-    host = admiral.host_for(entry, cfg)
+    cfg = adm.load_config()
+    entry = adm.resolve_ship(ship, cfg)
+    host = adm.host_for(entry, cfg)
     if host.ssh:
         raise RuntimeError(f"{ship} is remote; this case types at a local socket")
-    return admiral.sock_path(entry, host)
+    return adm.sock_path(entry, host)
 
 
 def type_raw(ship, keys):

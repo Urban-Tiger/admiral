@@ -51,6 +51,12 @@ class ParseArgs(unittest.TestCase):
         self.assertEqual(flags, {"-t": 5, "--yes": True, "--since": "2h"})
         self.assertEqual(pos, ["(add 2 2)"])
 
+    def test_flag_equals_value(self):
+        flags, pos = A.parse_args(self.c, ["-t=5", "--since=2h", "x"])
+        self.assertEqual(flags, {"-t": 5, "--since": "2h"})
+        with self.assertRaises(A.UsageError):
+            A.parse_args(self.c, ["--yes=1", "x"])
+
     def test_double_dash_ends_flags(self):
         flags, pos = A.parse_args(self.c, ["--", "-time ~s1"])
         self.assertEqual((flags, pos), ({}, ["-time ~s1"]))
@@ -79,13 +85,14 @@ class CommitVerdict(unittest.TestCase):
     desk = A.Desk("admiral-test")
 
     def test_no_changes(self):
-        self.assertEqual(A.commit_verdict(self.desk, ">=\n"), (True, "commit %admiral-test: no changes"))
+        self.assertEqual(A.commit_verdict(self.desk, ">=\n"), (True, "commit %admiral-test: no changes", []))
 
     def test_counts_and_reload(self):
         out = "+ /lib/x/hoon\n: /app/y/hoon\n- /mar/z/hoon\ngall: reloading %y\ngall: reloading %y\n>="
-        ok, line = A.commit_verdict(self.desk, out)
+        ok, line, reloaded = A.commit_verdict(self.desk, out)
         self.assertTrue(ok)
         self.assertEqual(line, "commit %admiral-test: 3 files (+1 -1 :1), reloaded %y")
+        self.assertEqual(reloaded, ["y"])
 
     def test_nothing_reloaded(self):
         self.assertEqual(A.commit_verdict(self.desk, ": /lib/x/hoon")[1],
@@ -93,7 +100,7 @@ class CommitVerdict(unittest.TestCase):
 
     def test_compiler_line_beats_crud(self):
         out = "crud: %into event failed\nsyntax error at [7 19] in /app/x/hoon\nbail: meme"
-        ok, line = A.commit_verdict(self.desk, out)
+        ok, line, _ = A.commit_verdict(self.desk, out)
         self.assertFalse(ok)
         self.assertTrue(line.startswith("commit %admiral-test FAILED: syntax error"), line)
 

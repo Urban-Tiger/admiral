@@ -88,6 +88,7 @@ MNEMONIC_RE = re.compile(r"^[a-z]+( [a-z]+)+$")          # BIP39 mnemonic (2+ lo
 # per-command dojo timeouts (seconds); commit drives a full build, rest are quick.
 T_COMMIT = 300  # a first build of a big desk takes minutes; a timeout aborts it
 T_RUN = 15
+T_HTTP = 3  # the status probe's GET; a dead origin must not stall the card
 T_DOJO = 60  # a dojo command's budget; past it the command is aborted, so builds need room
 T_HARNESS = 15
 T_CHOP = 900  # roll copies the snapshot into the new epoch — minutes on a big pier
@@ -390,7 +391,7 @@ def web_reachable(ship: Ship) -> bool | None:
         return None
     url = base.rstrip("/") + "/~/login"
     try:
-        resp = urllib.request.urlopen(url, timeout=T_RUN)
+        resp = urllib.request.urlopen(url, timeout=T_HTTP)
         return resp.status < 500
     except urllib.error.HTTPError as e:
         return e.code < 500  # 3xx/4xx still means the http server is answering
@@ -440,7 +441,8 @@ def local_exec(file: str, args: list[str], *, input: str | None = None,
                check: bool = True, inherit: bool = False, timeout_ms: int | None = None) -> str:
     timeout = (timeout_ms / 1000) if timeout_ms else None
     if inherit:
-        subprocess.run([file, *args], timeout=timeout, check=True)
+        assert input is None, "inherit=True hands the terminal to the child; it takes no input"
+        subprocess.run([file, *args], timeout=timeout, check=check)
         return ""
     try:
         # errors="replace": __capture streams the raw 256KB pty ring, a circular buffer
@@ -925,10 +927,16 @@ def host_has_run(host: Host, run: str) -> bool:
         return False
 
 
+_has_tool: dict[tuple[str, str], bool] = {}  # (host, tool) -> on PATH; a host's PATH doesn't change mid-run
+
+
 def host_has(host: Host, tool: str) -> bool:
     # is a tool on the host's PATH? lets us tell "probe found nothing" apart from
     # "probe tool missing" — the latter must never read as "pier free".
-    return len(host.exec("which", [tool], check=False).strip()) > 0
+    key = (host.name, tool)
+    if key not in _has_tool:
+        _has_tool[key] = len(host.exec("which", [tool], check=False).strip()) > 0
+    return _has_tool[key]
 
 
 def host_mkdirp(host: Host, d: str) -> None:
@@ -958,7 +966,6 @@ class HeldResult:
     held: bool
     holders: list[int]
     via: list[str]
-    conclusive: bool
 
 
 def _to_pids(out: str) -> list[int]:
@@ -982,12 +989,10 @@ def pier_held(host: Host, ship: Ship) -> HeldResult:
     # contents aren't the live PID). Two path-anchored probes instead:
     #   lsof  — who holds the .vere.lock fd (immune to stale files)
     #   pgrep — the worker whose argv carries THIS pier's absolute path
-    # conclusive is false only when neither tool exists; held=True is always conclusive.
     d = pier_dir(ship, host)
     lock = os.path.join(d, ".vere.lock")
     holders: set[int] = set()
     via: list[str] = []
-    probes = 0
 
     def add(out: str, tag: str) -> None:
         pids = _to_pids(out)
@@ -1004,14 +1009,11 @@ def pier_held(host: Host, ship: Ship) -> HeldResult:
         except Exception:
             lock_present = False
 
-    if host_has(host, "lsof"):
-        probes += 1
-        if lock_present:
-            add(host.exec("lsof", ["-t", lock], check=False), "lsof")
+    if lock_present and host_has(host, "lsof"):
+        add(host.exec("lsof", ["-t", lock], check=False), "lsof")
     if host_has(host, "pgrep"):
-        probes += 1
         add(host.exec("pgrep", ["-f", f"work --snap-dir {d}"], check=False), "pgrep")
-    return HeldResult(len(holders) > 0, sorted(holders), via, probes > 0)
+    return HeldResult(len(holders) > 0, sorted(holders), via)
 
 
 # ── port reconciliation: who actually owns this pier ──────────────────────────
@@ -1838,8 +1840,8 @@ def find_flag(c: Cmd, tok: str) -> Flag | None:
 
 def int_val(c: Cmd, flag: str, raw: str | None) -> int:
     try:
-        n = int(raw)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        n = int(raw or "")
+    except ValueError:
         n = 0
     if n <= 0:
         raise UsageError(c, f"{flag} needs a positive number (got {'nothing' if raw is None else repr(raw)})")
@@ -1861,14 +1863,19 @@ def parse_args(c: Cmd, argv: list[str]) -> tuple[dict[str, Any], list[str]]:
             pos.extend(argv[i + 1:])
             break
         if a.startswith("-"):
+            a, eq, inline = a.partition("=")  # --flag=value
             f = find_flag(c, a)
             if not f:
                 raise UsageError(c, f"Unknown flag: {a}")
             if f.kind == "bool":
+                if eq:
+                    raise UsageError(c, f"{a} takes no value")
                 flags[f.name] = True
             else:
-                i += 1
-                raw = argv[i] if i < len(argv) else None
+                raw: str | None = inline
+                if not eq:
+                    i += 1
+                    raw = argv[i] if i < len(argv) else None
                 if raw is None:
                     raise UsageError(c, f"{a} needs a value ({f.ph or '<val>'})")
                 flags[f.name] = int_val(c, a, raw) if f.kind == "int" else raw
@@ -1900,25 +1907,26 @@ COMMIT_ERROR = re.compile(r"^(crud: |syntax error|bail: |-find\.|-mint|nest-fail
 AGENT_LOADED = re.compile(r"^gall: (?:reloading|booted|installing|reviving) %(\S+)")
 
 
-def commit_verdict(desk: Desk, out: str) -> tuple[bool, str]:
-    # one line on what |commit did, read off its transcript: (succeeded, the line).
+def commit_verdict(desk: Desk, out: str) -> tuple[bool, str, list[str]]:
+    # one line on what |commit did, read off its transcript: (succeeded, the line, the
+    # agents gall reloaded).
     lines = out.split("\n")
     errors = [l for l in lines if COMMIT_ERROR.match(l)]
     if errors:
         # the compiler's own line ("syntax error at [7 19] in /app/x/hoon") beats clay's
         # "crud: %into event failed" wrapper around it.
         errors.sort(key=lambda l: l.startswith(("crud: ", "bail: ")))
-        return (False, f"commit %{desk.name} FAILED: " + "\n  ".join(dict.fromkeys(errors[:3])))
+        return (False, f"commit %{desk.name} FAILED: " + "\n  ".join(dict.fromkeys(errors[:3])), [])
     added = sum(l.startswith("+ /") for l in lines)
     deleted = sum(l.startswith("- /") for l in lines)
     changed = sum(l.startswith(": /") for l in lines)
     files = added + deleted + changed
     if not files:
-        return (True, f"commit %{desk.name}: no changes")
+        return (True, f"commit %{desk.name}: no changes", [])
     agents = list(dict.fromkeys(m.group(1) for l in lines if (m := AGENT_LOADED.match(l))))
     counts = " ".join(f"{sign}{n}" for sign, n in (("+", added), ("-", deleted), (":", changed)) if n)
     loaded = ("reloaded " + " ".join(f"%{x}" for x in agents)) if agents else "nothing reloaded"
-    return (True, f"commit %{desk.name}: {files} file{'s' if files > 1 else ''} ({counts}), {loaded}")
+    return (True, f"commit %{desk.name}: {files} file{'s' if files > 1 else ''} ({counts}), {loaded}", agents)
 
 
 def desk_suspended(ship: Ship, desk: Desk, cfg: Config, log: Callable[[str], None]) -> bool:
@@ -1954,8 +1962,9 @@ def cmd_commit(a: Parsed) -> None:
             dojo_one(ship, f"|unmount %{desk.name}", a.cfg, log=log)
             dojo_one(ship, f"|mount %{desk.name}", a.cfg, log=log)
         out = dojo_one(ship, f"|commit %{desk.name}", a.cfg, timeout=timeout, desk=desk, log=log)
-        ok, verdict = commit_verdict(desk, out)
-        if ok and desk_suspended(ship, desk, a.cfg, log):
+        ok, verdict, reloaded = commit_verdict(desk, out)
+        # a desk that just reloaded an agent is running; only an idle verdict needs +vats
+        if ok and not reloaded and desk_suspended(ship, desk, a.cfg, log):
             verdict += (f"\nwarning: %{desk.name} is suspended, so nothing it commits runs. "
                         f"Start it: {INVOKE} {ship.name} dojo '|revive %{desk.name}'")
         return (ok, out, verdict)
@@ -3238,6 +3247,11 @@ def cmd_init(args: list[str]) -> None:
     target = _config_target()
     if target.exists():
         raise RuntimeError(f"{target} already exists — use `{INVOKE} <ship> add` to add a ship to it")
+    if REPO != Path.cwd():
+        # the walk-up found a config above us; a second one here would shadow it from
+        # this directory down and split the project's ships across two files.
+        raise RuntimeError(f"{REPO / CONFIG} already governs this directory — use "
+                           f"`{INVOKE} <ship> add` to add a ship to it, or init outside that tree")
     kv = _kv_flags("init", args, INIT_FLAGS)
 
     if kv or not sys.stdin.isatty():
@@ -5023,30 +5037,6 @@ def engine_upgrade(sock: str) -> None:
         s.close()
 
 
-def engine_pty_seek(sock: str, when: float) -> None:
-    # print the byte offset of the last `.idx` record at or before `when`.
-    #
-    # This is what the index is FOR. A caller who wants "what was printed in the last two
-    # seconds" should not have to cook megabytes to find out: seeking by time turns
-    # dojo's slog window into a read of a few KB, independent of how big `.pty` has got.
-    # Floors rather than rounds — the record at/before `when` covers it, the one after
-    # starts too late and would clip the first line.
-    try:
-        with open(sock + ".idx", "rb") as f:
-            recs = f.read()
-    except OSError:
-        sys.stdout.write("0\n")
-        return
-    best = 0
-    for i in range(0, len(recs) - IDX.size + 1, IDX.size):
-        off, t = IDX.unpack_from(recs, i)
-        if t <= when:
-            best = off
-        else:
-            break
-    sys.stdout.write(f"{best}\n")
-
-
 def engine_pty_read(sock: str, offset: int) -> None:
     # ship `.pty` bytes past `offset`, plus the `.idx` records covering them.
     #
@@ -5104,7 +5094,7 @@ def engine_pty_read(sock: str, offset: int) -> None:
 
 
 ENGINE_SUBS = {"__daemon", "__attach", "__send", "__capture", "__capture-at",
-               "__status", "__kill", "__upgrade", "__pty-read", "__pty-seek"}
+               "__status", "__kill", "__upgrade", "__pty-read"}
 
 
 def engine_main(argv: list[str]) -> None:
@@ -5135,8 +5125,6 @@ def engine_main(argv: list[str]) -> None:
         return engine_send(sock)
     if sub == "__pty-read":
         return engine_pty_read(sock, int(rest[0]) if rest else 0)
-    if sub == "__pty-seek":
-        return engine_pty_seek(sock, float(rest[0]) if rest else 0.0)
     if sub == "__capture":
         return engine_capture(sock)
     if sub == "__capture-at":

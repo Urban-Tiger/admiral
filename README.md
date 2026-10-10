@@ -45,8 +45,14 @@ ln -s tools/admiral/admiral.py admiral.py
 
 ## Tests
 
-`tests/run.py` runs admiral's test suite against a live ship. The file's header
-explains how to set up the fixture desk in `tests/desk`.
+Two suites:
+
+- `uv run tests/unit.py` — the pure functions (argument parsing, commit
+  verdicts, prompt parsing, terminal rendering, config load/write, the engine's
+  framing), no ship needed. CI runs these on every push.
+- `tests/run.py <ship>` — the live suite against a running ship: the dojo
+  driver, commits, attach, and the Playwright harness. The file's header
+  explains how to set up the fixture desk in `tests/desk`.
 
 ## License
 

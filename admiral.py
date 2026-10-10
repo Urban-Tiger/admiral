@@ -43,7 +43,7 @@ from typing import Any, Callable
 
 Pattern = Any  # str | compiled regex
 
-VERSION = "0.0.8"
+VERSION = "0.1.0"
 
 # ── identity ──────────────────────────────────────────────────────────────────
 # Name is hardcoded to "admiral". SELF is the script's real on-disk path (the rsync

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# admiral's test suite, run against a live ship from this repo's admiral.toml.
+# admiral's test suite, run against a live ship from the nearest admiral.toml
+# (found by walking up from the current directory, like admiral itself).
 #
 #   tests/run.py <ship> [--group cli|dojo|commit|attach|harness] [--case <name>]
 #
@@ -29,11 +30,12 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 ADMIRAL = str(REPO / "admiral.py")
+sys.path.insert(0, str(REPO))
+import admiral  # noqa: E402  (the config walk-up, socket paths)
 DESK = REPO / "tests" / "desk"
 PROBE_AGENT = DESK / "app" / "admiral-probe.hoon"
 
@@ -67,12 +69,13 @@ def dojo(ship, command, *flags, timeout=120):
 
 
 def sock(ship):
-    cfg = tomllib.loads((REPO / "admiral.toml").read_text())
-    entry = cfg["ships"][ship]
-    if entry.get("host") not in (None, "local"):
+    # the ship's socket, from whichever admiral.toml the walk-up from here finds
+    cfg = admiral.load_config()
+    entry = admiral.resolve_ship(ship, cfg)
+    host = admiral.host_for(entry, cfg)
+    if host.ssh:
         raise RuntimeError(f"{ship} is remote; this case types at a local socket")
-    pier = (entry.get("pier") or {}).get("path") or f".piers/{ship}"
-    return str(REPO / pier / ".admiral.sock")
+    return admiral.sock_path(entry, host)
 
 
 def type_raw(ship, keys):

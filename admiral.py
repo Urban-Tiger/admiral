@@ -146,8 +146,9 @@ class Config:
 
 
 # ── config loading + validation ──────────────────────────────────────────────
-def load_config() -> Config:
-    file = REPO / CONFIG
+def load_config(file: Path | None = None) -> Config:
+    # `file` overrides the walk-up config; tests load fixtures through it.
+    file = file or REPO / CONFIG
     try:
         raw = file.read_text("utf8")
     except OSError:
@@ -580,7 +581,7 @@ def _regex_clean(text: str) -> str:
     text = _OSC.sub("", text)
     text = _CSI.sub("", text)
     text = _ESC.sub("", text)
-    text = text.replace("\r", "\n")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     return _CTL.sub("", text)
 
 
@@ -2738,7 +2739,8 @@ def _rc_markers(tag: str) -> tuple[str, str]:
 def _rc_strip(text: str, tag: str) -> str:
     beg, end = _rc_markers(tag)
     pat = re.compile(rf"\n*{re.escape(beg)}.*?{re.escape(end)}\n?", re.DOTALL)
-    return pat.sub("", text)
+    out = pat.sub("", text)
+    return out.rstrip("\n") + "\n" if out.strip() else ""  # keep the file's final newline
 
 
 def rc_present(p: Path, tag: str) -> bool:

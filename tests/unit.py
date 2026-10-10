@@ -198,7 +198,70 @@ class Render(unittest.TestCase):
             A.parse_since("soon")
 
 
+def fake_daemon(path, replies, hold=False):
+    # a daemon that answers one connection: reads a frame, sends replies[ctype] (a list of
+    # (stype, payload)) back, or holds the connection open forever when `hold`
+    import socket
+    import threading
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(1)
+    seen = []
+
+    def serve():
+        conn, _ = srv.accept()
+        fr = A.FrameReader()
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            for t, payload in fr.feed(chunk):
+                seen.append((t, payload))
+                for st, sp in replies.get(t, []):
+                    A.send_frame(conn, st, sp)
+                if not hold:
+                    conn.close()
+                    srv.close()
+                    return
+    th = threading.Thread(target=serve, daemon=True)
+    th.start()
+    return seen
+
+
 class Engine(unittest.TestCase):
+    def test_sock_request_round_trips(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s")
+            seen = fake_daemon(path, {A.C_PING: [(A.S_DATA, b"noise"), (A.S_PONG, b"11 22 9.9.9")]})
+            self.assertEqual(A.engine_ping(path), (11, 22, "9.9.9"))
+            self.assertEqual(seen, [(A.C_PING, b"")])
+            # no daemon: every client reads it as down, none raises
+            os.unlink(path)
+            self.assertIsNone(A.engine_ping(path))
+            self.assertIsNone(A.sock_capture_at(path, 0))
+            self.assertEqual(A.sock_capture(path), b"")
+            self.assertFalse(A.sock_send(path, b"x"))
+            # fire-and-forget sends the frame and returns once connected
+            seen = fake_daemon(path, {})
+            self.assertTrue(A.sock_send(path, b"keys"))
+            time.sleep(0.1)
+            self.assertEqual(seen, [(A.C_DATA, b"keys")])
+
+    def test_sock_capture_at_decodes_total(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s")
+            seen = fake_daemon(path, {A.C_CAPTURE_AT: [(A.S_SNAPSHOT_AT, struct.pack("!Q", 500) + b"tail")]})
+            self.assertEqual(A.sock_capture_at(path, 123), (500, b"tail"))
+            self.assertEqual(seen, [(A.C_CAPTURE_AT, struct.pack("!Q", 123))])
+
+    def test_sock_request_times_out_on_a_mute_daemon(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s")
+            fake_daemon(path, {}, hold=True)
+            t0 = time.monotonic()
+            self.assertIsNone(A.sock_request(path, A.C_PING, want=A.S_PONG, timeout=0.2))
+            self.assertLess(time.monotonic() - t0, 2)
+
     def test_frame_reader_reassembles(self):
         frames = A.HDR.pack(A.C_PING, 0) + A.HDR.pack(A.S_DATA, 3) + b"abc" + A.HDR.pack(A.S_EXIT, 2) + b"xy"
         fr = A.FrameReader()
@@ -255,7 +318,7 @@ class ConfigFile(unittest.TestCase):
         self.assertEqual(ship, A.Ship("zod", A.PierConfig("piers/zod", 8080, 31, 31337, True), host="box",
                                       http="http://localhost:8080", code="lidlut-tabwed-pillex-ridrup",
                                       master_ticket="~sampel-ticket", mnemonic="a b c"))
-        self.assertEqual(cfg.hosts["box"], A.HostDef("u@box", "/home/u"))
+        self.assertEqual(cfg.hosts["box"], A.Host("box", "/home/u", "u@box"))
         self.assertEqual(cfg.desks, [A.Desk("d", "src")])
 
     def test_minimal(self):
@@ -376,7 +439,7 @@ class RcBlocks(unittest.TestCase):
 
 class Resolution(unittest.TestCase):
     cfg = A.Config(ships=[A.Ship("zod", A.PierConfig()), A.Ship("nec", A.PierConfig(), host="drain")],
-                   desks=[A.Desk("base"), A.Desk("other")], hosts={"drain": A.HostDef("u@b", "/r")})
+                   desks=[A.Desk("base"), A.Desk("other")], hosts={"drain": A.Host("drain", "/r", "u@b")})
 
     def test_ships(self):
         self.assertIs(A.resolve_ship("~zod", self.cfg), self.cfg.ships[0])

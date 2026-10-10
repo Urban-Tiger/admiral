@@ -134,16 +134,31 @@ class Desk:
 
 
 @dataclass
-class HostDef:
-    ssh: str                  # ssh target (user@box); `ssh <ssh>` must work unattended
+class Host:
+    # a machine ships run on. The local machine is LOCAL (below); remote ones come from
+    # the config's [hosts.<name>] tables and are reached over ssh.
+    name: str
     root: str                 # absolute base dir for relative pier paths + desk syncs
+    ssh: str | None = None    # ssh target (user@box; `ssh <ssh>` must work unattended); None = local
+
+    def exec(self, file: str, args: list[str], *, input: str | None = None,
+             check: bool = True, inherit: bool = False, timeout_ms: int | None = None) -> str:
+        # local short-circuits to a direct exec; remote wraps file+args into ONE
+        # shell-quoted command and runs it through the local ssh client (per-arg
+        # shq lets a `--sock <path>` / dojo cmd argument survive the one remote parse
+        # intact). inherit -> `-tt` (pty, interactive attach); captured -> `-T`.
+        if self.ssh:
+            remote = " ".join(shq(x) for x in [file, *args])
+            return local_exec("ssh", [("-tt" if inherit else "-T"), *SSH_MUX, self.ssh, remote],
+                              input=input, check=check, inherit=inherit, timeout_ms=timeout_ms)
+        return local_exec(file, args, input=input, check=check, inherit=inherit, timeout_ms=timeout_ms)
 
 
 @dataclass
 class Config:
     ships: list[Ship]
     desks: list[Desk]
-    hosts: dict[str, HostDef]
+    hosts: dict[str, Host]    # remote hosts by name; the local machine is implicit
 
 
 # ── config loading + validation ──────────────────────────────────────────────
@@ -184,8 +199,7 @@ def load_config(file: Path | None = None) -> Config:
     # hosts: a table of REMOTE machines, keyed by name (the local machine is
     # implicit — a ship with no "host" runs locally, root = REPO). Validate first
     # so ships can reference them.
-    host_names: set[str] = set()
-    hosts: dict[str, HostDef] = {}
+    hosts: dict[str, Host] = {}
     hosts_raw = cfg.get("hosts")
     if hosts_raw is not None:
         if not is_map(hosts_raw):
@@ -201,8 +215,7 @@ def load_config(file: Path | None = None) -> Config:
                 raise RuntimeError(f'{CONFIG}: hosts["{hname}"] missing "root" (absolute base dir for piers, e.g. /home/urb)')
             if not os.path.isabs(h["root"]):
                 raise RuntimeError(f'{CONFIG}: hosts["{hname}"].root "{h["root"]}" must be an absolute path')
-            hosts[hname] = HostDef(ssh=h["ssh"], root=h["root"])
-            host_names.add(hname)
+            hosts[hname] = Host(hname, h["root"], h["ssh"])
 
     ships: list[Ship] = []
     for sname, ship in ships_raw.items():
@@ -212,10 +225,10 @@ def load_config(file: Path | None = None) -> Config:
             raise RuntimeError(f'{CONFIG}: ship name "{sname}" must match {win_re.pattern}')
         # host: top-level hosts key; empty/"local"/None => the local machine.
         host = ship.get("host") or None
-        if host is not None and host != "local" and host not in host_names:
+        if host is not None and host != "local" and host not in hosts:
             raise RuntimeError(
                 f'{CONFIG}: ships["{sname}"].host "{host}" is not in "hosts" '
-                f'(have: {", ".join(["local", *host_names])})'
+                f'(have: {", ".join(["local", *hosts])})'
             )
         # pier: optional table of where the ship's pier lives + its boot params.
         pier = ship.get("pier") or {}
@@ -290,7 +303,7 @@ def pier_rel(ship: Ship) -> str:
     return ship.pier.path or f".piers/{ship.name}"
 
 
-def pier_dir(ship: Ship, host: "Host") -> str:
+def pier_dir(ship: Ship, host: Host) -> str:
     p = pier_rel(ship)
     if os.path.isabs(p) or p.startswith("~"):
         return p
@@ -312,7 +325,7 @@ _pushed: set[str] = set()  # hosts this process has already rsynced the tool to
 SOCK_PATH_MAX = 103  # sun_path is 104 bytes on macOS, NUL included; Linux allows 107
 
 
-def sock_path(ship: "Ship", host: "Host") -> str:
+def sock_path(ship: Ship, host: Host) -> str:
     # the daemon's control socket lives inside the pier dir on the ship's host —
     # a unix-domain socket, host-local: it never crosses the network (ssh is the
     # only transport).
@@ -324,7 +337,7 @@ def sock_path(ship: "Ship", host: "Host") -> str:
     return path
 
 
-def remote_self(host: "Host") -> str:
+def remote_self(host: Host) -> str:
     # path to THIS file on the host. Local => the file itself; remote => a pushed
     # copy under <root>/.<NAME>/<CLI>. CONFIG is never shipped — only this tool.
     if not host.ssh:
@@ -332,7 +345,7 @@ def remote_self(host: "Host") -> str:
     return os.path.join(host.root, f".{NAME}", CLI)
 
 
-def ensure_self(host: "Host") -> str:
+def ensure_self(host: Host) -> str:
     # make sure this file exists on the host; rsync one file, once per host per
     # process. Cheap + idempotent (rsync skips when the bytes are unchanged).
     rs = remote_self(host)
@@ -345,14 +358,14 @@ def ensure_self(host: "Host") -> str:
     return rs
 
 
-def vere_binary(ship: "Ship", host: "Host") -> str:
+def vere_binary(ship: Ship, host: Host) -> str:
     # a booted pier keeps its own vere binary at <pier>/.run, so prefer that (the
     # host then needs no `urbit` on PATH); fall back to `urbit`.
     run = os.path.join(pier_dir(ship, host), ".run")
     return run if host_has_run(host, run) else "urbit"
 
 
-def run_argv(ship: "Ship", host: "Host") -> list[str]:
+def run_argv(ship: Ship, host: Host) -> list[str]:
     # the command the daemon holds a pty for: run the urbit pier with its configured
     # loom + http/ames ports.
     pier = pier_dir(ship, host)
@@ -480,42 +493,17 @@ SSH_MUX = [
 ]
 
 
-@dataclass
-class Host:
-    name: str
-    root: str                 # base dir for relative pier paths (REPO for local)
-    ssh: str | None = None    # ssh target; None for local
-
-    def exec(self, file: str, args: list[str], *, input: str | None = None,
-             check: bool = True, inherit: bool = False, timeout_ms: int | None = None) -> str:
-        # local short-circuits to a direct exec; remote wraps file+args into ONE
-        # shell-quoted command and runs it through the local ssh client (per-arg
-        # shq lets a `--sock <path>` / dojo cmd argument survive the one remote parse
-        # intact). inherit -> `-tt` (pty, interactive attach); captured -> `-T`.
-        if self.ssh:
-            remote = " ".join(shq(x) for x in [file, *args])
-            return local_exec("ssh", [("-tt" if inherit else "-T"), *SSH_MUX, self.ssh, remote],
-                              input=input, check=check, inherit=inherit, timeout_ms=timeout_ms)
-        return local_exec(file, args, input=input, check=check, inherit=inherit, timeout_ms=timeout_ms)
-
-
 # the local machine itself — the local end of every rsync; reused as every local
 # ship's host (host omitted => runs here).
 LOCAL = Host("local", str(REPO))
 
 
 def host_for(ship: Ship, cfg: Config) -> Host:
-    # no host, or the reserved name "local", => the local machine.
-    h = ship.host
-    if not h or h == "local":
+    # no host, or the reserved name "local", => the local machine. load_config already
+    # rejected a name that is not in hosts.
+    if not ship.host or ship.host == "local":
         return LOCAL
-    d = cfg.hosts.get(h)
-    if not d:
-        raise RuntimeError(
-            f'ship "{ship.name}" references unknown host "{h}" '
-            f'(hosts: {", ".join(cfg.hosts) or "none"})'
-        )
-    return Host(h, d.root, d.ssh)
+    return cfg.hosts[ship.host]
 
 
 # ── engine helpers (host-routed: drive the daemon on the ship's host) ──────────
@@ -4433,33 +4421,45 @@ class FrameReader:
             yield t, payload
 
 
+def sock_request(path: str, ctype: int, payload: bytes = b"", want: int | None = None,
+                 timeout: float | None = 5.0) -> bytes | None:
+    # one round trip to the daemon on `path`: connect, send one frame, and when `want`
+    # is set return the payload of the first frame of that type. None when no daemon
+    # answers — no socket, connection refused, closed mid-read, or no `want` frame within
+    # `timeout` (a daemon predating that frame type ignores it). A fire-and-forget
+    # (`want` None) returns b"" once the frame is sent. Every client below is this.
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        s.connect(path)
+        send_frame(s, ctype, payload)
+        if want is None:
+            return b""
+        fr = FrameReader()
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                return None
+            for t, got in fr.feed(chunk):
+                if t == want:
+                    return got
+    except OSError:  # socket.timeout is an OSError subclass
+        return None
+    finally:
+        s.close()
+
+
 def engine_ping(path: str) -> tuple[int, int, str | None] | None:
     # (daemon_pid, child_pid, engine_version) if a daemon answers, else None. The
     # version field is absent from a pre-versioning daemon's pong -> None there.
-    if not os.path.exists(path):
+    pong = sock_request(path, C_PING, want=S_PONG, timeout=3.0)
+    if pong is None:
         return None
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        s.settimeout(3.0)
-        s.connect(path)
-        send_frame(s, C_PING)
-        fr = FrameReader()
-        while True:
-            chunk = s.recv(4096)
-            if not chunk:
-                return None
-            for t, payload in fr.feed(chunk):
-                if t == S_PONG:
-                    parts = payload.decode().split()
-                    ver = parts[2] if len(parts) > 2 else None
-                    return (int(parts[0]), int(parts[1]), ver)
-    except (OSError, ValueError):
+        parts = pong.decode().split()
+        return (int(parts[0]), int(parts[1]), parts[2] if len(parts) > 2 else None)
+    except (IndexError, ValueError):
         return None
-    finally:
-        try:
-            s.close()
-        except OSError:
-            pass
 
 
 def engine_winsize(fd: int) -> bytes:
@@ -4917,67 +4917,27 @@ def engine_send(sock: str) -> None:
 
 
 def sock_capture(sock: str) -> bytes:
-    # the whole ring, or b"" if no daemon answers (a probe reads that as "down").
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.connect(sock)
-    except OSError:
-        return b""
-    try:
-        send_frame(s, C_CAPTURE)
-        fr = FrameReader()
-        while True:
-            chunk = s.recv(65536)
-            if not chunk:
-                return b""
-            for t, payload in fr.feed(chunk):
-                if t == S_SNAPSHOT:
-                    return payload
-    except OSError:
-        return b""
-    finally:
-        s.close()
+    # the whole ring, or b"" if no daemon answers (a probe reads that as "down"). No
+    # timeout: a full ring is tens of MB and the daemon sends it in one frame.
+    return sock_request(sock, C_CAPTURE, want=S_SNAPSHOT, timeout=None) or b""
 
 
 def sock_capture_at(sock: str, offset: int) -> tuple[int, bytes] | None:
     # (current total, ring bytes past `offset`), or None when the daemon does not
     # answer S_SNAPSHOT_AT — no daemon at all, or one predating C_CAPTURE_AT. Both
     # leave the caller to fall back to a whole-ring capture.
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.connect(sock)
-    except OSError:
+    got = sock_request(sock, C_CAPTURE_AT, struct.pack("!Q", offset & 0xFFFFFFFFFFFFFFFF),
+                       want=S_SNAPSHOT_AT)
+    if got is None:
         return None
-    s.settimeout(5.0)
-    try:
-        send_frame(s, C_CAPTURE_AT, struct.pack("!Q", offset & 0xFFFFFFFFFFFFFFFF))
-        fr = FrameReader()
-        while True:
-            chunk = s.recv(65536)
-            if not chunk:
-                return None
-            for t, payload in fr.feed(chunk):
-                if t == S_SNAPSHOT_AT:
-                    return (struct.unpack("!Q", payload[:8])[0], payload[8:])
-    except OSError:  # socket.timeout is an OSError subclass
-        return None
-    finally:
-        s.close()
+    return (struct.unpack("!Q", got[:8])[0], got[8:])
 
 
 def sock_send(sock: str, data: bytes) -> bool:
     # inject bytes into the pty. False when no daemon took them — a SILENT failure
     # here reads downstream as "the dojo refused the line", which sends people
     # hunting the line editor for what is really a dead socket.
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.connect(sock)
-        send_frame(s, C_DATA, data)
-        return True
-    except OSError:
-        return False
-    finally:
-        s.close()
+    return sock_request(sock, C_DATA, data) is not None
 
 
 def engine_capture(sock: str) -> None:
@@ -5012,14 +4972,7 @@ def engine_status(sock: str) -> None:
 
 
 def engine_kill(sock: str) -> None:
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.connect(sock)
-        send_frame(s, C_KILL)
-    except OSError:
-        pass
-    finally:
-        s.close()
+    sock_request(sock, C_KILL)
 
 
 def engine_upgrade(sock: str) -> None:
@@ -5027,14 +4980,7 @@ def engine_upgrade(sock: str) -> None:
     # keeping urbit + the pty alive). A pre-versioning daemon has no C_UPGRADE handler
     # and silently ignores the frame — the frontend detects that by polling the
     # reported version and falls back to a restart.
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.connect(sock)
-        send_frame(s, C_UPGRADE)
-    except OSError:
-        pass
-    finally:
-        s.close()
+    sock_request(sock, C_UPGRADE)
 
 
 def engine_pty_read(sock: str, offset: int) -> None:

@@ -41,6 +41,28 @@ class FakeHost(A.Host):
         return out or ""
 
 
+class Persist(unittest.TestCase):
+    def test_unit_text_runs_the_same_daemon(self):
+        h = FakeHost()
+        ship = A.Ship("zod", A.PierConfig(path="piers/zod", port=8080, ames=31337, loom=31))
+        text = A.unit_text(ship, h)
+        sock = A.sock_path(ship, h)
+        self.assertIn("WantedBy=default.target", text)
+        self.assertIn(f"RequiresMountsFor={A.pier_dir(ship, h)}", text)
+        self.assertIn(f"__daemon --foreground --sock {sock} -- " + " ".join(A.run_argv(ship, h)), text)
+        self.assertIn(f"ExecStop=-/usr/bin/env python3 {A.remote_self(h)} __kill --sock {sock}", text)
+        self.assertEqual(A.unit_name(ship), "admiral-zod.service")
+
+    def test_unit_enabled_needs_systemctl(self):
+        # host_has caches per host name, and every FakeHost is "fake"
+        A._has_tool.clear()
+        h = FakeHost({"which": ""})
+        self.assertFalse(A.unit_enabled(h, A.Ship("zod", A.PierConfig())))
+        A._has_tool.clear()
+        h = FakeHost({"which": "/usr/bin/systemctl", "systemctl": "enabled\n"})
+        self.assertTrue(A.unit_enabled(h, A.Ship("zod", A.PierConfig())))
+
+
 class ParseArgs(unittest.TestCase):
     def setUp(self):
         self.c = cmd([A.Flag("-t", "int", "", ph="<secs>"), A.Flag("--yes", "bool", ""),

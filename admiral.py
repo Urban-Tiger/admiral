@@ -2208,12 +2208,18 @@ def cmd_info(a: Parsed) -> None:
             for i, (name, kb) in enumerate(zip(epochs, epoch_kb), 1)
         ]
 
+    unit_cell = "-"
+    if host_has(host, "systemctl"):
+        unit_cell = (f"{unit_name(ship)} ({'active' if unit_active(host, ship) else 'inactive'})"
+                     if unit_enabled(host, ship) else "not persisted")
+
     rows: list[tuple[str, str]] = [
         ("ship", ship.name),
         ("host", f"{host.name} ({host.ssh}:{host.root})" if host.ssh else f"local ({host.root})"),
         ("pier", f"{pier_dir(ship, host)} ({', '.join(pier_extra)})" if pier_extra else pier_dir(ship, host)),
         *size_rows,
         ("sock", sock_path(ship, host)),
+        ("unit", unit_cell),
         ("http", ship.http or "-"),
         ("code", ship.code or "(live from dojo)"),
         ("master ticket", "set" if ship.master_ticket else "-"),
@@ -2262,6 +2268,12 @@ def daemon_start(ship: Ship, host: Host) -> tuple[int, int, str | None]:
     # the pty log tail if it never comes up — typically vere's own lock refusal.
     host_mkdirp(host, os.path.dirname(sock_path(ship, host)))
     eng(host, ship, "__daemon", "--", *run_argv(ship, host), check=False)
+    return wait_daemon(host, ship)
+
+
+def wait_daemon(host: Host, ship: Ship) -> tuple[int, int, str | None]:
+    # wait for a just-started daemon to answer on the ship's socket. Raises with the
+    # pty log tail if it never comes up — typically vere's own lock refusal.
     for _ in range(10):
         time.sleep(1)
         st = daemon_status(host, ship)
@@ -2329,10 +2341,122 @@ def daemon_stop(ship: Ship, host: Host, timeout: int = 30) -> bool:
     return False
 
 
+# ── persist: a systemd user unit per ship ─────────────────────────────────────
+# `persist` writes ~/.config/systemd/user/<NAME>-<ship>.service on the ship's host and
+# enables it, so the ship comes up at boot — as the ssh user, no root. The unit runs
+# the daemon `run` would start (--foreground, so systemd is its parent) and stops it
+# through the engine's own __kill, so `systemctl --user stop` IS `exit`. While a unit
+# is enabled `run` starts the ship through it, so systemd and admiral always hold the
+# same daemon. A user's units start at boot only once the user lingers
+# (`loginctl enable-linger <user>`, once, as root); persist says when that is off.
+def unit_name(ship: Ship) -> str:
+    return f"{NAME}-{ship.name}.service"
+
+
+def unit_file(ship: Ship) -> str:
+    # expanded by the host's shell, so it is only ever passed inside an `sh -c`
+    return f"~/.config/systemd/user/{unit_name(ship)}"
+
+
+def unit_text(ship: Ship, host: Host) -> str:
+    python = "/usr/bin/env python3"
+    rs = remote_self(host)
+    sock = sock_path(ship, host)
+    start = " ".join([python, rs, "__daemon", "--foreground", "--sock", sock, "--", *run_argv(ship, host)])
+    return (
+        "[Unit]\n"
+        f"Description=urbit {ship.name} under {NAME}\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        f"RequiresMountsFor={pier_dir(ship, host)}\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"WorkingDirectory={host.root}\n"
+        f"ExecStart={start}\n"
+        f"ExecStop=-{python} {rs} __kill --sock {sock}\n"
+        "KillMode=mixed\n"
+        "TimeoutStopSec=180\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def systemctl(host: Host, *args: str, check: bool = True) -> str:
+    return host.exec("systemctl", ["--user", *args], check=check).strip()
+
+
+def unit_enabled(host: Host, ship: Ship) -> bool:
+    # a persisted ship has an enabled unit; a host without systemd has none.
+    if not host_has(host, "systemctl"):
+        return False
+    return systemctl(host, "is-enabled", unit_name(ship), check=False) == "enabled"
+
+
+def unit_active(host: Host, ship: Ship) -> bool:
+    return systemctl(host, "is-active", unit_name(ship), check=False) == "active"
+
+
+def unit_present(host: Host, ship: Ship) -> bool:
+    try:
+        host.exec("sh", ["-c", f"test -f {unit_file(ship)}"])
+        return True
+    except Exception:
+        return False
+
+
+def linger_on(host: Host) -> bool:
+    out = host.exec("sh", ["-c", 'loginctl show-user "$(id -un)" -p Linger --value'], check=False)
+    return out.strip() == "yes"
+
+
+def cmd_persist(a: Parsed) -> None:
+    # make a ship come up at boot: write and enable its systemd user unit on the host.
+    # A ship running outside the unit is moved under it — one clean restart — so that
+    # from here on systemd and admiral hold the same daemon. --off disables and removes
+    # the unit; the ship keeps running until `exit`.
+    def work(ship, host, log):
+        if not host_has(host, "systemctl"):
+            raise RuntimeError(f"persist needs systemd on the ship's host ({host.name} has no systemctl)")
+        unit = unit_name(ship)
+        if a.flags.get("--off"):
+            if not unit_present(host, ship):
+                return "not persisted"
+            systemctl(host, "disable", unit, check=False)
+            host.exec("sh", ["-c", f"rm -f {unit_file(ship)}"])
+            systemctl(host, "daemon-reload")
+            return f"unpersisted; the ship keeps running until `{INVOKE} {ship.name} exit`"
+        if not pier_exists(host, ship):
+            raise RuntimeError(f'no pier at {pier_dir(ship, host)} — `{INVOKE} {ship.name} boot` first')
+        ensure_self(host)
+        host.exec("sh", ["-c", f"mkdir -p ~/.config/systemd/user && cat > {unit_file(ship)}"],
+                  input=unit_text(ship, host))
+        systemctl(host, "daemon-reload")
+        systemctl(host, "enable", unit)
+        note = "" if linger_on(host) else (
+            f"\n  linger is off on {host.name}: the unit starts at boot only after\n"
+            f"  sudo loginctl enable-linger $(id -un)")
+        st = daemon_status(host, ship)
+        if st and unit_active(host, ship):
+            return f"persisted as {unit} (already under it)" + note
+        if st:
+            log("restarting under the unit")
+            if not daemon_stop(ship, host):
+                raise RuntimeError("the running daemon would not stop; persisted, but still outside the unit")
+            systemctl(host, "start", unit)
+            st = wait_daemon(host, ship)
+            return f"persisted as {unit}; restarted under it (daemon {st[0]} child {st[1]})" + note
+        return f"persisted as {unit}; `{INVOKE} {ship.name} run` starts it" + note
+
+    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+
+
 def cmd_run(a: Parsed) -> None:
     # turn a ship ON: push the tool to the host, start the pty-holder daemon (which
     # forkpty's `urbit <pier>` and serves the socket), wait for it to answer. The
-    # pier must already exist — use `boot` to create one for the first time.
+    # pier must already exist — use `boot` to create one for the first time. A
+    # persisted ship starts through its unit, so systemd owns the daemon it will stop.
     def work(ship, host, log):
         if not pier_exists(host, ship):
             raise RuntimeError(f'no pier at {pier_dir(ship, host)} — `{INVOKE} {ship.name} boot` first')
@@ -2341,6 +2465,11 @@ def cmd_run(a: Parsed) -> None:
         if st:
             assert_port_match(host, ship, st)
             return f"already running (daemon {st[0]} child {st[1]})"
+        if unit_enabled(host, ship):
+            log("starting through its systemd unit")
+            systemctl(host, "start", unit_name(ship))
+            st = wait_daemon(host, ship)
+            return f"running under {unit_name(ship)} (daemon {st[0]} child {st[1]})"
         st = daemon_start(ship, host)
         return f"running (daemon {st[0]} child {st[1]})"
 
@@ -3099,6 +3228,24 @@ COMMANDS: list[Cmd] = [
                  "then stop the daemon. An already-stopped ship is reported as such."),
         examples=[f"{INVOKE} sampel-palnet exit"],
         run=cmd_exit,
+    ),
+    Cmd(
+        name="persist", summary="start the ship at boot, through a systemd user unit",
+        flags=[Flag("--off", "bool", "disable and remove the unit; the ship keeps running")],
+        positionals=[],
+        details=("Write ~/.config/systemd/user/admiral-<ship>.service on the ship's host and "
+                 "enable it, so the ship comes up at boot as the ssh user — no root. The unit "
+                 "runs the daemon `run` would start and stops it the way `exit` does, so "
+                 "`systemctl --user stop` and `exit` are the same clean shutdown. While the "
+                 "unit is enabled, `run` starts the ship through it.\n\n"
+                 "A ship already running outside the unit is restarted under it, once. "
+                 "A stopped ship stays stopped until `run`.\n\n"
+                 "systemd starts a user's units at boot only when the user lingers: "
+                 "`sudo loginctl enable-linger <user>` once on the host. persist says so "
+                 "when it is off.\n\n"
+                 "Needs systemd on the ship's host; a Mac cannot persist."),
+        examples=[f"{INVOKE} sampel-palnet persist", f"{INVOKE} sampel-palnet persist --off"],
+        run=cmd_persist,
     ),
     Cmd(
         name="engine-upgrade", summary="swap in this file's admiral engine, no restart",

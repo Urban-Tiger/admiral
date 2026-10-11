@@ -2819,7 +2819,7 @@ def cmd_configure(a: Parsed) -> None:
 {bold(f"{CONFIG}: how to write it")}
 
   {NAME} finds its config by climbing from the current directory to the
-  first {CONFIG} (or .{CONFIG}), like git finds .git. It never writes the
+  first {CONFIG} (or .{CONFIG}), as git finds .git. It never writes the
   file: every command re-reads and validates it, so a bad key is reported.
 
 {bold("[ships.<name>]")}  {gray("one table per ship; <name> is the ship's @p without ~")}

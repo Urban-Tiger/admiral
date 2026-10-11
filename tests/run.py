@@ -109,6 +109,14 @@ def _(ship, c):
     c.that("needs a ship first" in err, f"{err!r}")
 
 
+@case("cli", "bare-is-help-status-is-all")
+def _(ship, c):
+    rc, out, err, _ = admiral()
+    c.that(rc == 0 and "Getting started" in err, f"bare admiral is not the help menu: {rc} {err[:200]!r}")
+    rc, out, err, _ = admiral("status")
+    c.that(ship in out + err, f"`status` without a ship did not list {ship}: {(out + err)[:200]!r}")
+
+
 @case("cli", "renamed-commands")
 def _(ship, c):
     for old in ("upgrade", "next"):

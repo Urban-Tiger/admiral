@@ -2796,8 +2796,8 @@ COMMANDS: list[Cmd] = [
                  "misconfigured: the ship runs on a different http port than this config's "
                  "pier.port, so the pier belongs to another admiral.toml. This config refuses to "
                  "touch it, even to attach.\n\n"
-                 f"`{INVOKE}` alone shows every ship in the config; `{INVOKE} <ship>` shows one."),
-        examples=[INVOKE, f"{INVOKE} sampel-palnet", f"{INVOKE} sampel-palnet status --probe"],
+                 f"`{INVOKE} status` shows every ship in the config; `{INVOKE} <ship>` shows one."),
+        examples=[f"{INVOKE} status", f"{INVOKE} sampel-palnet", f"{INVOKE} sampel-palnet status --probe"],
         run=cmd_status,
     ),
     Cmd(
@@ -3137,7 +3137,7 @@ Usage
   {gray(f"{inv} <ship> <command> [opts]")}
 
   <ship> is a ship's name from {CONFIG}, with or without its ~.
-  {gray(inv)} alone shows every ship.
+  {gray(f"{inv} <ship>")} shows one ship; {gray(f"{inv} status")} shows every ship.
 
 Getting started
 
@@ -3912,10 +3912,9 @@ def engine_main(argv: list[str]) -> None:
 def main() -> None:
     argv = sys.argv[1:]
     first = argv[0] if argv else None
-    # bare `admiral` → status over every ship in the config.
+    # bare `admiral` → the help menu.
     if first is None:
-        status = by_name("status")
-        return status.run(Parsed(cmd=status, selector=None, cfg=load_config(), flags={}, pos=[]))
+        return help_menu()
     # engine mode: hidden host-local pty subcommands own argv[0]. No config load.
     if first in ENGINE_SUBS:
         return engine_main(argv)
@@ -3931,6 +3930,12 @@ def main() -> None:
     if shipless and not shipless.ship:
         flags, pos = parse_args(shipless, argv[1:])
         return shipless.run(Parsed(cmd=shipless, selector=None, cfg=None, flags=flags, pos=pos))
+
+    if first == "status":
+        # `admiral status` with no ship: every ship in the config.
+        status = by_name("status")
+        flags, pos = parse_args(status, argv[1:])
+        return status.run(Parsed(cmd=status, selector=None, cfg=load_config(), flags=flags, pos=pos))
 
     selector = argv[0]
     if by_name(selector):

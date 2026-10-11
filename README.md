@@ -5,6 +5,7 @@ small host-local daemon, drives the dojo over a socket, and syncs desk source
 into clay, on this machine or on remote hosts over SSH.
 
 ```
+./admiral.py status                      # every ship's state; `<ship>` alone shows one
 ./admiral.py <ship> run                  # start a ship (the daemon survives disconnects)
 ./admiral.py <ship> dojo '(add 2 2)'     # run a dojo command and print its output
 ./admiral.py <ship> commit <desk>        # rsync a desk's source in and |commit it

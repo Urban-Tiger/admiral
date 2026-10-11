@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import admiral as A  # noqa: E402
+import harness as H  # noqa: E402
 
 
 def cmd(flags=(), positionals=()):
@@ -43,11 +44,11 @@ class FakeHost(A.Host):
 class ParseArgs(unittest.TestCase):
     def setUp(self):
         self.c = cmd([A.Flag("-t", "int", "", ph="<secs>"), A.Flag("--yes", "bool", ""),
-                      A.Flag("--since", "str", "", alias="-s")],
+                      A.Flag("--since", "str", "")],
                      [A.Pos("CMD", True, "")])
 
     def test_kinds(self):
-        flags, pos = A.parse_args(self.c, ["-t", "5", "--yes", "-s", "2h", "(add 2 2)"])
+        flags, pos = A.parse_args(self.c, ["-t", "5", "--yes", "--since", "2h", "(add 2 2)"])
         self.assertEqual(flags, {"-t": 5, "--yes": True, "--since": "2h"})
         self.assertEqual(pos, ["(add 2 2)"])
 
@@ -171,25 +172,14 @@ class Render(unittest.TestCase):
         self.assertTrue(out.endswith(b"rest\n"))
         self.assertNotIn(b"\x1b[6144", out)
 
-    def test_render_table_pads_raw_width(self):
-        buf = io.StringIO()
-        A.render_table(["A", "BB"], [["xxx", "y"]], cell=lambda s: f"\x1b[32m{s}\x1b[0m", stream=buf)
-        head, row = buf.getvalue().split("\n")[:2]
-        self.assertEqual(head, "A    BB")
-        self.assertEqual(row, "\x1b[32mxxx\x1b[0m  \x1b[32my\x1b[0m")
-
     def test_wrap(self):
         self.assertEqual(A.wrap("aa bb cc dd", 5), ["aa bb", "cc dd"])
         self.assertEqual(A.wrap("  pre formatted line", 5), ["  pre formatted line"])
         self.assertEqual(A.wrap("a\n\nb", 80), ["a", "", "b"])
 
-    def test_sizes_and_versions(self):
+    def test_sizes(self):
         self.assertEqual(A.print_size(512 * 1024), "512 MB")
         self.assertEqual(A.print_size(3 * 1024 * 1024), "3.0 GB")
-        self.assertEqual(A.version_status(None, False), ("-", "down"))
-        self.assertEqual(A.version_status(None, True), ("legacy", "stale"))
-        self.assertEqual(A.version_status(A.VERSION, True), (A.VERSION, "current"))
-        self.assertEqual(A.version_status("0.0.1", True), ("0.0.1", "stale"))
 
     def test_parse_since(self):
         self.assertEqual(A.parse_since("5m"), 300)
@@ -239,7 +229,6 @@ class Engine(unittest.TestCase):
             os.unlink(path)
             self.assertIsNone(A.engine_ping(path))
             self.assertIsNone(A.sock_capture_at(path, 0))
-            self.assertEqual(A.sock_capture(path), b"")
             self.assertFalse(A.sock_send(path, b"x"))
             # fire-and-forget sends the frame and returns once connected
             seen = fake_daemon(path, {})
@@ -425,19 +414,19 @@ class ConfigFile(unittest.TestCase):
     def test_toml_str_escapes(self):
         self.assertEqual(tomllib.loads(f"x = {A._toml_str(chr(34) + 'a' + chr(92))}")["x"], '"a\\')
 
-    def test_upsert_and_remove_block(self):
+    def test_splice_ship_block(self):
         text = "# head\n[ships.a]\nhttp = 'x'\n\n[ships.b]  # keep me\nhttp = 'y'\n\n[[desks]]\nname = 'd'\n"
-        out = A.upsert_ship_block(text, "a", "[ships.a]\nhttp = 'z'")
+        out = A.splice_ship_block(text, "a", "[ships.a]\nhttp = 'z'")
         self.assertIn("# head\n[ships.a]\nhttp = 'z'\n\n[ships.b]  # keep me", out)
         self.assertNotIn("http = 'x'", out)
         self.assertEqual(tomllib.loads(out)["ships"]["a"]["http"], "z")
-        out = A.upsert_ship_block(text, "c", "[ships.c]\nhttp = 'w'")
+        out = A.splice_ship_block(text, "c", "[ships.c]\nhttp = 'w'")
         self.assertTrue(out.endswith("[ships.c]\nhttp = 'w'\n"))
-        out = A.remove_ship_block(text, "b")
+        out = A.splice_ship_block(text, "b", None)
         self.assertEqual(set(tomllib.loads(out)["ships"]), {"a"})
         self.assertIn("[[desks]]", out)
         with self.assertRaises(RuntimeError):
-            A.remove_ship_block(text, "zzz")
+            A.splice_ship_block(text, "zzz", None)
 
     def test_find_repo_walks_up(self):
         (self.dir / "admiral.toml").write_text("")
@@ -501,7 +490,7 @@ class HarnessDojo(unittest.TestCase):
         A.ring_mark = lambda h, s: len(self.stream)
         A.capture_at = lambda h, s, off: (len(self.stream), self.stream[max(off, len(self.stream) - A.RING_MAX):])
         cfg = A.Config([A.Ship("zod", A.PierConfig())], [], {})
-        self.d = A.Dojo(cfg.ships[0], cfg)
+        self.d = H.Dojo(cfg.ships[0], cfg)
 
     def tearDown(self):
         A.ring_mark, A.capture_at = self.saved
@@ -534,11 +523,6 @@ class HarnessDojo(unittest.TestCase):
         with self.assertRaises(RuntimeError) as cm:
             self.d.since(a)
         self.assertIn("no longer holds it", str(cm.exception))
-
-    def test_legacy_daemon_refused(self):
-        A.ring_mark = lambda h, s: A.RING_NOMARK
-        with self.assertRaises(RuntimeError):
-            self.d.mark()
 
 
 class RcBlocks(unittest.TestCase):

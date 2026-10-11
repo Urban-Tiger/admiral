@@ -38,6 +38,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 ADMIRAL = str(REPO / "admiral.py")
+HARNESS = str(REPO / "harness.py")
 sys.path.insert(0, str(REPO))
 import admiral as adm  # noqa: E402  (the config walk-up, socket paths)
 DESK = REPO / "tests" / "desk"
@@ -398,15 +399,6 @@ def _(ship, c):
     c.that("more lines" in lines(out)[-1], f"no truncation note: {lines(out)[-1]!r}")
 
 
-@case("dojo", "version-columns")
-def _(ship, c):
-    rc, out, err, dt = admiral(ship, "version")
-    c.that(rc == 0, f"exit {rc}: {err[-200:]}")
-    head, row = lines(out)[0].split(), lines(out)[1].split()
-    c.that(head == ["SHIP", "ENGINE", "LATEST", "STATUS", "VERE", "KELVIN"], f"columns: {head}")
-    c.that(row[-1].isdigit(), f"kelvin: {row[-1]!r}")
-
-
 # ── commit ────────────────────────────────────────────────────────────────────
 def commit(ship):
     return admiral(ship, "commit", "admiral-test", timeout=400)
@@ -542,7 +534,10 @@ _harness = {}
 def harness(ship, name):
     # one browser run serves every case in the group
     if not _harness:
-        rc, out, err, dt = admiral(ship, "test", str(HARNESS_DRIVE), timeout=300)
+        t0 = time.monotonic()
+        r = subprocess.run([HARNESS, ship, str(HARNESS_DRIVE)], capture_output=True, text=True,
+                           timeout=300, cwd=REPO)
+        rc, out, err = r.returncode, r.stdout.strip(), r.stderr.strip()
         for line in lines(out):
             verdict, _, rest = line.partition(" ")
             check, _, why = rest.partition(": ")

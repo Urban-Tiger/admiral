@@ -36,6 +36,7 @@ import subprocess
 import urllib.request
 import webbrowser
 import tempfile
+import textwrap
 import html
 import urllib.error
 from pathlib import Path
@@ -3142,21 +3143,21 @@ def config_summary(gray: Callable[[str], str], red: Callable[[str], str]) -> str
         cfg = load_config(file)
     except Exception as e:
         return red(f"  {file}\n  does not load: {e}")
-    lines = [f"  {file}", ""]
+    lines = [f"  {file}"]
     w = max(len(s.name) for s in cfg.ships)
     for ship in cfg.ships:
         host = cfg.hosts.get(ship.host or "local")
-        where = f"{host.ssh}:{host.root}" if host and host.ssh else "local"
-        pier = pier_rel(ship)
-        if ship.pier.port:
-            pier += f" :{ship.pier.port}"
-        tags = [t for t, on in (("local", ship.pier.local), ("persist", ship.pier.persist)) if on]
-        lines.append(f"  {ship.name.ljust(w)}  {ship.http or gray('no http')}")
-        lines.append(f"  {' ' * w}  {gray(where)}  {gray(pier)}" + (f"  {gray(', '.join(tags))}" if tags else ""))
+        # the bind port, unless the http origin already ends in it
+        port = ship.pier.port
+        pier = pier_rel(ship) + (f":{port}" if port and not (ship.http or "").endswith(f":{port}") else "")
+        extra = [t for t, on in (("local", ship.pier.local), ("persist", ship.pier.persist)) if on]
+        if host and host.ssh:
+            extra.insert(0, f"on {host.name}")
+        lines.append(f"  {ship.name.ljust(w)}  {ship.http or '-'}  {gray(pier)}"
+                     + (f"  {gray(', '.join(extra))}" if extra else ""))
     if cfg.desks:
-        lines.append("")
-        dw = max(len(d.name) for d in cfg.desks)
-        lines += [f"  {gray('desk')} {d.name.ljust(dw)}  {gray(d.src)}" for d in cfg.desks]
+        desks = ", ".join(f"{d.name} ({d.src})" for d in cfg.desks)
+        lines += [f"  {gray(l)}" for l in textwrap.wrap("desks: " + desks, HELP_WIDTH - 2)]
     return "\n".join(lines)
 
 

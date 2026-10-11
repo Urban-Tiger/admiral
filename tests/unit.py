@@ -332,12 +332,14 @@ class Engine(unittest.TestCase):
                 calls.append("op")
                 raise RuntimeError("disk full")
             with self.assertRaises(RuntimeError) as cm:
-                A.offline(ship, host, calls.append, "chop", False, op)
+                A.offline(ship, host, calls.append, "chop", op)
             self.assertIn("chop failed, restarted (daemon 3 child 4): disk full", str(cm.exception))
             self.assertEqual([c for c in calls if c in ("stop", "op", "start")], ["stop", "op", "start"])
+            # a ship already down is left down
             calls.clear()
-            self.assertEqual(A.offline(ship, host, calls.append, "next", True, lambda: "ok"), "ok")
-            self.assertNotIn("start", calls)
+            A.daemon_status = lambda h, s: None
+            self.assertEqual(A.offline(ship, host, calls.append, "next", lambda: "ok"), "ok")
+            self.assertEqual([c for c in calls if c in ("stop", "op", "start")], [])
         finally:
             A.pier_exists, A.daemon_status, A.daemon_stop, A.daemon_start, A.assert_port_match = saved
 

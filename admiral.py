@@ -2559,10 +2559,10 @@ def vere_argv(ship: Ship, host: Host, verb: str, *extra: str) -> list[str]:
 
 
 def offline(ship: Ship, host: Host, log: Callable[[str], None], what: str,
-            stay_down: bool, op: Callable[[], str]) -> str:
+            op: Callable[[], str]) -> str:
     # run `op` with the pier offline: stop a running ship first (its lock keeps vere's
-    # utilities out), restart it afterward even when op raised, unless --stay-down or it
-    # was already down. Returns op's one-line result with the restart appended; a
+    # utilities out), restart it afterward even when op raised, unless it was already
+    # down. Returns op's one-line result with the restart appended; a
     # failure raises with the same suffix, so the message always says where the ship
     # was left.
     if not pier_exists(host, ship):
@@ -2582,7 +2582,7 @@ def offline(ship: Ship, host: Host, log: Callable[[str], None], what: str,
     except Exception as e:
         failure = e
     restarted = ""
-    if was_running and not stay_down:
+    if was_running:
         log("restarting")
         now = daemon_start(ship, host)
         restarted = f", restarted (daemon {now[0]} child {now[1]})"
@@ -2598,8 +2598,7 @@ def cmd_chop(a: Parsed) -> None:
     # chop then deletes every epoch older than the two latest. Chop always keeps
     # two, so the first pass on a young pier may reclaim nothing — recurring runs
     # converge. The ship is stopped for the surgery and restarted after (even when
-    # roll/chop fail), unless --stay-down or it was already down.
-    stay_down = bool(a.flags.get("--stay-down"))
+    # roll/chop fail), unless it was already down.
 
     def work(ship, host, log):
         def op() -> str:
@@ -2620,7 +2619,7 @@ def cmd_chop(a: Parsed) -> None:
                 return f"rolled + chopped {len(deleted)} epoch{'s' if len(deleted) != 1 else ''}, {size}"
             return f"rolled; nothing to chop yet ({len(after)} epochs, two are always kept), {size}"
 
-        return offline(ship, host, log, "chop", stay_down, op)
+        return offline(ship, host, log, "chop", op)
 
     sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
@@ -2630,8 +2629,7 @@ def cmd_vere_upgrade(a: Parsed) -> None:
     # it downloads the next binary on the pier's release channel (<pier>/.bin/pace)
     # and installs it, so a docked pier's .run is replaced. The pier lock means the
     # ship is stopped for the upgrade and restarted after (even when next fails),
-    # unless --stay-down or it was already down.
-    stay_down = bool(a.flags.get("--stay-down"))
+    # unless it was already down.
 
     def work(ship, host, log):
         def op() -> str:
@@ -2640,7 +2638,7 @@ def cmd_vere_upgrade(a: Parsed) -> None:
             out = host.exec(argv[0], argv[1:], timeout_ms=T_CHOP * 1000).strip()
             return out.splitlines()[-1] if out else "next complete"
 
-        return offline(ship, host, log, "next", stay_down, op)
+        return offline(ship, host, log, "next", op)
 
     sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
@@ -2983,19 +2981,19 @@ COMMANDS: list[Cmd] = [
     ),
     Cmd(
         name="vere-upgrade", summary="upgrade the pier's urbit runtime (vere)",
-        flags=[Flag("--stay-down", "bool", "leave the ship off afterward")],
+        flags=[],
         positionals=[],
         details=("Upgrade the pier's vere binary with vere's own `next` utility: it checks the "
                  "pier's release channel (<pier>/.bin/pace, normally 'live'), downloads the next "
                  "version if there is one, and installs it into the pier. The pier must be offline "
                  "for it, so the ship is stopped and restarted after; a ship already down stays "
                  "down. An already-current runtime reports 'up to date'."),
-        examples=[f"{INVOKE} sampel-palnet vere-upgrade", f"{INVOKE} sampel-palnet vere-upgrade --stay-down"],
+        examples=[f"{INVOKE} sampel-palnet vere-upgrade"],
         run=cmd_vere_upgrade,
     ),
     Cmd(
         name="chop", summary="shrink the pier: roll an epoch, chop old ones",
-        flags=[Flag("--stay-down", "bool", "leave the ship off afterward")],
+        flags=[],
         positionals=[],
         details=("Truncate the event log with vere's offline utilities, in the order that makes "
                  "them work: `roll` first (seal the current epoch, open a fresh one), then `chop` "
@@ -3005,7 +3003,7 @@ COMMANDS: list[Cmd] = [
                  "nothing; the roll still counts, and the next run chops everything before it. "
                  "Deleted epochs can't be replayed (the snapshot stays authoritative), and roll "
                  "needs free disk for its snapshot copy before chop frees any."),
-        examples=[f"{INVOKE} sampel-palnet chop", f"{INVOKE} sampel-palnet chop --stay-down"],
+        examples=[f"{INVOKE} sampel-palnet chop"],
         run=cmd_chop,
     ),
     Cmd(

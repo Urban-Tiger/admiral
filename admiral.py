@@ -3189,7 +3189,7 @@ def help_menu() -> None:
     with_ship = [c for c in COMMANDS if c.ship]
     sigs = [sig(c) for c in with_ship]
     w = max(*(len(s) for s in sigs), len("help [command]"))
-    rows = "\n".join(f"{sigs[i].ljust(w)}  {c.summary}" for i, c in enumerate(with_ship))
+    rows = "\n".join(f"  {sigs[i].ljust(w)}  {c.summary}" for i, c in enumerate(with_ship))
     sys.stderr.write(f"""
 {bold(f"{CLI}: urbit ship manager")} {gray(f"v{VERSION}")}
 
@@ -3207,7 +3207,7 @@ Config
 Commands
 
 {rows}
-{'help [command]'.ljust(w)}  this menu, or everything about one command
+  {'help [command]'.ljust(w)}  this menu, or everything about one command
 
 shell enrichment {installed_state}. paste to toggle: {enrich_cmd}{enrich_blurb}
 

@@ -3189,7 +3189,6 @@ def help_menu() -> None:
         return " ".join([c.name, *flags, *[pos_brief(p) for p in c.positionals]])
 
     with_ship = [c for c in COMMANDS if c.ship]
-    without = ", ".join(gray(c.name) for c in COMMANDS if not c.ship)
     sigs = [sig(c) for c in with_ship]
     w = max(*(len(s) for s in sigs), len("help [command]"))
     rows = "\n".join(f"{sigs[i].ljust(w)}  {c.summary}" for i, c in enumerate(with_ship))
@@ -3211,8 +3210,6 @@ Commands
 
 {rows}
 {'help [command]'.ljust(w)}  this menu, or everything about one command
-
-Without a ship: {without}. {gray(f"{inv} help <name>")} explains each.
 
 shell enrichment {installed_state}. paste to toggle: {enrich_cmd}{enrich_blurb}
 

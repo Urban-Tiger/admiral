@@ -34,6 +34,9 @@ import termios
 import selectors
 import subprocess
 import urllib.request
+import webbrowser
+import tempfile
+import html
 import urllib.error
 from pathlib import Path
 from dataclasses import dataclass
@@ -104,6 +107,9 @@ class PierConfig:
                               # original still lives elsewhere: real ames from the copy
                               # would double-boot the ship. config-pinned so `run` can
                               # never forget it.
+    persist: bool = False     # come up at boot through a systemd user unit on the host.
+                              # `run` writes/enables the unit when true and removes it
+                              # when false, so the host always matches this file.
 
 
 # ── ship fields ──────────────────────────────────────────────────────────────
@@ -130,6 +136,7 @@ FIELDS: list[Field] = [
     Field("ames", "ames", "int", "must be an integer 1-65535", pier=True, hi=65535),
     Field("loom", "loom", "int", "must be a positive integer", pier=True),
     Field("local", "local", "bool", "must be a boolean", pier=True),
+    Field("persist", "persist", "bool", "must be a boolean", pier=True),
     Field("code", "code", "str", 'must be a +code key (e.g. "ralnyt-botwyc-batnyt-dozzod")',
           ok=lambda s: bool(CODE_RE.match(s))),
     Field("master-ticket", "master_ticket", "str", 'must be a ticket like "~ralnyt-botwyc-batnyt-dozzod"',
@@ -1955,6 +1962,43 @@ def cmd_code(a: Parsed) -> None:
     sys.exit(report(results))
 
 
+def login_page(base: str, code: str, path: str) -> str:
+    # a page that signs the browser in by itself: a form that POSTs the +code to eyre's
+    # own /~/login and submits on load. Eyre sets its session cookie on the ship's
+    # origin and redirects to `path`, so no cookie ever passes through admiral and it
+    # works for any origin, a remote https one included.
+    esc = html.escape
+    return (
+        "<!doctype html><meta charset=utf-8><title>signing in\u2026</title>"
+        f"<form method=post action=\"{esc(base)}/~/login\">"
+        f"<input type=hidden name=password value=\"{esc(code)}\">"
+        f"<input type=hidden name=redirect value=\"{esc(path)}\">"
+        "<noscript><button>sign in</button></noscript></form>"
+        "<script>document.forms[0].submit()</script>"
+    )
+
+
+def cmd_open(a: Parsed) -> None:
+    # open the ship's web UI in the default browser, already signed in: write the
+    # login page to a private temp file and hand it to the browser. The file holds
+    # the +code, so it is mode 0600 and lives in the temp dir; `code` prints the
+    # same secret on purpose.
+    def work(ship, host, log):
+        base = ship_base(ship)
+        path = a.pos[0] if a.pos else "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        code = fetch_code(ship, a.cfg, log)
+        with tempfile.NamedTemporaryFile("w", suffix=".html", prefix=f"{NAME}-{ship.name}-",
+                                         delete=False, encoding="utf8") as f:
+            f.write(login_page(base, code, path))
+        if not webbrowser.open(Path(f.name).as_uri()):
+            raise RuntimeError(f"no browser could be opened — sign in at {base}/~/login with code {code}")
+        return f"opened {base}{path}, signed in"
+
+    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+
+
 def cmd_exec(a: Parsed) -> None:
     # Run a shell command on the machine a ship lives on. Everything admiral
     # already knows — which host, over which multiplexed ssh connection, at
@@ -2154,10 +2198,20 @@ def cmd_info(a: Parsed) -> None:
             for i, (name, kb) in enumerate(zip(epochs, epoch_kb), 1)
         ]
 
-    unit_cell = "-"
-    if host_has(host, "systemctl"):
-        unit_cell = (f"{unit_name(ship)} ({'active' if unit_active(host, ship) else 'inactive'})"
-                     if unit_enabled(host, ship) else "not persisted")
+    # the config's persist, then what the host actually has — a mismatch is what the
+    # next `run` will reconcile
+    if ship.pier.persist:
+        unit_cell = f"persist = true, {unit_name(ship)} "
+        if not host_has(host, "systemctl"):
+            unit_cell += "(host has no systemctl)"
+        elif not unit_enabled(host, ship):
+            unit_cell += "(not enabled yet: run)"
+        else:
+            unit_cell += f"({'active' if unit_active(host, ship) else 'inactive'})"
+    else:
+        unit_cell = "persist = false"
+        if host_has(host, "systemctl") and unit_present(host, ship):
+            unit_cell += f", {unit_name(ship)} still on the host (removed on run)"
 
     rows: list[tuple[str, str]] = [
         ("ship", ship.name),
@@ -2288,13 +2342,14 @@ def daemon_stop(ship: Ship, host: Host, timeout: int = 30) -> bool:
 
 
 # ── persist: a systemd user unit per ship ─────────────────────────────────────
-# `persist` writes ~/.config/systemd/user/<NAME>-<ship>.service on the ship's host and
-# enables it, so the ship comes up at boot — as the ssh user, no root. The unit runs
-# the daemon `run` would start (--foreground, so systemd is its parent) and stops it
-# through the engine's own __kill, so `systemctl --user stop` IS `exit`. While a unit
-# is enabled `run` starts the ship through it, so systemd and admiral always hold the
-# same daemon. A user's units start at boot only once the user lingers
-# (`loginctl enable-linger <user>`, once, as root); persist says when that is off.
+# A ship with `persist = true` in its pier table comes up at boot through
+# ~/.config/systemd/user/<NAME>-<ship>.service on its host — as the ssh user, no root.
+# `run` reconciles the host to the config: it writes and enables the unit (or removes
+# a stale one when persist is off) before starting the ship. The unit runs the daemon
+# `run` would start (--foreground, so systemd is its parent) and stops it through the
+# engine's own __kill, so `systemctl --user stop` IS `exit`. A user's units start at
+# boot only once the user lingers (`loginctl enable-linger <user>`, once, as root);
+# `run` says when that is off.
 def unit_name(ship: Ship) -> str:
     return f"{NAME}-{ship.name}.service"
 
@@ -2357,67 +2412,60 @@ def linger_on(host: Host) -> bool:
     return out.strip() == "yes"
 
 
-def cmd_persist(a: Parsed) -> None:
-    # make a ship come up at boot: write and enable its systemd user unit on the host.
-    # A ship running outside the unit is moved under it — one clean restart — so that
-    # from here on systemd and admiral hold the same daemon. --off disables and removes
-    # the unit; the ship keeps running until `exit`.
+def cmd_run(a: Parsed) -> None:
+    # turn a ship ON: push the tool to the host, start the pty-holder daemon (which
+    # forkpty's `urbit <pier>` and serves the socket), wait for it to answer. The
+    # pier must already exist (created with the urbit binary; see help run). First the
+    # host's systemd unit is reconciled to the config's `persist`; a persisted ship
+    # then starts through its unit, so systemd owns the daemon it will stop.
     def work(ship, host, log):
-        if not host_has(host, "systemctl"):
-            raise RuntimeError(f"persist needs systemd on the ship's host ({host.name} has no systemctl)")
-        unit = unit_name(ship)
-        if a.flags.get("--off"):
-            if not unit_present(host, ship):
-                return "not persisted"
-            systemctl(host, "disable", unit, check=False)
-            host.exec("sh", ["-c", f"rm -f {unit_file(ship)}"])
-            systemctl(host, "daemon-reload")
-            return f"unpersisted; the ship keeps running until `{INVOKE} {ship.name} exit`"
         if not pier_exists(host, ship):
-            raise RuntimeError(f'no pier at {pier_dir(ship, host)} — `{INVOKE} {ship.name} boot` first')
+            raise RuntimeError(f'no pier at {pier_dir(ship, host)} — create it with the urbit binary first '
+                               f'(`{INVOKE} help run` shows how)')
         ensure_self(host)
-        host.exec("sh", ["-c", f"mkdir -p ~/.config/systemd/user && cat > {unit_file(ship)}"],
-                  input=unit_text(ship, host))
-        systemctl(host, "daemon-reload")
-        systemctl(host, "enable", unit)
-        note = "" if linger_on(host) else (
-            f"\n  linger is off on {host.name}: the unit starts at boot only after\n"
-            f"  sudo loginctl enable-linger $(id -un)")
+        note = reconcile_unit(ship, host, log)
         st = daemon_status(host, ship)
-        if st and unit_active(host, ship):
-            return f"persisted as {unit} (already under it)" + note
         if st:
-            log("restarting under the unit")
-            if not daemon_stop(ship, host):
-                raise RuntimeError("the running daemon would not stop; persisted, but still outside the unit")
-            systemctl(host, "start", unit)
+            assert_port_match(host, ship, st)
+            if ship.pier.persist and not unit_active(host, ship):
+                # running outside its unit: one clean restart so systemd holds it from here on
+                log("restarting under its systemd unit")
+                if not daemon_stop(ship, host):
+                    raise RuntimeError("the running daemon would not stop; still outside its unit")
+            else:
+                return f"already running (daemon {st[0]} child {st[1]})" + note
+        if ship.pier.persist:
+            systemctl(host, "start", unit_name(ship))
             st = wait_daemon(host, ship)
-            return f"persisted as {unit}; restarted under it (daemon {st[0]} child {st[1]})" + note
-        return f"persisted as {unit}; `{INVOKE} {ship.name} run` starts it" + note
+            return f"running under {unit_name(ship)} (daemon {st[0]} child {st[1]})" + note
+        st = daemon_start(ship, host)
+        return f"running (daemon {st[0]} child {st[1]})"
 
     sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
 
-def cmd_run(a: Parsed) -> None:
-    # turn a ship ON: push the tool to the host, start the pty-holder daemon (which
-    # forkpty's `urbit <pier>` and serves the socket), wait for it to answer. The
-    # pier must already exist — use `boot` to create one for the first time. A
-    # persisted ship starts through its unit, so systemd owns the daemon it will stop.
-    def work(ship, host, log):
-        if not pier_exists(host, ship):
-            raise RuntimeError(f'no pier at {pier_dir(ship, host)} — `{INVOKE} {ship.name} boot` first')
-        ensure_self(host)
-        st = daemon_status(host, ship)
-        if st:
-            assert_port_match(host, ship, st)
-            return f"already running (daemon {st[0]} child {st[1]})"
-        if unit_enabled(host, ship):
-            log("starting through its systemd unit")
-            systemctl(host, "start", unit_name(ship))
-            st = wait_daemon(host, ship)
-            return f"running under {unit_name(ship)} (daemon {st[0]} child {st[1]})"
-        st = daemon_start(ship, host)
-        return f"running (daemon {st[0]} child {st[1]})"
+def reconcile_unit(ship: Ship, host: Host, log: Callable[[str], None]) -> str:
+    # make the host's systemd unit match the config's `persist`: write + enable it when
+    # true (every run, so a template change lands on the next run), remove it when false.
+    # Returns a note for run's verdict: the linger warning for a persisted ship.
+    if ship.pier.persist:
+        if not host_has(host, "systemctl"):
+            raise RuntimeError(f"persist = true needs systemd on the ship's host ({host.name} has no systemctl)")
+        host.exec("sh", ["-c", f"mkdir -p ~/.config/systemd/user && cat > {unit_file(ship)}"],
+                  input=unit_text(ship, host))
+        systemctl(host, "daemon-reload")
+        if not unit_enabled(host, ship):
+            log(f"enabling {unit_name(ship)}")
+            systemctl(host, "enable", unit_name(ship))
+        return "" if linger_on(host) else (
+            f"\n  linger is off on {host.name}: the unit starts at boot only after\n"
+            f"  sudo loginctl enable-linger $(id -un)")
+    if host_has(host, "systemctl") and unit_present(host, ship):
+        log(f"removing {unit_name(ship)} (persist is off)")
+        systemctl(host, "disable", unit_name(ship), check=False)
+        host.exec("sh", ["-c", f"rm -f {unit_file(ship)}"])
+        systemctl(host, "daemon-reload")
+    return ""
 
     sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
@@ -2594,15 +2642,6 @@ def cmd_vere_upgrade(a: Parsed) -> None:
         return offline(ship, host, log, "next", stay_down, op)
 
     sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
-
-
-def cmd_boot(a: Parsed) -> None:
-    # create a pier for the FIRST time (from a keyfile / as a comet / fakezod), then
-    # leave it ready for `run`. STUB — not implemented yet.
-    raise RuntimeError(
-        "boot (first-time pier creation) is not implemented yet.\n"
-        "  For now, create the pier manually (e.g. `urbit -w <name> -k <keyfile>` or a\n"
-        f"  comet/fakezod), then `{INVOKE} {resolve_ship(a.selector, a.cfg).name} run`.")
 
 
 # ── shell tab-completion (hidden subcommands) ─────────────────────────────────
@@ -2880,31 +2919,45 @@ COMMANDS: list[Cmd] = [
         run=cmd_code,
     ),
     Cmd(
-        name="boot", summary="create a pier (not yet: how to do it by hand)",
-        flags=[], positionals=[],
-        details=("Not implemented yet. Create the pier with the urbit binary, stop it, then "
-                 "hand it to admiral:\n\n"
-                 "  a fake ship, for development:\n"
-                 "    urbit -F zod -c piers/zod\n"
-                 "  a real ship, from its keyfile:\n"
-                 "    urbit -w sampel-palnet -k sampel-palnet.key -c piers/sampel-palnet\n"
-                 "  a comet:\n"
-                 "    urbit -c piers/comet\n\n"
-                 "Once it reaches the dojo, stop it with Ctrl-D in that terminal. Then list it "
-                 f"in {CONFIG} and run it:\n\n"
-                 "  [ships.sampel-palnet]\n"
-                 "  http = \"http://localhost:8080\"\n"
-                 "  pier = { path = \"piers/sampel-palnet\", port = 8080 }\n\n"
-                 f"  {INVOKE} sampel-palnet run"),
-        run=cmd_boot,
+        name="open", summary="the ship's web UI in your browser, signed in",
+        flags=[], positionals=[Pos("path", False, "the page to land on (default /)")],
+        details=("Open the ship's http origin in the default browser and sign in with its "
+                 "+code (the config's code field, else read from the dojo). The browser POSTs "
+                 "the code to eyre's own /~/login, so the session cookie is set on the ship's "
+                 "origin by the ship itself; admiral never handles the cookie. Works for a "
+                 "remote https ship as well as a local one.\n\n"
+                 "The sign-in page is a small html file in the temp dir, private to you; it "
+                 "contains the +code, like `code` prints it."),
+        examples=[f"{INVOKE} sampel-palnet open", f"{INVOKE} sampel-palnet open /apps/landscape"],
+        run=cmd_open,
     ),
     Cmd(
         name="run", summary="turn the ship on",
         flags=[], positionals=[],
         details=("Start the daemon that holds the ship: it runs `urbit <pier>` in a terminal of "
                  "its own (with the configured loom and http port) and serves a control socket. "
-                 "The daemon outlives your shell. The pier must already exist (help boot). An "
-                 "already-running ship is reported as such."),
+                 "The daemon outlives your shell. An already-running ship is reported as "
+                 "such.\n\n"
+                 "The pier must already exist. Create it with the urbit binary, stop it, then "
+                 f"list it in {CONFIG}:\n\n"
+                 "  a fake ship, for development:\n"
+                 "    urbit -F zod -c piers/zod\n"
+                 "  a real ship, from its keyfile:\n"
+                 "    urbit -w sampel-palnet -k sampel-palnet.key -c piers/sampel-palnet\n"
+                 "  a comet:\n"
+                 "    urbit -c piers/comet\n\n"
+                 "Once it reaches the dojo, stop it with Ctrl-D in that terminal. Then:\n\n"
+                 "  [ships.sampel-palnet]\n"
+                 "  http = \"http://localhost:8080\"\n"
+                 "  pier = { path = \"piers/sampel-palnet\", port = 8080 }\n\n"
+                 "persist = true in the ship's pier table makes it come up at boot: run writes "
+                 "~/.config/systemd/user/admiral-<ship>.service on the host, enables it, and "
+                 "starts the ship through it, so systemd owns the daemon and `systemctl --user "
+                 "stop` is the same clean shutdown as exit. A ship found running outside its "
+                 "unit is restarted under it, once. With persist off, run removes a unit it "
+                 "left behind. systemd starts a user's units at boot only when the user "
+                 "lingers (`sudo loginctl enable-linger <user>`, once on the host); run says "
+                 "so when it is off. persist needs systemd on the host; a Mac cannot."),
         examples=[f"{INVOKE} sampel-palnet run"],
         run=cmd_run,
     ),
@@ -2915,24 +2968,6 @@ COMMANDS: list[Cmd] = [
                  "then stop the daemon. An already-stopped ship is reported as such."),
         examples=[f"{INVOKE} sampel-palnet exit"],
         run=cmd_exit,
-    ),
-    Cmd(
-        name="persist", summary="start the ship at boot, through a systemd user unit",
-        flags=[Flag("--off", "bool", "disable and remove the unit; the ship keeps running")],
-        positionals=[],
-        details=("Write ~/.config/systemd/user/admiral-<ship>.service on the ship's host and "
-                 "enable it, so the ship comes up at boot as the ssh user — no root. The unit "
-                 "runs the daemon `run` would start and stops it the way `exit` does, so "
-                 "`systemctl --user stop` and `exit` are the same clean shutdown. While the "
-                 "unit is enabled, `run` starts the ship through it.\n\n"
-                 "A ship already running outside the unit is restarted under it, once. "
-                 "A stopped ship stays stopped until `run`.\n\n"
-                 "systemd starts a user's units at boot only when the user lingers: "
-                 "`sudo loginctl enable-linger <user>` once on the host. persist says so "
-                 "when it is off.\n\n"
-                 "Needs systemd on the ship's host; a Mac cannot persist."),
-        examples=[f"{INVOKE} sampel-palnet persist", f"{INVOKE} sampel-palnet persist --off"],
-        run=cmd_persist,
     ),
     Cmd(
         name="engine-upgrade", summary="swap in this file's admiral engine, no restart",
@@ -3095,6 +3130,36 @@ def label_wrap(label: str, w: int, desc: str, width: int) -> list[str]:
     return [(label.ljust(w) if i == 0 else " " * w) + "  " + l for i, l in enumerate(body)]
 
 
+def config_summary(gray: Callable[[str], str], red: Callable[[str], str]) -> str:
+    # the loaded config at a glance, from the file alone (no host or ship probes): its
+    # path, then every ship's host, http origin and pier, then the desks. A missing or
+    # broken config says so here instead of failing the menu.
+    file = REPO / CONFIG
+    if not file.exists():
+        return red(f"  no {CONFIG} found (looked upward from {Path.cwd()}).") + gray(
+            f"\n  write one by hand — admiral.example.toml beside admiral.py shows the schema.")
+    try:
+        cfg = load_config(file)
+    except Exception as e:
+        return red(f"  {file}\n  does not load: {e}")
+    lines = [f"  {file}", ""]
+    w = max(len(s.name) for s in cfg.ships)
+    for ship in cfg.ships:
+        host = cfg.hosts.get(ship.host or "local")
+        where = f"{host.ssh}:{host.root}" if host and host.ssh else "local"
+        pier = pier_rel(ship)
+        if ship.pier.port:
+            pier += f" :{ship.pier.port}"
+        tags = [t for t, on in (("local", ship.pier.local), ("persist", ship.pier.persist)) if on]
+        lines.append(f"  {ship.name.ljust(w)}  {ship.http or gray('no http')}")
+        lines.append(f"  {' ' * w}  {gray(where)}  {gray(pier)}" + (f"  {gray(', '.join(tags))}" if tags else ""))
+    if cfg.desks:
+        lines.append("")
+        dw = max(len(d.name) for d in cfg.desks)
+        lines += [f"  {gray('desk')} {d.name.ljust(dw)}  {gray(d.src)}" for d in cfg.desks]
+    return "\n".join(lines)
+
+
 def help_menu() -> None:
     color = is_tty(sys.stderr)
     red = lambda s: paint(s, "red", color)
@@ -3114,9 +3179,7 @@ def help_menu() -> None:
         f"  so you type: {NAME} sam<TAB> at<TAB>\n"
         f"  instead of:  {INVOKE} sampel-palnet attach")
     inv = INVOKE
-    config_file = os.path.join(str(REPO), CONFIG)
-    config_line = (f"Config: {config_file}" if os.path.exists(config_file)
-                   else red(f"No config here yet: write {CONFIG} by hand (see admiral.example.toml)."))
+    config_block = config_summary(gray, red)
 
     def sig(c: Cmd) -> str:
         # collapse a long flag list to "[opts]" so one verbose command can't blow out
@@ -3139,15 +3202,9 @@ Usage
   <ship> is a ship's name from {CONFIG}, with or without its ~.
   {gray(f"{inv} <ship>")} shows one ship; {gray(f"{inv} status")} shows every ship.
 
-Getting started
+Config
 
-  1. create a pier with the urbit binary       {gray(f"{inv} help boot")}
-  2. list it in {CONFIG}                   {gray("see admiral.example.toml")}
-  3. {gray(f"{inv} <ship> run")}                   turn it on
-  4. {gray(f"{inv} <ship> code")}                  its web login password
-  5. open the ship's http address and log in with that code
-  6. {gray(f"{inv} <ship> dojo '(add 2 2)'")}      run a dojo command
-  7. {gray(f"{inv} <ship> attach")}                a live dojo (Ctrl-\\ detaches)
+{config_block}
 
 Commands
 
@@ -3155,8 +3212,6 @@ Commands
 {'help [command]'.ljust(w)}  this menu, or everything about one command
 
 Without a ship: {without}. {gray(f"{inv} help <name>")} explains each.
-
-{config_line}
 
 shell enrichment {installed_state}. paste to toggle: {enrich_cmd}{enrich_blurb}
 

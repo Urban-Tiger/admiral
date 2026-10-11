@@ -7,6 +7,9 @@ pier = { path = "piers/sampel-palnet", port = 8080 }
 # pier = { path = "copy-of-prod", port = 8081, local = true }
 #   local = true boots vere with -L (fake networking). Pin it on a COPIED pier whose
 #   original still runs elsewhere: one boot with real ames double-boots that ship.
+# pier = { path = "piers/sampel-palnet", port = 8080, persist = true }
+#   persist = true starts the ship at boot through a systemd user unit on its host;
+#   `run` writes and enables the unit (Linux hosts only).
 # mnemonic = "word word word word word word"
 # master-ticket = "~sampel-ticket-sampel-ticket"
 # code = "lidlut-tabwed-pillex-ridrup"      # +code, without the ~

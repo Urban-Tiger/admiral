@@ -112,7 +112,7 @@ def _(ship, c):
 @case("cli", "bare-is-help-status-is-all")
 def _(ship, c):
     rc, out, err, _ = admiral()
-    c.that(rc == 0 and "Getting started" in err, f"bare admiral is not the help menu: {rc} {err[:200]!r}")
+    c.that(rc == 0 and "Commands" in err and ship in err, f"bare admiral is not the help menu: {rc} {err[:200]!r}")
     rc, out, err, _ = admiral("status")
     c.that(ship in out + err, f"`status` without a ship did not list {ship}: {(out + err)[:200]!r}")
 
@@ -151,7 +151,7 @@ def _(ship, c):
     rc, out, err, _ = admiral("help")
     wide = [l for l in lines(err) if len(l) > 80]
     c.that(not wide, f"main help lines over 80 columns: {wide[:3]}")
-    c.that("Getting started" in err, "no getting-started block")
+    c.that("Config" in err and ship in err, "no config block naming the ship")
 
 
 @case("cli", "help-unknown-is-one-line")

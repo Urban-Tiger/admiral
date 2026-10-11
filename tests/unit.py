@@ -396,6 +396,21 @@ class ConfigFile(unittest.TestCase):
                 self.load(text)
             self.assertIn(msg, str(cm.exception), text)
 
+    def test_login_page_posts_to_eyre(self):
+        page = A.login_page("https://x.urbit.house", "lidlut-tabwed-pillex-ridrup", "/apps/x")
+        self.assertIn('action="https://x.urbit.house/~/login"', page)
+        self.assertIn('name=password value="lidlut-tabwed-pillex-ridrup"', page)
+        self.assertIn('name=redirect value="/apps/x"', page)
+        self.assertIn('"', A.login_page("h", 'a"b', "/"))
+
+    def test_persist_is_a_pier_bool(self):
+        cfg = self.load('[ships.zod]\npier = { port = 1, persist = true }\n')
+        self.assertTrue(cfg.ships[0].pier.persist)
+        cfg = self.load('[ships.zod]\npier = { port = 1 }\n')
+        self.assertFalse(cfg.ships[0].pier.persist)
+        with self.assertRaises(RuntimeError):
+            self.load('[ships.zod]\npier = { persist = "yes" }\n')
+
     def test_find_repo_walks_up(self):
         (self.dir / "admiral.toml").write_text("")
         sub = self.dir / "a" / "b"

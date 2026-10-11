@@ -1659,7 +1659,7 @@ class ShipState:
     pier: bool
     holders: list[int]               # the urbit child PID the daemon reports (the pier holder)
     verdict: str
-    responsive: bool | None = None   # --probe only: (add 2 2) round-trips
+    responsive: bool | None = None   # single-ship status only: (add 2 2) round-trips
     http: bool | None = None         # the ship's "http" origin /~/login is reachable
     misconfigured: bool = False      # live --http-port disagrees with this config's pier.port
     running_port: int | None = None  # the --http-port the ship is ACTUALLY running on
@@ -2099,11 +2099,14 @@ def cmd_capture(a: Parsed) -> None:
 
 
 def cmd_status(a: Parsed) -> None:
-    probe = bool(a.flags.get("--probe"))
+    # one ship: everything admiral knows about it, fully probed. Every ship: one
+    # compact card each from the cheap signals (no dojo round trip).
     cfg = a.cfg
-    ships = select_ships(a.selector, cfg)
+    if a.selector is not None:
+        return print_detail(resolve_ship(a.selector, cfg), cfg)
+    ships = select_ships(None, cfg)
     results = fan(ships, cfg,
-                  lambda ship, host, log: probe_ship(ship, cfg, host, probe))
+                  lambda ship, host, log: probe_ship(ship, cfg, host))
     print_status(ships, results, cfg)
     sys.exit(fan_exit(results))
 
@@ -2154,9 +2157,11 @@ def engine_cell(st: ShipState, on: bool) -> str:
     return paint(f"v{st.version} ({'current' if cur else 'stale'})", "green" if cur else "yellow", on)
 
 
-def cmd_info(a: Parsed) -> None:
-    cfg = a.cfg
-    ship = resolve_ship(a.selector, cfg)
+def print_detail(ship: Ship, cfg: Config) -> None:
+    # the single-ship status: the config block (host, pier, sizes, unit, http, code),
+    # then a full probe — the verdict and every raw signal behind it, plus the three
+    # versions behind the ship: admiral's engine, vere, and the kelvin its base desk
+    # is built for.
     host = host_for(ship, cfg)
     st = probe_ship(ship, cfg, host, probe=True)
 
@@ -2219,12 +2224,9 @@ def cmd_info(a: Parsed) -> None:
         ("host", f"{host.name} ({host.ssh}:{host.root})" if host.ssh else f"local ({host.root})"),
         ("pier", f"{pier_dir(ship, host)} ({', '.join(pier_extra)})" if pier_extra else pier_dir(ship, host)),
         *size_rows,
-        ("sock", sock_path(ship, host)),
         ("unit", unit_cell),
         ("http", ship.http or "-"),
         ("code", ship.code or "(live from dojo)"),
-        ("master ticket", "set" if ship.master_ticket else "-"),
-        ("mnemonic", "set" if ship.mnemonic else "-"),
         ("", ""),
         ("verdict", verdict_color(st.verdict, on)),
         ("daemon", daemon_str),
@@ -2781,6 +2783,83 @@ def _shell_arg(a: Parsed) -> str:
     return shell
 
 
+FIELD_DOC: dict[str, str] = {
+    # one line per config key, for `configure`; FIELDS carries the type and check
+    "host": "a [hosts.<name>] the ship runs on; omit for this machine",
+    "http": "the ship's web origin, e.g. http://localhost:8080 or a public https URL",
+    "code": "its +code (skips the live dojo read)",
+    "master-ticket": "the ship's master ticket, plain text, for tooling that needs it",
+    "mnemonic": "its BIP39 seed phrase, plain text, for tooling that needs it",
+    "path": "pier dir, relative to the host root (here, for a local ship); default .piers/<name>",
+    "port": "the http bind port",
+    "ames": "the ames UDP port; pin it so peers' lanes survive a restart",
+    "loom": "loom size in memory pages, a power of 2",
+    "local": "boot with -L (fake networking): for a COPIED pier whose original still runs",
+    "persist": "come up at boot through a systemd user unit that `run` writes (Linux only)",
+}
+
+
+def cmd_configure(a: Parsed) -> None:
+    # explain how to write admiral.toml: where it is looked for, then every table and
+    # key with its meaning and type. Keys come from FIELDS so the list cannot drift
+    # from the loader.
+    color = is_tty(sys.stderr)
+    bold = lambda s: paint(s, "bold", color)
+    gray = lambda s: paint(s, "gray", color)
+    kinds = {"str": "string", "int": "integer", "bool": "bool"}
+    keys = ["host", *(f.key for f in FIELDS if not f.pier), *(f.key for f in FIELDS if f.pier)]
+    w = max(len(k) for k in keys)
+
+    def row(key: str, kind: str, indent: str = "  ") -> str:
+        label = indent + key
+        return "\n".join(label_wrap(label, len(indent) + w, f"{kind}. {FIELD_DOC[key]}", HELP_WIDTH))
+    ship_rows = [row("host", "string"), *(row(f.key, kinds[f.kind]) for f in FIELDS if not f.pier)]
+    pier_rows = [row(f.key, kinds[f.kind], "    ") for f in FIELDS if f.pier]
+    sys.stderr.write(f"""
+{bold(f"{CONFIG}: how to write it")}
+
+  {NAME} finds its config by climbing from the current directory to the
+  first {CONFIG} (or .{CONFIG}), like git finds .git. It never writes the
+  file: every command re-reads and validates it, so a bad key is reported.
+
+{bold("[ships.<name>]")}  {gray("one table per ship; <name> is the ship's @p without ~")}
+
+{chr(10).join(ship_rows)}
+  {"pier".ljust(w)}  table. where the pier is and how it boots, inline {{ ... }}:
+{chr(10).join(pier_rows)}
+
+{bold("[hosts.<name>]")}  {gray("a remote machine; the local machine is implicit")}
+
+  {"ssh".ljust(w)}  ssh target, e.g. urb@box
+  {"root".ljust(w)}  absolute base dir on the box that pier paths are relative to
+
+{bold("[[desks]]")}  {gray("a desk `commit` can sync into a ship; one entry per desk")}
+
+  {"name".ljust(w)}  the desk name on the ship
+  {"src".ljust(w)}  its source directory, relative to the config's directory
+
+{bold("example")}
+
+  [ships.sampel-palnet]
+  http = "http://localhost:8080"
+  pier = {{ path = "piers/sampel-palnet", port = 8080 }}
+
+  [hosts.box]
+  ssh = "urb@box"
+  root = "/home/urb"
+
+  [ships.marnec-dozzod]
+  host = "box"
+  http = "https://marnec-dozzod.example.com"
+  pier = {{ path = "piers/marnec-dozzod", port = 8080, persist = true }}
+
+  [[desks]]
+  name = "my-desk"
+  src = "desk"
+
+""")
+
+
 def cmd_enrich(a: Parsed) -> None:
     # Enrich the shell with the combined feature (command alias + tab-completion) as ONE rc
     # managed block, and emit a snippet the CURRENT shell must `eval` for immediate effect.
@@ -2819,10 +2898,16 @@ def cmd_unenrich(a: Parsed) -> None:
 # ── command registry ──────────────────────────────────────────────────────────
 COMMANDS: list[Cmd] = [
     Cmd(
-        name="status", summary="the ship's state and config (the default command)",
-        flags=[Flag("--probe", "bool", "also require (add 2 2) to return 4, and a live process to hold the pier")],
+        name="status", summary="the ship's state and config",
+        flags=[],
         positionals=[],
-        details=("Probe the ship and print one card: every live signal, then the static config.\n\n"
+        details=("One ship: everything admiral knows about it — the config block (host, pier "
+                 "dir, port, loom, sizes and epochs, persist unit, http, code), then a full "
+                 "probe: the verdict and every raw signal behind it, plus the three versions "
+                 f"behind the ship — admiral's engine (against this file's v{VERSION}), vere, "
+                 "and the kelvin its base desk is built for. daemon shows the urbit process id.\n\n"
+                 f"`{INVOKE} status` with no ship: one card per ship, every live signal and "
+                 "the static config.\n\n"
                  "  STATE    up / partial / down / misconfigured\n"
                  "  version  the admiral engine its daemon runs: current or stale\n"
                  "  daemon   the daemon holding the ship's terminal answers on its socket\n"
@@ -2834,20 +2919,9 @@ COMMANDS: list[Cmd] = [
                  "misconfigured: the ship runs on a different http port than this config's "
                  "pier.port, so the pier belongs to another admiral.toml. This config refuses to "
                  "touch it, even to attach.\n\n"
-                 f"`{INVOKE} status` shows every ship in the config; `{INVOKE} <ship>` shows one."),
-        examples=[f"{INVOKE} status", f"{INVOKE} sampel-palnet", f"{INVOKE} sampel-palnet status --probe"],
+                 "status is the default command: `<ship>` alone is `<ship> status`."),
+        examples=[f"{INVOKE} sampel-palnet", f"{INVOKE} status"],
         run=cmd_status,
-    ),
-    Cmd(
-        name="info", summary="everything admiral knows about the ship",
-        flags=[], positionals=[],
-        details=("The config block (host, pier dir, port, loom, socket, http, code), then a full "
-                 "--probe status: the verdict and every raw signal behind it, plus the three "
-                 "versions behind the ship — admiral's engine (against this file's "
-                 f"v{VERSION}), vere, and the kelvin its base desk is built for. daemon shows "
-                 "the urbit process id."),
-        examples=[f"{INVOKE} sampel-palnet info"],
-        run=cmd_info,
     ),
     Cmd(
         name="dojo", summary="run a dojo command and print what it printed",
@@ -3087,6 +3161,14 @@ COMMANDS += [
         run=cmd_enrich,
     ),
     Cmd(
+        name="configure", summary=f"an explainer about how to write {CONFIG}", ship=False,
+        flags=[], positionals=[],
+        details=(f"Print how {CONFIG} is found and every table and key it may hold, with an "
+                 f"example. {NAME} never writes the file — you do."),
+        examples=[f"{INVOKE} configure"],
+        run=cmd_configure,
+    ),
+    Cmd(
         name="unenrich", summary="remove what enrich added", ship=False,
         flags=ENRICH_FLAGS, positionals=SHELL_POS,
         details=(f"Print shell code that removes the `{NAME}` function and its completion, and "
@@ -3129,34 +3211,35 @@ def label_wrap(label: str, w: int, desc: str, width: int) -> list[str]:
     return [(label.ljust(w) if i == 0 else " " * w) + "  " + l for i, l in enumerate(body)]
 
 
-def config_summary(gray: Callable[[str], str], red: Callable[[str], str]) -> str:
-    # the loaded config at a glance, from the file alone (no host or ship probes): its
-    # path, then every ship's host, http origin and pier, then the desks. A missing or
-    # broken config says so here instead of failing the menu.
-    file = REPO / CONFIG
-    if not file.exists():
-        return red(f"  no {CONFIG} found (looked upward from {Path.cwd()}).") + gray(
-            f"\n  write one by hand — admiral.example.toml beside admiral.py shows the schema.")
-    try:
-        cfg = load_config(file)
-    except Exception as e:
-        return red(f"  {file}\n  does not load: {e}")
-    lines = [f"  {file}"]
-    w = max(len(s.name) for s in cfg.ships)
+MENU_GROUPS: list[list[str]] = [
+    # the command table, grouped by what you are doing; a command missing from every
+    # group lands in a final group of its own so a new one is never silently hidden.
+    ["status"],
+    ["run", "exit", "open", "code"],
+    ["attach", "dojo", "commit"],
+    ["engine-upgrade", "vere-upgrade", "chop"],
+    ["slog", "exec", "capture"],
+]
+
+
+def menu_ships(cfg: Config, gray: Callable[[str], str]) -> str:
+    # the ships, grouped by host (local first), each with its pier and bind port
+    groups: dict[str, list[Ship]] = {}
     for ship in cfg.ships:
-        host = cfg.hosts.get(ship.host or "local")
-        # the bind port, unless the http origin already ends in it
-        port = ship.pier.port
-        pier = pier_rel(ship) + (f":{port}" if port and not (ship.http or "").endswith(f":{port}") else "")
-        extra = [t for t, on in (("local", ship.pier.local), ("persist", ship.pier.persist)) if on]
-        if host and host.ssh:
-            extra.insert(0, f"on {host.name}")
-        lines.append(f"  {ship.name.ljust(w)}  {ship.http or '-'}  {gray(pier)}"
-                     + (f"  {gray(', '.join(extra))}" if extra else ""))
-    if cfg.desks:
-        desks = ", ".join(f"{d.name} ({d.src})" for d in cfg.desks)
-        lines += [f"  {gray(l)}" for l in textwrap.wrap("desks: " + desks, HELP_WIDTH - 2)]
-    return "\n".join(lines)
+        groups.setdefault(ship.host or "local", []).append(ship)
+    names = ["local", *(h for h in cfg.hosts if h in groups)] if "local" in groups else list(cfg.hosts)
+    out: list[str] = []
+    for hname in names:
+        ships = groups.get(hname, [])
+        if not ships:
+            continue
+        out.append(f"  {hname}")
+        w = max(len(s.name) for s in ships)
+        for ship in ships:
+            pier = pier_rel(ship) + (f":{ship.pier.port}" if ship.pier.port else "")
+            tags = [t for t, on in (("local", ship.pier.local), ("persist", ship.pier.persist)) if on]
+            out.append(f"    {ship.name.ljust(w)}  {pier}" + (f"  {gray(', '.join(tags))}" if tags else ""))
+    return "\n".join(out)
 
 
 def help_menu() -> None:
@@ -3164,21 +3247,12 @@ def help_menu() -> None:
     red = lambda s: paint(s, "red", color)
     gray = lambda s: paint(s, "gray", color)
     bold = lambda s: paint(s, "bold", color)
+    inv = INVOKE
     shell = os.path.basename(os.environ.get("SHELL", ""))
-
     try:
         enriched = rc_present(rc_path(shell), "installed")  # persisted truth, not the live env flag
     except Exception:
         enriched = False
-    white = lambda s: paint(s, "white", color)
-    installed_state = white("ON") if enriched else gray("OFF")
-    enrich_cmd = gray(f'eval "$({INVOKE} unenrich)"') if enriched else gray(f'eval "$({INVOKE} enrich)"')
-    enrich_blurb = "" if enriched else gray(
-        f"\n\n  enrichment adds a `{NAME}` command and tab completion to your shell,\n"
-        f"  so you type: {NAME} sam<TAB> at<TAB>\n"
-        f"  instead of:  {INVOKE} sampel-palnet attach")
-    inv = INVOKE
-    config_block = config_summary(gray, red)
 
     def sig(c: Cmd) -> str:
         # collapse a long flag list to "[opts]" so one verbose command can't blow out
@@ -3186,30 +3260,47 @@ def help_menu() -> None:
         flags = ["[opts]"] if len(c.flags) > 1 else [flag_brief(f) for f in c.flags]
         return " ".join([c.name, *flags, *[pos_brief(p) for p in c.positionals]])
 
-    with_ship = [c for c in COMMANDS if c.ship]
-    sigs = [sig(c) for c in with_ship]
-    w = max(*(len(s) for s in sigs), len("help [command]"))
-    rows = "\n".join(f"  {sigs[i].ljust(w)}  {c.summary}" for i, c in enumerate(with_ship))
+    grouped = [c for g in MENU_GROUPS for c in g]
+    groups = [[by_name(n) for n in g] for g in MENU_GROUPS]
+    rest = [c for c in COMMANDS if c.ship and c.name not in grouped]
+    if rest:
+        groups.append(rest)
+    shipless = [
+        ("enrich/unenrich", f"{'ON' if enriched else 'OFF'} toggle autocomplete and `{NAME}` alias"),
+        ("configure", by_name("configure").summary),
+    ]
+    w = max(*(len(sig(c)) for g in groups for c in g), *(len(n) for n, _ in shipless))
+    table = "\n\n".join("\n".join(f"  {sig(c).ljust(w)}  {c.summary}" for c in g) for g in groups)
+    table += "\n\n" + "\n".join(f"  {n.ljust(w)}  {d}" for n, d in shipless)
+
+    file = REPO / CONFIG
+    if not file.exists():
+        config = red(f"Config: no {CONFIG} found (looked upward from {Path.cwd()})") + gray(
+            f" — `{inv} configure` explains how to write one.")
+    else:
+        try:
+            cfg = load_config(file)
+        except Exception as e:
+            config = f"Config: {file}\n" + red(f"  does not load: {e}")
+        else:
+            config = f"Config: {file}\n"
+            if cfg.desks:
+                dw = max(len(d.name) for d in cfg.desks)
+                config += "\nDesks\n" + "\n".join(f"  {d.name.ljust(dw)}  {d.src}" for d in cfg.desks) + "\n"
+            config += "\nShips\n" + menu_ships(cfg, gray)
+
     sys.stderr.write(f"""
 {bold(f"{CLI}: urbit ship manager")} {gray(f"v{VERSION}")}
 
-Usage
+Commands
+
+  {gray(f"{inv} help <command>")}
 
   {gray(f"{inv} <ship> <command> [opts]")}
 
-  <ship> is a ship's name from {CONFIG}, with or without its ~.
-  {gray(f"{inv} <ship>")} shows one ship; {gray(f"{inv} status")} shows every ship.
+{table}
 
-Config
-
-{config_block}
-
-Commands
-
-{rows}
-  {'help [command]'.ljust(w)}  this menu, or everything about one command
-
-shell enrichment {installed_state}. paste to toggle: {enrich_cmd}{enrich_blurb}
+{config}
 
 """)
 

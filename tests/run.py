@@ -132,10 +132,11 @@ def _(ship, c):
     rc, out, err, _ = admiral("help")
     c.that(rc == 0, f"help: exit {rc}")
     menu = lines(err)
-    table = menu[menu.index("Commands") + 2:]
-    names = [l.split()[0] for l in table[:next(i for i, l in enumerate(table) if not l)]]
-    c.that(len(names) > 15, f"read {len(names)} commands off the menu")
-    for name in [n for n in names if n != "help"] + ["enrich", "unenrich"]:
+    table = menu[menu.index("Commands") + 1:next(i for i, l in enumerate(menu) if l.startswith("Config:"))]
+    names = [n for l in table if l.strip() and not l.lstrip().startswith("./")
+             for n in l.split()[0].split("/")]
+    c.that(len(names) > 15, f"read {len(names)} commands off the menu: {names}")
+    for name in names:
         rc, out, err, _ = admiral("help", name)
         c.that(rc == 0, f"help {name}: exit {rc}: {err[:200]!r}")
         c.that(f"admiral.py {name}" in err, f"help {name} has no header: {err[:200]!r}")
@@ -151,7 +152,7 @@ def _(ship, c):
     rc, out, err, _ = admiral("help")
     wide = [l for l in lines(err) if len(l) > 80]
     c.that(not wide, f"main help lines over 80 columns: {wide[:3]}")
-    c.that("Config" in err and ship in err, "no config block naming the ship")
+    c.that("Config:" in err and "Ships" in err and ship in err, "no config block naming the ship")
 
 
 @case("cli", "help-unknown-is-one-line")
@@ -167,7 +168,7 @@ def _(ship, c):
         pier = "p" * 120
         Path(d, "admiral.toml").write_text(
             f'[ships.zod]\nhttp = "http://localhost:1"\npier = {{ path = "{pier}", port = 1 }}\n')
-        rc, out, err, _ = admiral("zod", "info", cwd=d)
+        rc, out, err, _ = admiral("zod", "status", cwd=d)
         c.that(rc != 0, "a 120-byte pier path passed")
         c.that("socket path is" in err, f"no socket-length error: {err[-300:]!r}")
 

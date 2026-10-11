@@ -1,15 +1,16 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["playwright", "pyte"]
+# dependencies = ["pyte"]
 # ///
 #
 # urbit ship manager.
 #
 #   manage your urbit ships across many computers (via ssh).
 #
-#   runs via uv (deps playwright + pyte, declared above); the host-side engine is
-#   stdlib-only, so a ship's host needs only python3.
+#   runs via uv (dep: pyte, declared above); the host-side engine is stdlib-only, so
+#   a ship's host needs only python3. harness.py, beside this file, is the Playwright
+#   test harness for ships this manages.
 #
 #   ./admiral.py init                 # to get started
 #
@@ -33,15 +34,12 @@ import termios
 import selectors
 import subprocess
 import urllib.request
-import urllib.parse
 import urllib.error
 from pathlib import Path
 from dataclasses import dataclass
-from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
-Pattern = Any  # str | compiled regex
 
 VERSION = "0.1.0"
 
@@ -59,7 +57,6 @@ NAME = "admiral"             # drives config + infra names (socket, tool copy, c
 CLI = "admiral.py"           # basename with extension — shown in help/usage
 CONFIG_NAMES = (f"{NAME}.toml", f".{NAME}.toml")
 INVOKE = f"./{CLI}"          # how examples/usage render the invocation
-SCRIPTS = f".{NAME}"         # test/script dir under REPO; excluded from desk syncs
 
 
 def _find_repo() -> tuple[Path, str]:
@@ -78,7 +75,7 @@ def _find_repo() -> tuple[Path, str]:
 
 REPO, CONFIG = _find_repo()
 
-# config-value shapes, shared by load_config's validation and the init/add wizards.
+# config-value shapes, shared by load_config's validation and init/add.
 SHIP_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")  # ships.<name> map key
 DESK_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")          # desks[].name
 CODE_RE = re.compile(r"^[a-z]{6}(-[a-z]{6}){3}$")        # +code override
@@ -91,7 +88,6 @@ T_RUN = 15
 T_HTTP = 3  # the status probe's GET; a dead origin must not stall the card
 T_DOJO = 60  # a dojo command's budget; past it the command is aborted, so builds need room
 T_CHOP = 900  # roll copies the snapshot into the new epoch — minutes on a big pier
-
 
 
 # ── domain types ─────────────────────────────────────────────────────────────
@@ -112,15 +108,14 @@ class PierConfig:
 
 # ── ship fields ──────────────────────────────────────────────────────────────
 # The one table behind everything that handles a ship's settings: config load
-# validates against it, add/edit take a --flag per row, the wizard asks a question per
-# row, and the TOML writer renders from it. A new setting is one new row.
+# validates against it, add/edit take a --flag per row, and the TOML writer renders
+# from it. A new setting is one new row.
 @dataclass(frozen=True)
 class Field:
     key: str                  # TOML key, and the --flag name ("master-ticket")
     attr: str                 # attribute on Ship (or on PierConfig when pier)
     kind: str                 # "str" | "int" | "bool"
     desc: str                 # the --flag's help
-    prompt: str               # the wizard's question
     hint: str                 # what a good value looks like; the error for a bad one
     ph: str = "<val>"         # value placeholder in usage
     pier: bool = False        # lives in the ship's `pier = { ... }` table
@@ -130,44 +125,33 @@ class Field:
 
 
 FIELDS: list[Field] = [
-    Field("http", "http", "str", "http origin playwright/login targets",
-          "http origin playwright/login targets",
+    Field("http", "http", "str", "http origin the ship's web UI answers at",
           'must be a non-empty hostname or URL (e.g. "example.com")', ph="<url>",
           ok=lambda s: bool(s.strip()) and not re.search(r"\s", s)),
-    Field("path", "path", "str", "pier path (relative to the host root, or absolute)",
-          "pier path (relative to the host root, or absolute)", "must be a string",
+    Field("path", "path", "str", "pier path (relative to the host root, or absolute)", "must be a string",
           ph="<path>", pier=True),
-    Field("port", "port", "int", "http bind port on the box (1-65535)", "http port on the box",
+    Field("port", "port", "int", "http bind port on the box (1-65535)",
           "must be an integer 1-65535", ph="<port>", pier=True, hi=65535),
     Field("ames", "ames", "int", "ames UDP port; pin it so peers' lanes survive a restart",
-          "ames UDP port", "must be an integer 1-65535", ph="<port>", pier=True, hi=65535),
+          "must be an integer 1-65535", ph="<port>", pier=True, hi=65535),
     Field("loom", "loom", "int", "loom size (memory pages, power of 2)",
-          "loom size (memory pages, power of 2; blank = vere default)",
           "must be a positive integer", ph="<pages>", pier=True),
     Field("local", "local", "bool", "boot with -L (fake networking) — pin it for a COPIED pier "
-          "whose original still runs elsewhere", "boot with -L (fake networking)",
+          "whose original still runs elsewhere",
           "must be a boolean", ph="<true|false>", pier=True),
     Field("code", "code", "str", "+code override (skips the live dojo read)",
-          "+code override (skips the live dojo read; blank = read live)",
           'must be a +code key (e.g. "ralnyt-botwyc-batnyt-dozzod")', ph="<code>",
           ok=lambda s: bool(CODE_RE.match(s))),
     Field("master-ticket", "master_ticket", "str", "ship master ticket (key material)",
-          "master ticket (key material; blank = none)",
           'must be a ticket like "~ralnyt-botwyc-batnyt-dozzod"', ph="<ticket>",
           ok=lambda s: bool(TICKET_RE.match(s))),
     Field("mnemonic", "mnemonic", "str", "BIP39 mnemonic seed phrase (quote it)",
-          "mnemonic (BIP39 seed words; blank = none)",
           "must be a space-separated word list (BIP39 mnemonic)", ph="<words>",
           ok=lambda s: bool(MNEMONIC_RE.match(s))),
 ]
 # every key `pier = { ... }` may carry. Config load rejects anything else, because
 # add/edit rewrite that table from these fields alone — see load_config.
 PIER_KEYS = frozenset(f.key for f in FIELDS if f.pier)
-
-# what the wizard asks, in order (port before http so a local ship's http can default
-# to it). ames and local are niche and flag-only — but an existing ship's values for
-# them survive an edit untouched, see wizard_ship.
-WIZARD_KEYS = ("port", "http", "loom", "path", "code", "master-ticket", "mnemonic")
 
 
 def field_error(f: Field, v: Any) -> str | None:
@@ -185,7 +169,7 @@ def field_error(f: Field, v: Any) -> str | None:
 
 
 def field_from_text(f: Field, raw: str) -> tuple[Any, str | None]:
-    # a --flag or wizard answer -> (typed value, error). "" unsets the field.
+    # a --flag's text -> (typed value, error). "" unsets the field.
     if raw == "":
         return (None, None)
     v: Any = raw
@@ -218,7 +202,7 @@ class Ship:
     name: str                 # map key — the ship name (the selector matches this)
     pier: PierConfig          # pier dir + bind port + loom on its box
     host: str | None = None   # hosts map key; empty/None => the local machine
-    http: str | None = None   # http origin playwright targets; REQUIRED for web access
+    http: str | None = None   # http origin of the ship's web UI; REQUIRED for web access
     code: str | None = None   # optional +code override; skips the live dojo read
     master_ticket: str | None = None  # ship master ticket (key material; for boot)
     mnemonic: str | None = None       # BIP39 mnemonic seed phrase (key material)
@@ -275,7 +259,7 @@ def load_config(file: Path | None = None) -> Config:
             f'  src = "."'
         )
     try:
-        import tomllib
+        import tomllib  # lazy: the host-side engine runs under whatever python3 the box has
     except ImportError:
         raise RuntimeError(f"admiral needs python 3.11+ (this is {sys.version.split()[0]}, no tomllib)")
     try:
@@ -450,12 +434,13 @@ def run_argv(ship: Ship, host: Host) -> list[str]:
 
 
 def ship_base(ship: Ship) -> str:
-    # the base origin playwright/login targets: the configured http origin (scheme
-    # defaults to https). REQUIRED — there is no localhost:<port> fallback.
+    # the base origin of the ship's web UI (the status probe and harness.py target it):
+    # the configured http origin, scheme defaulting to https. REQUIRED — there is no
+    # localhost:<port> fallback.
     if not ship.http:
         raise RuntimeError(
             f'ship "{ship.name}" has no "http" in {CONFIG} — '
-            f'playwright needs an http origin to target it (no localhost:<port> fallback)'
+            f'web access needs an http origin to target (no localhost:<port> fallback)'
         )
     d = ship.http.strip().rstrip("/")
     return d if re.match(r"^https?://", d, re.I) else f"https://{d}"
@@ -589,18 +574,16 @@ def local_capture_at(ship: Ship, host: Host, offset: int) -> tuple[int, str]:
     # a remote socket.
     sock = sock_path(ship, host)
     got = sock_capture_at(sock, offset)
-    if got is not None:
-        return (got[0], got[1].decode("utf-8", "replace"))
-    # no daemon => ("", RING_NOMARK); a pre-C_CAPTURE_AT daemon => the whole ring under
-    # RING_NOMARK, the same transparent degrade the remote path spells with its header.
-    return (RING_NOMARK, sock_capture(sock).decode("utf-8", "replace"))
+    if got is None:
+        raise RuntimeError(f'ship "{ship.name}" daemon not running (no daemon at {sock})')
+    return (got[0], got[1].decode("utf-8", "replace"))
 
 
 # The daemon ring is RAW pty bytes — full of the ANSI/cursor escapes urbit's dojo TUI
 # emits. `pyte` is a pure-python terminal emulator: feed it the raw bytes, read back
 # the RENDERED lines + scrollback (the cell grid a terminal maintains). It runs
 # FRONTEND-side only (the host engine ships raw bytes), so it lives in the uv dep
-# block and the engine stays stdlib-only. Falls back to a regex strip if absent.
+# block and the engine stays stdlib-only.
 _OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _CSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _ESC = re.compile(r"\x1b[@-Z\\-_]")
@@ -610,6 +593,11 @@ RENDER_COLS, RENDER_ROWS = 8192, 2
 # The ONE geometry for every pyte render here — `capture`, a dojo output slice, the
 # console log. Two knobs, and they fail in different ways; both were measured on ~lagrev
 # against a 4000-char slog (`~&  (crip (reap 4.000 %x))  ~`).
+#
+# COST. pyte charges per character and renders ~65KB/s (measured on a real ring), so
+# every render here is bounded: a 64MB ring is ~20 minutes, a 3.3MB `.pty` ~100s. The
+# caps that follow (PANE_TAIL_MIN, DOJO_RENDER_MAX, CONSOLE_SEED_MAX, PTY_MAX) are all
+# sized against this one number.
 #
 # COLS WRAP. A logical line longer than `cols` soft-wraps into separate history entries,
 # so the render splits a value urbit never split: at 200 the run came back in 200-char
@@ -633,7 +621,6 @@ PANE_HIST = 30000  # history >= lines a full RING_MAX burst can render to, so py
 # doesn't drop sentinels the raw ring still holds
 
 
-
 def _regex_clean(text: str) -> str:
     text = _OSC.sub("", text)
     text = _CSI.sub("", text)
@@ -648,10 +635,7 @@ def clean_pane(raw: str, cols: int = RENDER_COLS, rows: int = RENDER_ROWS,
     # emulator (cursor-aware) is the ONLY way to read a stream the dojo paints with
     # absolute cursor moves + backspace-overwrite spinners — a regex strip linearizes
     # those repaints into garbage. This is what `tmux capture-pane` does.
-    try:
-        import pyte
-    except ImportError:
-        return _regex_clean(raw)
+    import pyte  # lazy: the engine side (host-local, stdlib-only) never renders
     screen = pyte.HistoryScreen(cols, rows, history=hist, ratio=0.5)
     stream = pyte.Stream(screen)
     stream.feed(raw)
@@ -673,26 +657,19 @@ PROBE_TAIL = 64 * 1024     # `status` only reads the pane's last non-blank line
 
 def capture_pane(host: Host, ship: Ship, tail_bytes: int | None = None) -> str:
     # dump the daemon's scrollback ring, rendered to clean text. `tail_bytes` bounds the
-    # render to that many raw ring bytes.
-    #
-    # Bounding is not an optimization, it is the difference between usable and not: pyte
-    # charges per CHARACTER and renders ~50KB/s (measured on a real ring), so reading the
-    # last line of a 64MB ring costs ~20 minutes. Pass None only when the caller really
-    # wants the whole console.
+    # render to that many raw ring bytes (see RENDER_COLS for why unbounded is minutes);
+    # None renders the whole ring.
+    start = 0
     if tail_bytes is not None:
-        total = ring_mark(host, ship)
-        if total >= 0:  # a pre-watermark daemon can only hand back the whole ring
-            start = max(0, total - max(tail_bytes, PANE_TAIL_MIN))
-            _, tail = capture_at(host, ship, start)
-            if start > 0:
-                # the cut lands mid-line far more often than not, and half a line
-                # renders as a line — so the window's first row would be a fragment
-                # of a row the console never had. Open on the next real break, the
-                # same trim +attach_snapshot does for a replayed screen.
-                cut = tail.find("\n")
-                tail = tail[cut + 1:] if cut >= 0 else tail
-            return clean_pane(tail)
-    return clean_pane(eng(host, ship, "__capture", check=False))
+        start = max(0, ring_mark(host, ship) - max(tail_bytes, PANE_TAIL_MIN))
+    _, tail = capture_at(host, ship, start)
+    if start > 0:
+        # the cut lands mid-line far more often than not, and half a line renders as a
+        # line the console never had. Open on the next real break, the same trim
+        # +attach_snapshot does for a replayed screen.
+        cut = tail.find("\n")
+        tail = tail[cut + 1:] if cut >= 0 else tail
+    return clean_pane(tail)
 
 
 # ── the console log ───────────────────────────────────────────────────────────
@@ -702,14 +679,10 @@ def capture_pane(host: Host, ship: Ship, tail_bytes: int | None = None) -> str:
 # split is not a style choice: pyte cannot run on the host (stdlib-only engine), so the
 # daemon can only ever append and the cook has to happen here regardless.
 CONSOLE_DIR = Path.home() / ".cache" / "admiral"
-CONSOLE_MIN_VERSION = "0.0.6"  # the release that started teeing `.pty`
 CONSOLE_SEED_MAX = 1024 * 1024
-# How much backlog a FIRST cook will chew. pyte runs ~65KB/s, so an unbounded first
-# `slog` against a ship that has been up a while just hangs (a 3.3MB `.pty` is ~97s of
-# silence, and a caller who times out reads the empty result as "the ship said nothing").
-# Seed from the last MB instead — ~15s — and SAY what was skipped: a silent cap reads as
-# full coverage, which is the same lie this whole feature exists to stop telling. The
-# skipped bytes are not lost; they are in `.pty`, and `--rebuild` cooks all of them.
+# How much backlog a FIRST cook will chew: ~15s of pyte (see RENDER_COLS), where a whole
+# long-lived `.pty` would hang the caller. The skip is SAID, not silent (a silent cap
+# reads as full coverage), and the bytes stay in `.pty` for `--rebuild`.
 
 
 def console_paths(ship: Ship) -> tuple[Path, Path]:
@@ -736,11 +709,7 @@ def cook_pty(raw: str, stamps: list[tuple[int, float]], base: int) -> list[str]:
     # and cursor moves in a later chunk resolve against an earlier one. (Spreading lines
     # evenly across a chunk's span instead is a trap: over a whole-file cook it divides
     # HOURS by the line count and stamps every line with a fiction.)
-    try:
-        import pyte
-    except ImportError:  # same degraded path as clean_pane: spinner litter, no crash
-        return [f"{fmt_stamp(stamps[0][1] if stamps else time.time())}\t{l}"
-                for l in _regex_clean(raw).split("\n") if l.strip()]
+    import pyte
     screen = pyte.HistoryScreen(RENDER_COLS, RENDER_ROWS, history=PANE_HIST, ratio=0.5)
     stream = pyte.Stream(screen)
     # Seed the saved cursor at the bottom row before feeding a chunk that starts
@@ -828,8 +797,8 @@ def console_sync(host: Host, ship: Ship, rebuild: bool = False,
 
     cur_ino, size, stamps, body = pty_read(host, ship, offset)
     if cur_ino == 0:
-        raise RuntimeError("no console log on this ship — its daemon predates the pty "
-                           f"tee (v{CONSOLE_MIN_VERSION}). run: admiral {ship.name} engine-upgrade")
+        raise RuntimeError(f"no console log for {ship.name}: no .pty beside its socket — "
+                           "has it ever booted under admiral?")
     # a changed inode means `.pty` rotated under us: our offset indexes a file that is
     # now `.pty.1`, so it is meaningless. Restart from 0 rather than cook garbage — and
     # truncate, for the same reason as above: appending a fresh cook to the old log
@@ -875,33 +844,23 @@ def console_sync(host: Host, ship: Ship, rebuild: bool = False,
     return log
 
 
-# sentinel watermark meaning "no daemon, or a daemon too old to support C_CAPTURE_AT".
-# Callers that get it back fall back to whole-ring capture (the pre-watermark behavior).
-RING_NOMARK = -1
-
-
 def capture_at(host: Host, ship: Ship, offset: int) -> tuple[int, str]:
-    # raw (unrendered) capture of ring bytes past `offset` (a prior `total` watermark).
-    # Returns (current_total, raw_tail). total is RING_NOMARK when the daemon predates
-    # watermark support — then raw_tail is the FULL ring (identical to __capture), so the
-    # caller transparently degrades to whole-ring search.
+    # raw (unrendered) capture of ring bytes past `offset` (a prior `total` watermark):
+    # (current_total, raw_tail). Offset 0 is the whole ring. Raises when no daemon answers.
     if not host.ssh:
         return local_capture_at(ship, host, offset)
     out = eng(host, ship, "__capture-at", str(offset), check=False)
-    if not out:
-        return (RING_NOMARK, "")
     head, sep, tail = out.partition("\n")
-    if not sep or head == "f" * 16:
-        return (RING_NOMARK, tail if sep else out)
     try:
         return (int(head, 16), tail)
     except ValueError:
-        return (RING_NOMARK, out)
+        raise RuntimeError(f'ship "{ship.name}" daemon not running (no daemon at '
+                           f'{sock_path(ship, host)})')
 
 
 def ring_mark(host: Host, ship: Ship) -> int:
-    # current total-bytes-written watermark, or RING_NOMARK if unsupported. Asking past
-    # the end (max u64) returns an empty tail + the live total — a cheap watermark probe.
+    # current total-bytes-written watermark. Asking past the end (max u64) returns an
+    # empty tail + the live total — a cheap watermark probe.
     total, _ = capture_at(host, ship, (1 << 64) - 1)
     return total
 
@@ -939,12 +898,11 @@ def daemon_log_tail(host: Host, ship: Ship, n: int = 25) -> str:
     return "\n".join(l for l in clean_pane(out).split("\n") if l.strip())
 
 
-def daemon_status(host: Host, ship: Ship) -> tuple[int, int, str | None] | None:
+def daemon_status(host: Host, ship: Ship) -> tuple[int, int, str] | None:
     # (daemon_pid, child_pid, engine_version) if a daemon answers on the ship's
     # socket, else None. This is the AUTHORITATIVE liveness + the meaningful child PID:
     # the daemon owns the urbit child and reports it directly. engine_version is the
-    # VERSION baked into the on-host tool copy that
-    # STARTED this daemon — None when an older, pre-versioning daemon is running.
+    # VERSION baked into the on-host tool copy that STARTED this daemon.
     if not host.ssh:
         return engine_ping(sock_path(ship, host))
     out = eng(host, ship, "__status", check=False).strip()
@@ -952,8 +910,7 @@ def daemon_status(host: Host, ship: Ship) -> tuple[int, int, str | None] | None:
         return None
     parts = out.split()
     try:
-        ver = parts[3] if len(parts) > 3 and parts[3] != "?" else None
-        return (int(parts[1]), int(parts[2]), ver)
+        return (int(parts[1]), int(parts[2]), parts[3])
     except (IndexError, ValueError):
         return None
 
@@ -1186,26 +1143,6 @@ def verdict_color(s: str, on: bool) -> str:
 
 def shown_port(p: int | None) -> str:
     return str(p) if p is not None else "(unset)"
-
-
-def render_table(cols: list[str], rows: list[list[str]],
-                 cell: Callable[[str], str] | None = None, stream: Any = None) -> None:
-    # the single table renderer (list / status / version): header + width-aligned
-    # rows. `cell` optionally colors a body cell; padding is computed on the RAW
-    # text width so injected ANSI escapes never skew the columns.
-    stream = stream or sys.stdout
-    w = [max(len(cols[i]), *(len(r[i]) for r in rows)) for i in range(len(cols))] if rows \
-        else [len(c) for c in cols]
-
-    def fmt(cells: list[str], head: bool = False) -> str:
-        return "  ".join(
-            ((c if head or cell is None else cell(c)) + " " * max(0, w[i] - len(c)))
-            for i, c in enumerate(cells)
-        ).rstrip()
-
-    stream.write(fmt(cols, True) + "\n")
-    for r in rows:
-        stream.write(fmt(r) + "\n")
 
 
 # ── desk sync ─────────────────────────────────────────────────────────────────
@@ -1477,7 +1414,7 @@ DOJO_NOISE = re.compile(r"^(dojo: busy \(press backspace to abort\)|interrupt|"
 
 
 def render_transcript(raw: str) -> str:
-    # pyte renders ~65KB/s, so a huge transcript renders its head and regex-cleans the rest.
+    # a huge transcript renders its head and regex-cleans the rest (see RENDER_COLS)
     if len(raw) <= DOJO_RENDER_MAX:
         return clean_pane(raw)
     return clean_pane(raw[:DOJO_RENDER_MAX]) + "\n" + _regex_clean(raw[DOJO_RENDER_MAX:])
@@ -1530,16 +1467,6 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
                 sync_err.append(e)
         sync_thread = threading.Thread(target=_do_sync)
         sync_thread.start()
-
-    if ring_mark(host, ship) < 0:
-        # a daemon predating C_CAPTURE_AT answers every capture with the WHOLE ring under
-        # a RING_NOMARK total, and every invariant below breaks at once. Refuse plainly
-        # rather than pretend to degrade.
-        if sync_thread is not None:
-            sync_thread.join()
-        raise RuntimeError(
-            f'ship "{ship.name}" runs a daemon too old for watermarked capture — '
-            f'`{INVOKE} {ship.name} engine-upgrade` (hot-swaps the engine in place, no restart)')
 
     try:
         dojo_ready(host, ship, timeout, log)
@@ -1782,7 +1709,7 @@ class ShipState:
     http: bool | None = None         # the ship's "http" origin /~/login is reachable
     misconfigured: bool = False      # live --http-port disagrees with this config's pier.port
     running_port: int | None = None  # the --http-port the ship is ACTUALLY running on
-    version: str | None = None       # engine VERSION baked into the daemon; None = legacy/down
+    version: str | None = None       # engine VERSION baked into the daemon; None when down
 
 
 def probe_ship(ship: Ship, cfg: Config, host: Host, probe: bool = False) -> ShipState:
@@ -1843,7 +1770,6 @@ class Flag:
     name: str            # canonical "--probe" / "-t"
     kind: str            # 'bool' | 'int' | 'str'
     desc: str
-    alias: str | None = None
     ph: str | None = None  # value placeholder for help/usage, e.g. "<secs>"
 
 
@@ -1865,7 +1791,6 @@ class Cmd:
     details: str | None = None
     examples: list[str] | None = None
     complete: Callable[[Config | None], list[str]] | None = None
-    notes: Callable[[Config | None], str] | None = None
     ship: bool = True        # takes a <ship> selector and a loaded config; init/enrich don't
 
 
@@ -1904,7 +1829,7 @@ class UsageError(Exception):
 
 
 def find_flag(c: Cmd, tok: str) -> Flag | None:
-    return next((f for f in c.flags if f.name == tok or f.alias == tok), None)
+    return next((f for f in c.flags if f.name == tok), None)
 
 
 def int_val(c: Cmd, flag: str, raw: str | None) -> int:
@@ -2201,12 +2126,7 @@ def print_status(ships: list[Ship], results: list[FanResult], cfg: Config) -> No
     on = is_tty(sys.stdout)
 
     def ver_cell(v: ShipState) -> str:
-        # version baked into the running daemon vs this control file's VERSION.
-        running, status = version_status(v.version, v.daemon)
-        if status == "down":
-            return paint("-", "red", on)
-        label = running if running == "legacy" else f"v{running}"
-        return paint(f"{label} ({status})", "green" if status == "current" else "yellow", on)
+        return engine_cell(v, on) if v.daemon else paint("-", "red", on)
 
     namew = max((len(s.name) for s in ships), default=0)
     statew = max((len(r.value.verdict) for r in results if r.ok and r.value),
@@ -2237,6 +2157,12 @@ def print_status(ships: list[Ship], results: list[FanResult], cfg: Config) -> No
     sys.stdout.write("\n".join(out) + "\n")
 
 
+def engine_cell(st: ShipState, on: bool) -> str:
+    # the version baked into the running daemon, against this control file's VERSION
+    cur = st.version == VERSION
+    return paint(f"v{st.version} ({'current' if cur else 'stale'})", "green" if cur else "yellow", on)
+
+
 def cmd_info(a: Parsed) -> None:
     cfg = a.cfg
     ship = resolve_ship(a.selector, cfg)
@@ -2244,6 +2170,15 @@ def cmd_info(a: Parsed) -> None:
     st = probe_ship(ship, cfg, host, probe=True)
 
     on = is_tty(sys.stdout)
+
+    # the three versions behind the ship: admiral's engine, vere, and the kelvin its
+    # base desk is built for (read from the dojo).
+    vere = host.exec(vere_binary(ship, host), ["--version"], check=False).split("\n")[0]
+    vere = vere.removeprefix("urbit ").strip() or "-"
+    kelvin = "-"
+    if st.dojo:
+        m = re.search(r"\d+", dojo_one(ship, "zuse", cfg, log=lambda m: None))
+        kelvin = m.group(0) if m else "?"
 
     pier_extra = [
         f"port {ship.pier.port}" if ship.pier.port is not None else None,
@@ -2286,6 +2221,9 @@ def cmd_info(a: Parsed) -> None:
         ("", ""),
         ("verdict", verdict_color(st.verdict, on)),
         ("daemon", daemon_str),
+        ("engine", engine_cell(st, on) if st.daemon else "-"),
+        ("vere", vere),
+        ("kelvin", kelvin),
         ("pane", sig(st.pane, on)),
         ("dojo", sig(st.dojo, on)),
         ("pier dir", sig(st.pier, on)),
@@ -2423,67 +2361,11 @@ def cmd_exit(a: Parsed) -> None:
     sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
 
-def cmd_version(a: Parsed) -> None:
-    # Three versions per ship: the admiral engine its daemon runs (against this file's),
-    # the vere runtime, and the kelvin its base desk is built for.
-    cfg = a.cfg
-
-    def work(ship, host, log):
-        st = daemon_status(host, ship)
-        vere = host.exec(vere_binary(ship, host), ["--version"], check=False).split("\n")[0]
-        vere = vere.removeprefix("urbit ").strip() or "-"
-        kelvin = "-"
-        if st is not None:
-            m = re.search(r"\d+", dojo_one(ship, "zuse", cfg, log=lambda m: None))
-            kelvin = m.group(0) if m else "?"
-        return (st, vere, kelvin)
-
-    results = fan(select_ships(a.selector, cfg), cfg, work)
-    print_versions(results)
-    sys.exit(fan_exit(results))
-
-
-def version_status(version: str | None, up: bool) -> tuple[str, str]:
-    # (running, status) for a ship's daemon engine. status is one of current / stale /
-    # down, where a pre-versioning daemon (no version in its pong) reports as "legacy".
-    if not up:
-        return ("-", "down")
-    if version is None:
-        return ("legacy", "stale")
-    return (version, "current" if version == VERSION else "stale")
-
-
-def print_versions(results: list[FanResult]) -> None:
-    on = is_tty(sys.stdout)
-    cols = ["SHIP", "ENGINE", "LATEST", "STATUS", "VERE", "KELVIN"]
-    rows: list[list[str]] = []
-    for r in results:
-        if not r.ok:
-            rows.append([r.ship, "?", VERSION, f"error: {r.err or ''}", "?", "?"])
-            continue
-        st, vere, kelvin = r.value
-        running, status = version_status(st[2] if st else None, st is not None)
-        rows.append([r.ship, running, VERSION, status, vere, kelvin])
-
-    def cell(s: str) -> str:
-        if s == "current":
-            return paint(s, "green", on)
-        if s == "stale":
-            return paint(s, "yellow", on)
-        if s == "down" or s.startswith("error"):
-            return paint(s, "red", on)
-        return s
-
-    render_table(cols, rows, cell)
-
-
 def cmd_engine_upgrade(a: Parsed) -> None:
     # Bring each ship's on-host engine up to THIS control file's version. First rsync
     # the tool to the host, then ask the running daemon to swap its code IN PLACE — it
     # re-execs the new tool while keeping urbit and the pty alive, so there is no
-    # restart and no downtime. A pre-versioning daemon has no swap handler; we detect
-    # that (version doesn't change) and fall back to a full restart, after which every
-    # future upgrade is in-place. A current ship is left untouched; a stopped ship just
+    # restart and no downtime. A current ship is left untouched; a stopped ship just
     # gets its on-host tool refreshed.
     def work(ship, host, log):
         st = daemon_status(host, ship)
@@ -2496,7 +2378,6 @@ def cmd_engine_upgrade(a: Parsed) -> None:
             return f"on-host tool refreshed; daemon not running (start with `{INVOKE} {ship.name} run`)"
         if running == VERSION:
             return f"already current (v{VERSION})"
-        old = running or "legacy"
         # in-place swap: signal the daemon, then poll for its reported version to flip.
         log(f"swapping engine in place -> v{VERSION}")
         eng(host, ship, "__upgrade", check=False)
@@ -2504,14 +2385,10 @@ def cmd_engine_upgrade(a: Parsed) -> None:
             time.sleep(1)
             now = daemon_status(host, ship)
             if now and now[2] == VERSION:
-                return f"upgraded {old} -> v{VERSION} in place (daemon {now[0]} child {now[1]}, urbit not restarted)"
-        # version never flipped: a legacy daemon ignored the frame (or the exec
-        # failed). Fall back to a clean restart.
-        log("in-place swap unavailable (legacy daemon); restarting")
-        if not daemon_stop(ship, host):
-            raise RuntimeError("ship did not shut down for upgrade (still running) — try `exit` then `run`")
-        now = daemon_start(ship, host)
-        return f"upgraded {old} -> v{VERSION} via restart (daemon {now[0]} child {now[1]})"
+                return f"upgraded v{running} -> v{VERSION} in place (daemon {now[0]} child {now[1]}, urbit not restarted)"
+        # the version never flipped: the exec failed and the daemon stayed on its old code
+        raise RuntimeError(f"engine did not swap (still v{running}); the daemon's .log says why — "
+                           f"`{INVOKE} {ship.name} exit` then `run` restarts it onto the new tool")
 
     sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
@@ -2653,56 +2530,7 @@ def cmd_boot(a: Parsed) -> None:
         f"  comet/fakezod), then `{INVOKE} {resolve_ship(a.selector, a.cfg).name} run`.")
 
 
-def ensure_chromium() -> None:
-    home = Path.home()
-    dirs = [home / "Library/Caches/ms-playwright", home / ".cache/ms-playwright"]
-    env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")  # honor the cache redirect, if set
-    if env and env != "0":
-        dirs.insert(0, Path(env))
-
-    def has(d: Path) -> bool:
-        try:
-            return any(n.startswith("chromium-") for n in os.listdir(d))
-        except OSError:
-            return False
-
-    if not any(has(d) for d in dirs):
-        sys.stderr.write("Installing Chromium for Playwright...\n")
-        subprocess.run(["playwright", "install", "chromium"], check=True)
-
-
-def cmd_test(a: Parsed) -> None:
-    headed = bool(a.flags.get("--headed"))
-    files = a.pos  # required+variadic => guaranteed >=1 by parse_args
-    cfg = a.cfg
-    ship = resolve_ship(a.selector, cfg)
-    ensure_chromium()
-    status = 0
-    for t in files:
-        file = t
-        if not os.path.exists(file):
-            file = os.path.join(str(REPO), SCRIPTS, t)
-        sys.stderr.write(f"=== running {file} on {ship.name} ===\n")
-        # pass the ship + headed flag as argv (read by setup via argv_flag) — no env vars
-        pass_args = [file, "--ship", ship.name, *(["--headed"] if headed else [])]
-        # admiral's own directory on the path, so a test can `from admiral import with_ship`
-        path = os.pathsep.join(x for x in [str(SELF.parent), os.environ.get("PYTHONPATH")] if x)
-        try:
-            subprocess.run([sys.executable, *pass_args], check=True,
-                           env={**os.environ, "PYTHONPATH": path})
-        except subprocess.CalledProcessError:
-            sys.stderr.write(f"=== FAILED: {file} ===\n")
-            status = 1
-    sys.exit(status)
-
-
 # ── shell tab-completion (hidden subcommands) ─────────────────────────────────
-def completion_test_files() -> list[str]:
-    try:
-        return [n for n in os.listdir(os.path.join(str(REPO), SCRIPTS))
-                if n.endswith(".py") and n != CLI]
-    except OSError:
-        return []
 
 
 def cmd_complete(words: list[str]) -> None:
@@ -2740,10 +2568,7 @@ def cmd_complete(words: list[str]) -> None:
         cmd = by_name(before[1])
         if not cmd or not cmd.ship:
             return
-    flag_names = []
-    for f in cmd.flags:
-        flag_names.extend([f.name, f.alias] if f.alias else [f.name])
-    return emit([*(cmd.complete(cfg) if cmd.complete else []), *flag_names])
+    return emit([*(cmd.complete(cfg) if cmd.complete else []), *(f.name for f in cmd.flags)])
 
 
 # ── shell install body (the combined `installed` feature) ─────────────────────
@@ -2878,90 +2703,6 @@ def cmd_unenrich(a: Parsed) -> None:
     sys.stdout.write(_installed_uninstall(shell) + "\n")
 
 
-# ── interactive wizard: step-by-step prompts + TOML emit (init / add) ─────────
-# init builds admiral.toml from scratch; add appends a ship to an existing one. Both
-# share one ship-prompt flow (wizard_ship) and one set of input primitives below. The
-# primitives read a line at a time from stdin; Ctrl-C / EOF aborts the whole wizard.
-class WizardAbort(Exception):
-    pass
-
-
-def _readline(prompt: str) -> str:
-    try:
-        return input(prompt)
-    except (EOFError, KeyboardInterrupt):
-        raise WizardAbort()
-
-
-def ask(label: str, *, default: str | None = None, optional: bool = False,
-        validate: Callable[[str], str | None] | None = None) -> str | None:
-    # one required/optional free-text prompt. default shown in [..]; empty input takes
-    # the default (or, when optional with no default, returns None). validate returns an
-    # error string to re-ask, or None to accept.
-    suffix = f" [{default}]" if default is not None else (" (optional)" if optional else "")
-    while True:
-        raw = _readline(f"  {label}{suffix}: ").strip()
-        if not raw:
-            if default is not None:
-                raw = default
-            elif optional:
-                return None
-            else:
-                sys.stderr.write("    required — enter a value\n")
-                continue
-        if validate:
-            err = validate(raw)
-            if err:
-                sys.stderr.write(f"    {err}\n")
-                continue
-        return raw
-
-
-def ask_int(label: str, *, default: int | None = None, lo: int = 1, hi: int = 2**31,
-            optional: bool = False) -> int | None:
-    def v(s: str) -> str | None:
-        try:
-            n = int(s)
-        except ValueError:
-            return f"must be a whole number"
-        if n < lo or n > hi:
-            return f"must be between {lo} and {hi}"
-        return None
-    out = ask(label, default=(str(default) if default is not None else None),
-              optional=optional, validate=v)
-    return int(out) if out is not None else None
-
-
-def ask_yn(label: str, *, default: bool = False) -> bool:
-    d = "Y/n" if default else "y/N"
-    while True:
-        raw = _readline(f"  {label} [{d}]: ").strip().lower()
-        if not raw:
-            return default
-        if raw in ("y", "yes"):
-            return True
-        if raw in ("n", "no"):
-            return False
-        sys.stderr.write("    answer y or n\n")
-
-
-def ask_choice(label: str, options: list[str], *, default: str | None = None) -> str:
-    # pick one of options by number or exact name; default is one of the options.
-    while True:
-        sys.stderr.write(f"  {label}\n")
-        for i, o in enumerate(options, 1):
-            mark = "  (default)" if o == default else ""
-            sys.stderr.write(f"    {i}) {o}{mark}\n")
-        raw = _readline("  choice: ").strip()
-        if not raw and default is not None:
-            return default
-        if raw.isdigit() and 1 <= int(raw) <= len(options):
-            return options[int(raw) - 1]
-        if raw in options:
-            return raw
-        sys.stderr.write("    pick a listed number or name\n")
-
-
 # ── TOML emit (hand-rolled: stdlib has no writer; our schema is small + fixed) ──
 def _toml_str(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -3000,7 +2741,7 @@ def render_desk_block(name: str, src: str) -> str:
     return f"[[desks]]\nname = {_toml_str(name)}\nsrc = {_toml_str(src)}"
 
 
-# ── ship sub-wizard (shared by init + add) ────────────────────────────────────
+# ── ship drafts (init / add / edit) ───────────────────────────────────────────
 @dataclass
 class HostDraft:
     name: str
@@ -3022,57 +2763,11 @@ class ShipDraft:
         return render_ship_block(self.ship)
 
 
-def _wizard_host() -> HostDraft:
-    sys.stderr.write("  new remote host:\n")
-    name = ask("host name (label, e.g. drain)",
-               validate=lambda s: None if SHIP_NAME_RE.match(s) else "letters/digits/_/- , not starting with a digit")
-    ssh = ask("ssh target (user@box; `ssh <target>` must work unattended)")
-    root = ask("root (absolute base dir for piers, e.g. /home/urb)",
-               validate=lambda s: None if os.path.isabs(s) else "must be an absolute path")
-    return HostDraft(name, ssh, root)
-
-
-def wizard_ship(name: str, existing: Ship | None, existing_hosts: list[str]) -> ShipDraft:
-    # prompt for one ship's fields (the NAME is already chosen — it's the selector).
-    # `existing` is the current record when EDITING (its values become the [defaults]),
-    # or None when adding. Returns the drafted Ship + any new host drafted inline.
-    new_host: HostDraft | None = None
-    cur_host = (existing.host if existing else None) or "local"
-    host_choice = cur_host
-    opts = ["local", *existing_hosts, "define a new remote host…"]
-    if len(opts) > 1:
-        host_choice = ask_choice("where does it run?", opts, default=cur_host if cur_host in opts else "local")
-        if host_choice == opts[-1]:
-            new_host = _wizard_host()
-            host_choice = new_host.name
-
-    # start from the existing record, so the fields the wizard never asks about (ames,
-    # local) survive an edit. Dropping `local` would be the dangerous one: the next
-    # `run` boots a copied pier onto REAL ames and double-boots the ship it was copied
-    # from, which is the entire failure the flag exists to make unforgettable.
-    values: dict[str, Any] = {f.attr: field_get(existing, f) for f in FIELDS} if existing else {}
-    for key in WIZARD_KEYS:
-        f = next(f for f in FIELDS if f.key == key)
-        cur = values.get(f.attr)
-        default = None if cur is None else str(cur)
-        if default is None and key == "port":
-            default = "80"
-        if default is None and key == "http" and values.get("port") and host_choice == "local":
-            default = f"http://localhost:{values['port']}"
-        if default is None and key == "path":
-            default = f".piers/{name}"
-        raw = ask(f.prompt, default=default, optional=True,
-                  validate=lambda s, f=f: field_from_text(f, s)[1])
-        values[f.attr] = field_from_text(f, raw or "")[0]
-    return ShipDraft(make_ship(name, host_choice, values), new_host)
-
-
-# ── non-interactive driver: same TOML emit, fields from --flags (for LLMs/scripts) ─
-# add/edit/delete run their wizard when given no flags in a tty; pass any --flag (or run
-# without a tty) and they go non-interactive instead — the flags carry exactly the values
-# the wizard would have prompted for, validated through the same rules. The scriptable
-# path: `admiral sampel-palnet add --host drain --port 8080`. (init keeps its own bare-key
-# flag set since it is a top-level verb that also takes --name/--desk/--src.)
+# ── config edits, driven by --flags ──────────────────────────────────────────
+# init/add/edit/delete take their values as flags, validated through FIELDS, and edit
+# the TOML text in place: `admiral sampel-palnet add --host drain --port 8080`. (init
+# keeps its own bare-key flag set since it is a top-level verb that also takes
+# --name/--desk/--src.)
 
 # the per-ship field flags, shared by the `add` and `edit` Cmd entries. All are strings
 # (typed when applied, through field_from_text) so add/edit can carry every field.
@@ -3138,52 +2833,33 @@ def ship_draft_upsert(verb: str, name: str, get: Callable[[str], Any],
     return ShipDraft(make_ship(name, host, values), new_host)
 
 
-def upsert_ship_block(text: str, name: str, block: str) -> str:
-    # replace the [ships.<name>] table IN PLACE with `block` (preserving its position +
-    # the rest of the file's comments/formatting), or append it when the ship is new.
+def splice_ship_block(text: str, name: str, block: str | None) -> str:
+    # replace the [ships.<name>] table IN PLACE with `block` — header line through the
+    # line before the next top-level [table]/[[array]] (or EOF) — or drop it when `block`
+    # is None; a ship not yet in the file is appended. Editing the text (not re-rendering)
+    # preserves comments + every other ship's hand formatting.
     hdr = re.compile(r"^\s*\[ships\." + re.escape(name) + r"\]\s*(#.*)?$")
     table = re.compile(r"^\s*\[")
     lines = text.split("\n")
     out: list[str] = []
-    i, done = 0, False
+    i, found = 0, False
     while i < len(lines):
-        if not done and hdr.match(lines[i]):
-            out.extend(block.split("\n"))
-            out.append("")  # keep a blank line before whatever followed the old block
+        if not found and hdr.match(lines[i]):
+            found = True
+            if block is not None:
+                out.extend(block.split("\n"))
+                out.append("")  # keep a blank line before whatever followed the old block
             i += 1
             while i < len(lines) and not table.match(lines[i]):
                 i += 1
-            done = True
         else:
             out.append(lines[i])
             i += 1
-    if not done:
+    if not found:
+        if block is None:
+            raise RuntimeError(f"no [ships.{name}] block found in {CONFIG}")
         return text.rstrip("\n") + "\n\n" + block + "\n"
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).rstrip("\n") + "\n"
-
-
-def remove_ship_block(text: str, name: str) -> str:
-    # textually drop the [ships.<name>] table from the config — header line through the
-    # line before the next top-level [table]/[[array]] (or EOF). Editing the text (not
-    # re-rendering) preserves comments + every other ship's hand formatting. The pier on
-    # disk is never touched; this only edits config.
-    hdr = re.compile(r"^\s*\[ships\." + re.escape(name) + r"\]\s*(#.*)?$")
-    table = re.compile(r"^\s*\[")
-    lines = text.split("\n")
-    out: list[str] = []
-    i, removed = 0, False
-    while i < len(lines):
-        if hdr.match(lines[i]):
-            removed = True
-            i += 1
-            while i < len(lines) and not table.match(lines[i]):
-                i += 1
-        else:
-            out.append(lines[i])
-            i += 1
-    if not removed:
-        raise RuntimeError(f"no [ships.{name}] block found in {CONFIG}")
-    # collapse the blank-line run the removal can leave behind
+    # collapse the blank-line run a removal can leave behind
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).rstrip("\n") + "\n"
 
 
@@ -3193,7 +2869,7 @@ def _config_target() -> Path:
 
 
 def _validate_written(p: Path) -> None:
-    # re-parse what we just wrote through the real loader so a malformed wizard result
+    # re-parse what we just wrote through the real loader so a malformed result
     # surfaces immediately, not on the next command.
     try:
         load_config()
@@ -3202,9 +2878,8 @@ def _validate_written(p: Path) -> None:
 
 
 def cmd_init(a: Parsed) -> None:
-    # Wizard (or --flags): create admiral.toml in the current directory (one host? + one
-    # ship + one desk), the minimum a working config needs. With no flags in a terminal it
-    # prompts; pass --name ... (or run without a tty) to drive it non-interactively.
+    # create admiral.toml in the current directory (one host? + one ship + one desk),
+    # the minimum a working config needs.
     target = _config_target()
     if target.exists():
         raise RuntimeError(f"{target} already exists — use `{INVOKE} <ship> add` to add a ship to it")
@@ -3214,33 +2889,18 @@ def cmd_init(a: Parsed) -> None:
         raise RuntimeError(f"{REPO / CONFIG} already governs this directory — use "
                            f"`{INVOKE} <ship> add` to add a ship to it, or init outside that tree")
     kv = {k.lstrip("-"): v for k, v in a.flags.items()}
-
-    if kv or not sys.stdin.isatty():
-        if not kv:
-            raise RuntimeError(f"init needs --flags when not run in a terminal "
-                               f"(e.g. {INVOKE} init --name sampel-palnet --http http://localhost:80 --port 80)")
-        name = (kv.get("name") or "").lstrip("~")
-        if not name:
-            raise RuntimeError("init: --name is required (the first ship's name, without ~, e.g. sampel-palnet)")
-        ship = ship_draft_upsert("init", name, lambda k: kv.get(k, _UNSET), None, [])
-        # --desk defaults to "base"; pass --desk "" for a deskless config (no commits).
-        desk_name = kv.get("desk", "base")
-        if desk_name and not DESK_NAME_RE.match(desk_name):
-            raise RuntimeError(f"init: --desk {desk_name!r} must match {DESK_NAME_RE.pattern}")
-        desk_src = kv.get("src", ".")
-    else:
-        sys.stderr.write(f"\nCreating {target}\n  (Ctrl-C to abort; press Enter to accept a [default])\n\n")
-        try:
-            name = ask("ship name (without ~, e.g. sampel-palnet)",
-                       validate=lambda s: None if SHIP_NAME_RE.match(s) else "letters/digits/_/- , not starting with a digit")
-            ship = wizard_ship(name, None, [])
-            sys.stderr.write("\n  a desk publishes a directory of this repo into the ship (blank = no desk, no commits):\n")
-            desk_name = ask("desk name", default="",
-                            validate=lambda s: None if (not s or DESK_NAME_RE.match(s)) else "lowercase letters/digits/- , not starting with a digit")
-            desk_src = ask("desk source (repo subpath to sync; '.' = repo root)", default=".") if desk_name else "."
-        except WizardAbort:
-            sys.stderr.write("\naborted — nothing written\n")
-            sys.exit(1)
+    name = (kv.get("name") or "").lstrip("~")
+    if not name:
+        raise RuntimeError("init: --name is required (the first ship's name, without ~; e.g. "
+                           f"{INVOKE} init --name sampel-palnet --http http://localhost:80 --port 80)")
+    if not SHIP_NAME_RE.match(name):
+        raise RuntimeError(f"init: ship name {name!r} must match {SHIP_NAME_RE.pattern}")
+    ship = ship_draft_upsert("init", name, lambda k: kv.get(k, _UNSET), None, [])
+    # --desk defaults to "base"; pass --desk "" for a deskless config (no commits).
+    desk_name = kv.get("desk", "base")
+    if desk_name and not DESK_NAME_RE.match(desk_name):
+        raise RuntimeError(f"init: --desk {desk_name!r} must match {DESK_NAME_RE.pattern}")
+    desk_src = kv.get("src", ".")
 
     blocks = [f"# {NAME} config — see `{INVOKE} help` and this script's header for the full schema."]
     if ship.new_host:
@@ -3259,9 +2919,8 @@ def cmd_init(a: Parsed) -> None:
 
 def cmd_add(a: Parsed) -> None:
     # Upsert one ship (the selector is its name): add it when new, or edit its fields when
-    # it already exists — `add` and `edit` are the same command. No flags in a terminal =>
-    # the wizard prompts (existing values prefill as [defaults]); pass --flags (or run
-    # without a tty) => non-interactive, changing only the fields you name.
+    # it already exists — `add` and `edit` are the same command. Only the fields named by
+    # a flag change.
     cfg = a.cfg
     name = resolve_upsert_name(a.selector, cfg, must_exist=False)
     existing = ship_by_name(name, cfg)
@@ -3271,39 +2930,23 @@ def cmd_add(a: Parsed) -> None:
     target = REPO / CONFIG
     existing_hosts = list(cfg.hosts)
 
-    if a.flags or not sys.stdin.isatty():
-        ship = ship_draft_upsert(verb, name, lambda k: a.flags.get(f"--{k}", _UNSET), existing, existing_hosts)
-    else:
-        action = "Editing" if existing else "Adding"
-        sys.stderr.write(f"\n{action} ship {name} in {target}\n  (Ctrl-C to abort; Enter keeps a [default])\n\n")
-        try:
-            ship = wizard_ship(name, existing, existing_hosts)
-        except WizardAbort:
-            sys.stderr.write("\naborted — nothing written\n")
-            sys.exit(1)
+    if not a.flags:
+        raise RuntimeError(f"{verb}: nothing to {'change' if existing else 'set'} — pass the fields as "
+                           f"flags (`{INVOKE} help {verb}` lists them)")
+    ship = ship_draft_upsert(verb, name, lambda k: a.flags.get(f"--{k}", _UNSET), existing, existing_hosts)
 
     text = target.read_text()
-    if existing:
-        text = upsert_ship_block(text, name, ship.block)
-        if ship.new_host:
-            h = ship.new_host
-            text = text.rstrip("\n") + "\n\n" + render_host_block(h.name, h.ssh, h.root) + "\n"
-        target.write_text(text)
-    else:
-        add = []
-        if ship.new_host:
-            h = ship.new_host
-            add.append(render_host_block(h.name, h.ssh, h.root))
-        add.append(ship.block)
-        target.write_text(text.rstrip("\n") + "\n\n" + "\n\n".join(add) + "\n")
+    if ship.new_host:
+        h = ship.new_host
+        text = text.rstrip("\n") + "\n\n" + render_host_block(h.name, h.ssh, h.root) + "\n"
+    target.write_text(splice_ship_block(text, name, ship.block))
     _validate_written(target)
     sys.stderr.write(f"\n{NAME}: {'updated' if existing else 'added'} ship {name} in {target}\n")
 
 
 def cmd_delete(a: Parsed) -> None:
     # The opposite of `add`: remove a ship (the selector) from the config. Leaves the pier
-    # on disk untouched — this only edits admiral.toml. In a terminal it confirms first;
-    # pass --yes (or run without a tty) to skip the prompt.
+    # on disk untouched — this only edits admiral.toml. --yes is the confirmation.
     cfg = a.cfg
     if len(cfg.ships) == 1:
         raise RuntimeError(f"delete: \"{cfg.ships[0].name}\" is the only ship; {CONFIG} must list at least one "
@@ -3312,16 +2955,11 @@ def cmd_delete(a: Parsed) -> None:
     guard_not_running(resolve_ship(name, cfg), cfg, "delete")  # config is frozen while the ship runs
     target = REPO / CONFIG
 
-    if not a.flags.get("--yes") and sys.stdin.isatty():
-        try:
-            if not ask_yn(f"delete ship {name} from {CONFIG}? (pier on disk left in place)", default=False):
-                sys.stderr.write("\naborted — nothing written\n")
-                sys.exit(1)
-        except WizardAbort:
-            sys.stderr.write("\naborted — nothing written\n")
-            sys.exit(1)
+    if not a.flags.get("--yes"):
+        raise RuntimeError(f"delete: pass --yes to remove ship {name} from {CONFIG} "
+                           "(the pier on disk is left in place)")
 
-    target.write_text(remove_ship_block(target.read_text(), name))
+    target.write_text(splice_ship_block(target.read_text(), name, None))
     _validate_written(target)
     sys.stderr.write(f"\n{NAME}: removed ship {name} from {target} (pier on disk left in place)\n")
 
@@ -3334,7 +2972,7 @@ COMMANDS: list[Cmd] = [
         positionals=[],
         details=("Probe the ship and print one card: every live signal, then the static config.\n\n"
                  "  STATE    up / partial / down / misconfigured\n"
-                 "  version  the admiral engine its daemon runs: current, stale, or legacy\n"
+                 "  version  the admiral engine its daemon runs: current or stale\n"
                  "  daemon   the daemon holding the ship's terminal answers on its socket\n"
                  "  dojo     a dojo prompt is on screen\n"
                  "  http     the ship's web address answers GET /~/login\n"
@@ -3352,8 +2990,10 @@ COMMANDS: list[Cmd] = [
         name="info", summary="everything admiral knows about the ship",
         flags=[], positionals=[],
         details=("The config block (host, pier dir, port, loom, socket, http, code), then a full "
-                 "--probe status: the verdict and every raw signal behind it. daemon shows the "
-                 "urbit process id."),
+                 "--probe status: the verdict and every raw signal behind it, plus the three "
+                 "versions behind the ship — admiral's engine (against this file's "
+                 f"v{VERSION}), vere, and the kelvin its base desk is built for. daemon shows "
+                 "the urbit process id."),
         examples=[f"{INVOKE} sampel-palnet info"],
         run=cmd_info,
     ),
@@ -3461,26 +3101,12 @@ COMMANDS: list[Cmd] = [
         run=cmd_exit,
     ),
     Cmd(
-        name="version", summary="the ship's admiral engine, vere, and kelvin",
-        flags=[], positionals=[],
-        details=("Three versions:\n\n"
-                 "  ENGINE  the admiral engine the ship's daemon runs\n"
-                 f"  LATEST  this file's engine (v{VERSION})\n"
-                 "  STATUS  current, stale (older, or a pre-versioning 'legacy' daemon), or down\n"
-                 "  VERE    the urbit runtime in the pier\n"
-                 "  KELVIN  the kelvin the ship's base desk is built for (read from the dojo)\n\n"
-                 "engine-upgrade brings a stale ENGINE current; vere-upgrade moves VERE."),
-        examples=[f"{INVOKE} sampel-palnet version"],
-        run=cmd_version,
-    ),
-    Cmd(
         name="engine-upgrade", summary="swap in this file's admiral engine, no restart",
         flags=[], positionals=[],
         details=("Copy this file to the ship's host and have the running daemon swap to it in "
                  "place: it re-execs the new code while urbit and its terminal stay alive (same "
-                 "process, no restart, no downtime). A pre-versioning 'legacy' daemon cannot swap, "
-                 "so it restarts once; every upgrade after is in place. A current ship is left "
-                 "alone; a stopped ship just gets the new file.\n\n"
+                 "process, no restart, no downtime). A current ship is left alone; a stopped "
+                 "ship just gets the new file.\n\n"
                  "This upgrades admiral, not urbit. For urbit's runtime, see vere-upgrade."),
         examples=[f"{INVOKE} sampel-palnet engine-upgrade"],
         run=cmd_engine_upgrade,
@@ -3528,8 +3154,7 @@ COMMANDS: list[Cmd] = [
                  "landed late, a crash, why a ship failed to boot.\n\n"
                  "It is not capture. capture renders the daemon's in-memory scrollback, which dies "
                  "with the daemon and evicts as it fills. slog is derived from an on-disk copy of "
-                 "the terminal stream, so it outlives the process. A daemon too old to keep that "
-                 "copy says so, and engine-upgrade fixes it.\n\n"
+                 "the terminal stream, so it outlives the process.\n\n"
                  "The log is a cache of <sock>.pty on the ship's host. --rebuild re-derives it "
                  "from scratch, with the most accurate timestamps. --raw prints the stream "
                  "unrendered for eyeballing escape sequences (invalid bytes become U+FFFD).\n\n"
@@ -3577,31 +3202,12 @@ COMMANDS: list[Cmd] = [
         run=cmd_attach,
     ),
     Cmd(
-        name="test", summary="run Playwright tests against the ship",
-        flags=[Flag("--headed", "bool", "show the browser window (default: headless)")],
-        positionals=[Pos("file.py", True, f"one or more test files (bare names resolve under {SCRIPTS}/)", variadic=True)],
-        details=("Run each test file with --ship <ship> (and --headed when given). Exits nonzero "
-                 "if any test fails.\n\n"
-                 "A test is a python script using admiral's harness:\n\n"
-                 "  from admiral import with_ship\n"
-                 "  with with_ship() as s:       # logged in with the ship's +code\n"
-                 "      s.goto(\"/\")\n"
-                 "      s.shot(\"home\")\n\n"
-                 "with_anon() is the same without logging in. s.page is the Playwright page, and "
-                 "s.dojo.run(cmd) drives the ship's dojo."),
-        examples=[f"{INVOKE} sampel-palnet test login.py", f"{INVOKE} sampel-palnet test --headed login.py nav.py"],
-        complete=lambda cfg: completion_test_files(),
-        notes=lambda cfg: (f"Test files in {SCRIPTS}/:\n" + "\n".join("  " + f for f in completion_test_files())
-                           if completion_test_files() else ""),
-        run=cmd_test,
-    ),
-    Cmd(
         name="add", summary="add the ship to the config, or change its fields",
         flags=SHIP_FIELD_FLAGS, positionals=[],
         details=("Create the ship's [ships.<name>] entry, or edit an existing one (add and edit "
-                 "are the same command). With no flags in a terminal, a wizard asks for each "
-                 "field; with flags, only those fields change. A new remote --host needs --ssh "
-                 "and --root to define it. The pier on disk is never touched.\n\n"
+                 "are the same command). Only the fields you pass change; a new ship needs at "
+                 "least one. A new remote --host needs --ssh and --root to define it. The pier "
+                 "on disk is never touched.\n\n"
                  "--master-ticket and --mnemonic are stored in admiral.toml as plain text."),
         examples=[f"{INVOKE} sampel-palnet add --path piers/sampel-palnet --port 8080 --http http://localhost:8080",
                   f"{INVOKE} marnec-dozzod add --host drain --ssh urb@box --root /home/urb --port 8080"],
@@ -3611,7 +3217,7 @@ COMMANDS: list[Cmd] = [
     Cmd(
         name="edit", summary="the same as add",
         flags=SHIP_FIELD_FLAGS, positionals=[],
-        details="The same command as add: with flags, change only those fields; with none, the wizard.",
+        details="The same command as add: only the fields you pass change.",
         examples=[f"{INVOKE} sampel-palnet edit --port 8080",
                   f"{INVOKE} sampel-palnet edit --code ralnyt-botwyc-batnyt-dozzod"],
         complete=lambda cfg: (["local", *cfg.hosts] if cfg else []),
@@ -3619,11 +3225,11 @@ COMMANDS: list[Cmd] = [
     ),
     Cmd(
         name="delete", summary="remove the ship from the config; its pier stays",
-        flags=[Flag("--yes", "bool", "skip the confirm prompt (implied without a terminal)")],
+        flags=[Flag("--yes", "bool", "confirm the removal (required)")],
         positionals=[],
         details=("Remove the ship's [ships.<name>] entry from admiral.toml. The pier on disk is "
-                 "not touched. Asks first in a terminal. The last ship in a config can't be removed."),
-        examples=[f"{INVOKE} sampel-palnet delete", f"{INVOKE} marnec-dozzod delete --yes"],
+                 "not touched. The last ship in a config can't be removed."),
+        examples=[f"{INVOKE} sampel-palnet delete --yes"],
         run=cmd_delete,
     ),
 ]
@@ -3640,14 +3246,12 @@ COMMANDS += [
                Flag("--src", "str", "the desk's source dir, relative to here (default .)", ph="<dir>"),
                *SHIP_FIELD_FLAGS],
         positionals=[],
-        details=("Write a new admiral.toml here with one ship and, optionally, one desk. In a "
-                 "terminal with no flags it is a wizard; with flags (or no terminal) it takes "
-                 f"--name plus any field add takes, and --desk / --src for the desk. Refuses when "
+        details=("Write a new admiral.toml here with one ship and, optionally, one desk. It takes "
+                 "--name plus any field add takes, and --desk / --src for the desk. Refuses when "
                  f"admiral.toml already exists: use `{INVOKE} <ship> add` for more ships.\n\n"
                  "admiral finds its config by walking up from the current directory to the nearest "
                  "admiral.toml (or .admiral.toml), like git finds .git."),
-        examples=[f"{INVOKE} init",
-                  f"{INVOKE} init --name zod --path piers/zod --port 8080 --http http://localhost:8080"],
+        examples=[f"{INVOKE} init --name zod --path piers/zod --port 8080 --http http://localhost:8080"],
         run=cmd_init,
     ),
     Cmd(
@@ -3750,7 +3354,7 @@ Usage
 Getting started
 
   1. create a pier with the urbit binary       {gray(f"{inv} help boot")}
-  2. {gray(f"{inv} init")}                         write {CONFIG} for it
+  2. {gray(f"{inv} init --name <ship> ...")}      write {CONFIG} for it
   3. {gray(f"{inv} <ship> run")}                   turn it on
   4. {gray(f"{inv} <ship> code")}                  its web login password
   5. open the ship's http address and log in with that code
@@ -3782,10 +3386,6 @@ def cmd_help(name: str | None = None) -> None:
     if not c:
         sys.stderr.write(f'no command "{name}"; {INVOKE} help lists them\n')
         sys.exit(1)
-    try:
-        cfg: Config | None = load_config()
-    except Exception:
-        cfg = None
     out: list[str] = [""]
     head = f"{CLI} {c.name}"
     for i, l in enumerate(wrap(f"{head} — {c.summary}", W)):
@@ -3795,7 +3395,7 @@ def cmd_help(name: str | None = None) -> None:
         out.append("Flags")
         w = max(len(flag_brief(f)) for f in c.flags)
         for f in c.flags:
-            out += label_wrap("  " + flag_brief(f), w + 2, f.desc + (f" (alias {f.alias})" if f.alias else ""), W)
+            out += label_wrap("  " + flag_brief(f), w + 2, f.desc, W)
         out.append("")
     if c.positionals:
         out.append("Arguments")
@@ -3805,462 +3405,12 @@ def cmd_help(name: str | None = None) -> None:
         out.append("")
     if c.details:
         out += wrap(c.details, W) + [""]
-    notes = c.notes(cfg) if c.notes else None
-    if notes:
-        out += notes.split("\n") + [""]
     if c.examples:
         out.append("Examples")
         for e in c.examples:
             out.append("  " + gray(e))
         out.append("")
     sys.stderr.write("\n".join(out) + "\n")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PLAYWRIGHT HARNESS (library mode)
-#
-# Wrap a test in with_ship (authed) or with_anon (no login); both launch a browser,
-# build the helper `s`, and always tear the browser down. The `s` object exposes raw
-# Playwright handles (s.page/ctx/browser), s.goto/shot/post/assert_no_page_errors,
-# and s.dojo to drive and read the ship's console (run/tail/mark/since/runlog/grep/
-# assert_clean) — assert frontend with locators, backend with s.dojo.since(mark)
-# against a mark taken before the action. A mark is the daemon ring's byte watermark
-# (see ring_mark): free to take, nothing typed into the dojo, and the window it opens
-# is exactly the bytes the console printed after it.
-#
-#   screen reader   s.by_role / click_role / fill_role / expect_name / a11y_tree,
-#                   s.assert_a11y (axe-core, needs network)
-#   console         s.console_tag(surface) / console_records / console_report /
-#                   assert_console_clean; an app sets s.console_blame to sort
-#                   lines by kind and s.console_fatal to pick which kinds fail
-#   crash check     with_ship(crash_check=True) fails a test that passed in the
-#                   browser while the ship crashed; s.absolve() forgives a crash
-#                   the test provoked on purpose
-#
-#   from <thismodule> import with_ship
-#   with with_ship() as s:
-#       mark = s.dojo.mark()
-#       s.goto("/foo"); s.shot("foo")
-#       s.dojo.assert_clean(mark, [r"crud", r"%bail"])
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def argv_flag(name: str) -> str | None:
-    # read `--flag value` from this process's argv (test options arrive as argv)
-    try:
-        i = sys.argv.index(name)
-    except ValueError:
-        return None
-    return sys.argv[i + 1] if i + 1 < len(sys.argv) else None
-
-
-def harness_capture(ship: Ship, cfg: Config, lines: int = 200) -> str:
-    host = host_for(ship, cfg)
-    return tail_n(capture_pane(host, ship, LINE_BYTES * lines).rstrip("\n"), lines)
-
-
-class Dojo:
-    # the ship's console, for a test: run commands, and read what the console printed
-    # between two marks. Marks are ring watermarks, so a window is a byte range of the
-    # raw pty stream rendered through the same terminal emulator `slog` uses — a
-    # concurrent writer's output lands in the window only if it printed inside it.
-    def __init__(self, ship: Ship, cfg: Config):
-        self.ship = ship
-        self.cfg = cfg
-        self.host = host_for(ship, cfg)
-        self.run_mark: int | None = None
-
-    def run(self, cmd: str, timeout_secs: int | None = None) -> str:
-        # type cmd into the dojo and return its transcript (the result, then every line
-        # the ship printed while it ran). `-name` threads need no `--`: nothing parses
-        # this as a flag.
-        return dojo_one(self.ship, cmd, self.cfg, timeout=timeout_secs or T_DOJO, log=lambda m: None)
-
-    def tail(self, n: int = 40) -> str:
-        return "\n".join(harness_capture(self.ship, self.cfg, n).rstrip("\n").split("\n")[-n:])
-
-    def mark(self) -> int:
-        # the console's current byte watermark. Costs one socket ping; the first one a
-        # test takes doubles as the run-start mark runlog()/grep() read from.
-        total = ring_mark(self.host, self.ship)
-        if total < 0:
-            raise RuntimeError(f'ship "{self.ship.name}" runs a daemon too old for watermarked '
-                               f"capture — `{INVOKE} {self.ship.name} engine-upgrade`")
-        if self.run_mark is None:
-            self.run_mark = total
-        return total
-
-    def _raw(self, mark: int) -> str:
-        # raw pty bytes past `mark`. The ring holds the last RING_MAX bytes, so a mark
-        # older than that is gone for good: a hard error, never a silently shorter window.
-        total, raw = capture_at(self.host, self.ship, mark)
-        if total - mark > RING_MAX:
-            raise RuntimeError(f"dojo mark {mark} is {total - mark} bytes back; the daemon's "
-                               f"{RING_MAX // (1024 * 1024)}MB ring no longer holds it — read "
-                               f"`{INVOKE} {self.ship.name} slog` instead, or mark closer to the action")
-        return raw
-
-    def since(self, mark: int) -> str:
-        # everything the console printed after `mark`, rendered
-        return render_transcript(self._raw(mark))
-
-    def between(self, start: int, end: int) -> str:
-        # what the console printed between two marks: the start window minus its tail
-        # past `end`. Output a concurrent writer adds after `end` is excluded, so the
-        # bracket a test draws around its own action stays its own.
-        if end < start:
-            raise RuntimeError(f"dojo between: end mark {end} precedes start mark {start}")
-        head, tail = self._raw(start), self._raw(end)
-        return render_transcript(head[:len(head) - len(tail)] if tail else head)
-
-    def runlog(self) -> str:
-        # the console since the first mark this test took (taken now if it never did)
-        if self.run_mark is None:
-            self.mark()
-        return self.since(self.run_mark)  # type: ignore[arg-type]
-
-    @staticmethod
-    def _hits(hay: str, patterns: list[Pattern]) -> list[str]:
-        pats = [re.compile(p) if isinstance(p, str) else p for p in patterns]
-        return [l for l in hay.split("\n") if any(p.search(l) for p in pats)]
-
-    def grep(self, mark: int | None, patterns: list[Pattern]) -> list[str]:
-        return self._hits(self.since(mark) if mark is not None else self.runlog(), patterns)
-
-    def grep_between(self, start: int, end: int, patterns: list[Pattern]) -> list[str]:
-        return self._hits(self.between(start, end), patterns)
-
-    def assert_clean(self, mark: int | None, patterns: list[Pattern]) -> None:
-        hits = self.grep(mark, patterns)
-        if hits:
-            raise RuntimeError("dojo not clean:\n" + "\n".join(hits))
-
-    def assert_clean_between(self, start: int, end: int, patterns: list[Pattern]) -> None:
-        hits = self.grep_between(start, end, patterns)
-        if hits:
-            raise RuntimeError("dojo not clean:\n" + "\n".join(hits))
-
-
-# pinned axe-core for assert_a11y. add_script_tag pulls it from the CDN, so the audit
-# needs network; the role and tree helpers are offline.
-AXE_CDN = "https://cdnjs.cloudflare.com/ajax/libs/axe-core/4.10.2/axe.min.js"
-
-# dojo lines that mean the ship crashed, whatever the browser showed
-CRASH_PATTERNS: list[Pattern] = [
-    r"thread failed",
-    r"\bbail\b",
-    r"bail:",
-    r"ford:",
-    r"syntax error",
-    r"nest-fail",
-    r"mint-vain",
-    r"mint-nice",
-    r"-find\.",
-    r"fish-loop",
-]
-
-# console lines from landscape's login and channel teardown, not the app's
-CONSOLE_BENIGN = (
-    "geteventid",
-    "pikes",
-    "/~/channel",
-    "channel-abort",
-    "failed to load resource",
-)
-
-
-class Harness:
-    def __init__(self, pw, browser, ctx, page, base, cfg, ship, code, auth):
-        self.pw = pw
-        self.browser = browser
-        self.ctx = ctx
-        self.page = page
-        self.base = base
-        self.cfg = cfg
-        self.ship = ship
-        self.code = code
-        self.auth = auth
-        self.page_errors: list[str] = []
-        self.dojo = Dojo(ship, cfg)
-        self._shot_n = 0
-        self._shots_dir = os.path.join(str(REPO), SCRIPTS, "shots")
-        self.console: list[dict] = []
-        self.console_surface = "(untagged)"
-        self.console_benign = CONSOLE_BENIGN
-        self.console_blame: dict[str, tuple[str, ...]] = {}
-        self.console_fatal: set[str] | None = None  # None: every kind fails
-        self._crash_mark: int | None = None
-        self._crash_patterns: list[Pattern] = []
-        page.on("pageerror", self._on_pageerror)
-        page.on("console", self._on_console)
-
-    # SSE pages (datastar @get) hold a connection open, so 'networkidle' never
-    # fires — default to domcontentloaded.
-    def goto(self, path: str, **o):
-        url = self.base + (path if path.startswith("/") else "/" + path)
-        return self.page.goto(url, **{"wait_until": "domcontentloaded", **o})
-
-    def shot(self, name: str | None = None) -> str:
-        os.makedirs(self._shots_dir, exist_ok=True)
-        fname = os.path.join(self._shots_dir, f"{name or f'shot-{self._shot_n}'}.png")
-        if not name:
-            self._shot_n += 1
-        self.page.screenshot(path=fname)
-        return fname
-
-    def post(self, path: str, form: dict):
-        url = self.base + (path if path.startswith("/") else "/" + path)
-        return self.ctx.request.post(url, form=form)
-
-    def assert_no_page_errors(self) -> None:
-        if self.page_errors:
-            raise RuntimeError("page errors:\n" + "\n".join(self.page_errors))
-
-    # ── screen reader ───────────────────────────────────────────────────────────
-    # Find controls by ARIA role + accessible name: what a control IS, not a CSS chain.
-    # A name matches as a case-insensitive substring unless exact=True. A miss raises
-    # with the a11y tree, so a broken name explains itself without a screenshot.
-
-    def by_role(self, role: str, name: str | None = None, exact: bool = False, **kw):
-        if name is None:
-            return self.page.get_by_role(role, **kw)
-        return self.page.get_by_role(role, name=name, exact=exact, **kw)
-
-    def click_role(self, role: str, name: str, exact: bool = False, **kw):
-        found = self.expect_name(role, name, exact=exact, **kw)
-        n = found.count()
-        if n > 1:
-            raise AssertionError(f"click_role: {n} controls match {role} named {name!r} — "
-                                 "narrow the name or pass exact=True")
-        found.click()
-        return found
-
-    def fill_role(self, name: str, value: str, exact: bool = False):
-        found = self.expect_name("textbox", name, exact=exact).first
-        found.fill(value)
-        return found
-
-    def expect_name(self, role: str, name: str, exact: bool = False, **kw):
-        found = self.by_role(role, name, exact=exact, **kw)
-        if found.count() == 0:
-            raise AssertionError(f"no {role} named {name!r}\n--- a11y tree ---\n{self.a11y_tree()}")
-        return found
-
-    def a11y_tree(self, root: str = "body") -> str:
-        # the tree a screen reader walks, one indented line per node. The cheap stand-in
-        # for a screenshot when the question is structural: present, named, checked.
-        found = self.page.locator(root).first
-        if found.count() == 0:
-            return f"(no element matches {root!r})"
-        return found.aria_snapshot() or "(empty a11y tree)"
-
-    def audit_a11y(self, impacts=("critical", "serious"), root: str = "document") -> list[dict]:
-        try:
-            self.page.add_script_tag(url=AXE_CDN)
-        except Exception as e:
-            raise RuntimeError(f"audit_a11y: could not load axe-core from {AXE_CDN} (offline?): {e}")
-        result = self.page.evaluate(
-            "async (root) => await axe.run("
-            "  root === 'document' ? document : document.querySelector(root),"
-            "  {resultTypes: ['violations']})",
-            root)
-        return [v for v in result.get("violations", []) if v.get("impact") in set(impacts)]
-
-    def assert_a11y(self, impacts=("critical", "serious"), root: str = "document") -> None:
-        violations = self.audit_a11y(impacts=impacts, root=root)
-        if violations:
-            lines = []
-            for v in violations:
-                nodes = "; ".join(n.get("target", [""])[0] for n in v.get("nodes", [])[:5])
-                lines.append(f"  [{v['impact']}] {v['id']}: {v['help']} → {nodes}")
-            raise AssertionError("a11y violations:\n" + "\n".join(lines))
-
-    # ── console ─────────────────────────────────────────────────────────────────
-    # Every console error and warning plus every uncaught throw, tagged with the
-    # surface that was on screen. Sorting happens when read, so an app can set
-    # console_blame / console_benign / console_fatal any time before it asks.
-
-    def _on_pageerror(self, e) -> None:
-        message = getattr(e, "message", str(e))
-        self.page_errors.append(message)
-        self.console.append({"severity": "pageerror", "text": message, "where": "",
-                             "surface": self.console_surface})
-
-    def _on_console(self, m) -> None:
-        if m.type not in ("error", "warning"):
-            return
-        text = m.text
-        where = ""
-        try:
-            location = m.location or {}
-            if location.get("url"):
-                where = f"{location['url']}:{location.get('lineNumber', '')}"
-            # a library often logs its detail as a second argument, not in .text
-            for argument in (m.args or [])[1:]:
-                value = argument.json_value()
-                if value not in (None, {}, ""):
-                    text += f" | {value}"
-        except Exception:
-            pass
-        self.console.append({"severity": m.type, "text": text, "where": where,
-                             "surface": self.console_surface})
-
-    def console_tag(self, surface: str) -> None:
-        # every record from here on is blamed on `surface`, until the next tag
-        self.console_surface = surface
-
-    def console_kind(self, text: str) -> str | None:
-        # None for a benign line; else the first console_blame kind whose marker
-        # matches, else "other"
-        low = text.lower()
-        if any(b in low for b in self.console_benign):
-            return None
-        return next((kind for kind, markers in self.console_blame.items()
-                     if any(m in low for m in markers)), "other")
-
-    def console_records(self, kind: str | None = None) -> list[dict]:
-        out = []
-        for r in self.console:
-            k = self.console_kind(r["text"])
-            if k is not None and (kind is None or k == kind):
-                out.append({**r, "kind": k})
-        return out
-
-    def console_summary(self, record: dict) -> str:
-        # one report line per record; an app overrides this to pull out what matters
-        return " ".join(record["text"].split())[:160]
-
-    def console_report(self) -> dict[str, int]:
-        records = self.console_records()
-        counts: dict[str, int] = {}
-        for r in records:
-            counts[r["kind"]] = counts.get(r["kind"], 0) + 1
-        print("\n=== console report ===")
-        print("   ".join(f"{k}: {n}" for k, n in counts.items()) or "clean")
-        for kind in counts:
-            print(f"\n-- {kind} --")
-            print(f"{'surface':<22}{'severity':<11}message")
-            for r in records:
-                if r["kind"] == kind:
-                    print(f"{r['surface']:<22}{r['severity']:<11}{self.console_summary(r)}")
-        print("======================\n")
-        return counts
-
-    def assert_console_clean(self) -> None:
-        counts = self.console_report()
-        fatal = {k: n for k, n in counts.items()
-                 if self.console_fatal is None or k in self.console_fatal}
-        if fatal:
-            raise RuntimeError(f"console errors ({', '.join(f'{k}: {n}' for k, n in fatal.items())}) "
-                               "— see the report above")
-
-    # ── crash check ─────────────────────────────────────────────────────────────
-    # A server-side crash often leaves the browser looking healthy: the SSE stops and
-    # later assertions pass against the last good DOM. The dojo saw it.
-
-    def watch_crashes(self, patterns: list[Pattern]) -> None:
-        self._crash_patterns = patterns
-        self._crash_mark = self.dojo.mark()
-
-    def absolve(self) -> None:
-        # forgive everything printed so far: the test provoked that crash on purpose
-        if self._crash_mark is None:
-            raise RuntimeError("absolve: this run has no crash check (with_ship(crash_check=True))")
-        self._crash_mark = self.dojo.mark()
-
-    def check_crashes(self) -> None:
-        if self._crash_mark is None:
-            return
-        hits = self.dojo.grep(self._crash_mark, self._crash_patterns)
-        if hits:
-            raise RuntimeError("test passed in the browser but the ship crashed during it:\n"
-                               + "\n".join(hits[:20]))
-
-    def close(self) -> None:
-        try:
-            self.browser.close()
-        finally:
-            self.pw.stop()
-
-
-def _login(ctx, base: str, code: str) -> None:
-    # POST +code to plant the urbauth cookie, then inject it into the browser
-    # context. We use plain urllib + ctx.add_cookies (NOT ctx.request.post) so we
-    # control redirect handling and read the Set-Cookie off urbit's login response
-    # directly — no dependency on the client's cookie-jar parsing.
-    data = urllib.parse.urlencode({"password": code}).encode()
-    req = urllib.request.Request(f"{base}/~/login", data=data, method="POST",
-                                 headers={"content-type": "application/x-www-form-urlencoded"})
-
-    class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, *a, **k):
-            return None
-
-    opener = urllib.request.build_opener(_NoRedirect)
-    try:
-        resp = opener.open(req, timeout=T_RUN)
-        headers = resp.headers
-    except urllib.error.HTTPError as e:
-        if e.code >= 400:
-            raise RuntimeError(f"login failed: {e.code} {e.read().decode(errors='replace')}")
-        headers = e.headers  # 3xx lands here (NoRedirect); cookie is still on it
-    cookies = headers.get_all("set-cookie") or ([headers.get("set-cookie")] if headers.get("set-cookie") else [])
-    set_cookie = cookies[0] if cookies else ""
-    m = re.match(r"([^=]+)=([^;]+)", set_cookie or "")
-    if not m:
-        raise RuntimeError(f'login: no urbauth cookie in response (set-cookie: "{set_cookie}")')
-    ctx.add_cookies([{"name": m.group(1), "value": m.group(2), "url": base}])
-
-
-def setup(*, ship: str | None = None, auth: bool = True, base: str | None = None,
-          headless: bool | None = None, log_console: bool = False) -> Harness:
-    cfg = load_config()
-    name = ship or argv_flag("--ship")
-    if not name:
-        raise RuntimeError(f"no ship to test against: pass --ship <name> ({INVOKE} <ship> test does)")
-    ship_obj = resolve_ship(name, cfg)
-    if headless is None:
-        headless = "--headed" not in sys.argv
-    base = (base or ship_base(ship_obj)).rstrip("/")
-    code = fetch_code(ship_obj, cfg) if auth else None
-
-    from playwright.sync_api import sync_playwright  # LAZY — the CLI never hits this
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=headless)
-    ctx = browser.new_context()
-    page = ctx.new_page()
-    h = Harness(pw, browser, ctx, page, base, cfg, ship_obj, code, auth)
-    if log_console:
-        page.on("console", lambda m: print("[console]", m.text))
-    if auth:
-        _login(ctx, base, code)
-    # setup never types into the dojo: the code override skips the +code read, and a
-    # mark is a socket ping, so a browser-only test stays sub-second.
-    return h
-
-
-@contextmanager
-def with_ship(*, crash_check: bool | list[Pattern] = False, **opts):
-    # authed run — logs in with the driven ship's code, always tears down.
-    # crash_check: True watches CRASH_PATTERNS, a list watches those instead.
-    s = setup(auth=True, **opts)
-    try:
-        if crash_check:
-            s.watch_crashes(CRASH_PATTERNS if crash_check is True else crash_check)
-        yield s
-        s.check_crashes()  # only on success: a test that raised keeps its own failure
-    finally:
-        s.close()
-
-
-@contextmanager
-def with_anon(**opts):
-    # unauthed run — no cookie; for public / read-only endpoints
-    s = setup(auth=False, **opts)
-    try:
-        yield s
-    finally:
-        s.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4275,63 +3425,37 @@ def with_anon(**opts):
 # bytes. One framing for both directions.
 # ═══════════════════════════════════════════════════════════════════════════════
 HDR = struct.Struct("!BI")
-C_ATTACH, C_DATA, C_WINCH, C_CAPTURE, C_PING, C_KILL, C_UPGRADE = 1, 2, 3, 4, 5, 6, 7
-C_CAPTURE_AT = 8  # capture only ring bytes past a caller-held watermark (vs whole ring)
+C_ATTACH, C_DATA, C_WINCH, C_PING, C_KILL, C_UPGRADE = 1, 2, 3, 5, 6, 7  # 4 was whole-ring capture
+C_CAPTURE_AT = 8  # capture ring bytes past a caller-held watermark (0 = the whole ring)
 S_DATA, S_EXIT, S_SNAPSHOT, S_PONG = 1, 2, 3, 4
 S_SNAPSHOT_AT = 5  # reply to C_CAPTURE_AT: 8-byte total-bytes-written + the requested tail
 WINSZ = struct.Struct("!HHHH")
 RING_MAX = 64 * 1024 * 1024  # scrollback ring cap; oldest bytes drop past this.
-# Sized to survive a CONCURRENT dojo writer (a second agent dumping output to the
-# same console) AND a chatty app slogging through a full rebuild. A 256KB ring was
-# smaller than one large burst (e.g. a tool-guide dump), so any burst evicted a sentinel
-# the moment it landed. 4MB held many bursts but a `|commit` that rebuilds an app
-# ~&-printing every event still outran it mid-build — the command echo rolled off before
-# the done echo landed, so the start..done slice was unrecoverable. 64MB holds a full
-# noisy rebuild, so a window bracketed by the sentinels survives until the next capture.
-# (RING_MAX is baked into the running daemon — `engine-upgrade` a ship to apply a new value.)
+# Sized to hold a full noisy rebuild (a `|commit` of an app that ~&-prints every event)
+# plus a concurrent dojo writer: 256KB lost a single large burst, 4MB lost the command
+# echo mid-build. A window a driver brackets must survive until its next capture.
+# (Baked into the running daemon — `engine-upgrade` a ship to apply a new value.)
 
-ATTACH_TAIL = 64 * 1024  # ring bytes replayed to the terminal on attach.
-# The ring is sized for MACHINE readers hunting a sentinel across a noisy rebuild. A
-# human attaching wants the screen they left, and a whole ring is neither: replaying all
-# of it made attach cost a terminal parse — and, on a remote host, an ssh transfer —
-# proportional to how long the daemon had been up, so the dojo churned through megabytes
-# of stale redraw before the prompt was usable (measured: 7.7MB on a prod ship). 64KB is
-# ~6 screens. What it skips is not lost: `.pty` is the durable copy and `slog` renders
-# it properly, which is the right way to read history back anyway.
-#
-# Unlike RING_MAX this is NOT baked into the daemon. The cap rides in the C_ATTACH frame
-# AND the client trims whatever comes back, so both halves move with the pushed engine
-# and an un-upgraded daemon still gives a short attach (it just ships the bytes first).
+ATTACH_TAIL = 64 * 1024  # ring bytes replayed to the terminal on attach: ~6 screens.
+# A human attaching wants the screen they left; replaying the whole ring cost a terminal
+# parse (and an ssh transfer) proportional to uptime — 7.7MB on a prod ship. History is
+# `slog`'s job. The cap rides in the C_ATTACH frame, so it moves with the pushed engine.
 
 ATTACH_SLACK = 4 * 1024  # asked for on top of ATTACH_TAIL, and thrown away by the client.
-# The daemon cuts at a byte offset, which lands mid-line (and mid-escape-sequence) far
-# more often than not — the very thing +attach_snapshot exists to clean up. Asking for
-# exactly ATTACH_TAIL would hand the client a snapshot already at the cap, so its trim
-# would decline to touch it and the cut would reach the screen. Asking for a little more
-# guarantees there is something to discard, so the replay always opens on a line.
+# The daemon cuts at a byte offset, mid-line more often than not. Asking for a little
+# more than the cap guarantees +attach_snapshot has something to discard, so the replay
+# always opens on a line boundary.
 
 PTY_MAX = 16 * 1024 * 1024  # `.pty` rotation cap; ONE older generation is kept.
-# Sized against the COOK, not the disk. pyte renders ~65KB/s (measured), so `--rebuild`
-# is ~4min at this cap and would be ~34min at 128MB — an escape hatch that cannot be
-# reached is not one. 16MB x 2 generations is still far more console than the question
-# this exists to answer ("what did it print 30s ago, mid-rebuild") ever needs.
+# Sized against the cook, not the disk: `--rebuild` is ~4min at this cap (see
+# RENDER_COLS) and an escape hatch that cannot be reached is not one.
 IDX = struct.Struct("!Qd")   # `.idx` record: (byte offset into .pty, unix time)
 IDX_GAP = 0.05  # seconds; don't index a read that lands within this of the last record.
-# A record per READ was the obvious design and it is wildly wasteful: the dojo repaints
-# its spinner in tiny escape-sequence writes, so reads average ~14 bytes and a 16-byte
-# record each made `.idx` LARGER than the `.pty` it indexes (measured: 38352B of index
-# for 32776B of pty). Records are a sparse map anyway — a reader bisects and floors to
-# the nearest record at or before its offset — so one per 50ms costs a stamp no worse
-# than 50ms stale and collapses a spinner burst to almost nothing. Correlating a slog to
-# a command window is a ~second-scale question; 50ms is far below the noise.
-# The ring above is memory: it dies with the daemon and evicts past RING_MAX, so a slog
-# from a poke 30s into a noisy rebuild is gone with nothing on disk remembering it.
-# `.pty` is the durable counterpart — every byte the console printed, raw, appended
-# forever. It is the SOURCE OF TRUTH and is never transformed here: rendering it to text
-# needs a terminal emulator (pyte), which the engine cannot import (stdlib-only, see the
-# section header above), so the daemon only ever appends and the control side cooks.
-# `.idx` carries the timestamps `.pty` deliberately does not, keeping the byte stream
-# exactly what vere wrote. (Both are baked into the daemon — `engine-upgrade` a ship to apply.)
+# A record per read made `.idx` larger than the `.pty` it indexes (spinner repaints are
+# ~14-byte reads). Records are a sparse map a reader floors into, so one per 50ms costs
+# a stamp at most 50ms stale — far below the second-scale questions a slog answers.
+# `.pty` is the durable, raw, append-only counterpart of the ring (see the console log
+# section): the daemon only appends, the control side cooks. (Both baked into the daemon.)
 
 
 def die(msg: str) -> None:
@@ -4373,7 +3497,7 @@ def sock_request(path: str, ctype: int, payload: bytes = b"", want: int | None =
     # one round trip to the daemon on `path`: connect, send one frame, and when `want`
     # is set return the payload of the first frame of that type. None when no daemon
     # answers — no socket, connection refused, closed mid-read, or no `want` frame within
-    # `timeout` (a daemon predating that frame type ignores it). A fire-and-forget
+    # `timeout`. A fire-and-forget
     # (`want` None) returns b"" once the frame is sent. Every client below is this.
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -4396,15 +3520,14 @@ def sock_request(path: str, ctype: int, payload: bytes = b"", want: int | None =
         s.close()
 
 
-def engine_ping(path: str) -> tuple[int, int, str | None] | None:
-    # (daemon_pid, child_pid, engine_version) if a daemon answers, else None. The
-    # version field is absent from a pre-versioning daemon's pong -> None there.
+def engine_ping(path: str) -> tuple[int, int, str] | None:
+    # (daemon_pid, child_pid, engine_version) if a daemon answers, else None
     pong = sock_request(path, C_PING, want=S_PONG, timeout=3.0)
     if pong is None:
         return None
     try:
         parts = pong.decode().split()
-        return (int(parts[0]), int(parts[1]), parts[2] if len(parts) > 2 else None)
+        return (int(parts[0]), int(parts[1]), parts[2])
     except (IndexError, ValueError):
         return None
 
@@ -4661,24 +3784,18 @@ def engine_serve(path: str, master: int, pid: int, listen: socket.socket, ring: 
                     if t == C_PING:
                         safe(c, S_PONG, f"{os.getpid()} {pid} {VERSION}".encode())
                     elif t == C_ATTACH:
-                        # payload (optional): 8-byte big-endian cap on how much
-                        # scrollback to replay. A terminal only wants the screen it is
-                        # about to sit in front of, and shipping a multi-MB ring to it
-                        # costs an ssh transfer plus a full terminal parse before the
-                        # prompt is usable. No payload => an older client that wants the
-                        # whole ring, so keep giving it that.
-                        cap = (struct.unpack("!Q", payload[:8])[0]
-                               if len(payload) >= 8 else len(ring))
+                        # payload: 8-byte big-endian cap on how much scrollback to replay.
+                        # A terminal only wants the screen it is about to sit in front of
+                        # (see ATTACH_TAIL).
+                        cap = struct.unpack("!Q", payload[:8])[0]
                         safe(c, S_SNAPSHOT, bytes(ring[len(ring) - min(cap, len(ring)):]))
                         c["attached"] = True
-                    elif t == C_CAPTURE:
-                        safe(c, S_SNAPSHOT, bytes(ring))
                     elif t == C_CAPTURE_AT:
                         # payload: 8-byte big-endian watermark (a prior `total`). Return
                         # the current total + only ring bytes at/after that offset. If the
                         # watermark predates the ring (output outran RING_MAX), clamp to
-                        # the ring start — same recoverable case the full capture hits.
-                        frm = struct.unpack("!Q", payload[:8])[0] if len(payload) >= 8 else 0
+                        # the ring start.
+                        frm = struct.unpack("!Q", payload[:8])[0]
                         base = total - len(ring)
                         start = min(max(0, frm - base), len(ring))
                         safe(c, S_SNAPSHOT_AT, struct.pack("!Q", total) + bytes(ring[start:]))
@@ -4775,10 +3892,8 @@ def engine_daemon(sock: str, cmd: list[str], foreground: bool) -> None:
 
 def attach_snapshot(ring: bytes) -> bytes:
     # trim a C_ATTACH snapshot to the last ATTACH_TAIL bytes, for a terminal to replay.
-    # Runs on BOTH paths, and does real work on both: a daemon that understands the cap
-    # has already cut the transfer down to size but cut it at a raw byte offset, and an
-    # older daemon sends the whole ring. Either way this is where the replay is made
-    # safe to blit. See ATTACH_SLACK for why the capped case still lands here.
+    # The daemon already cut the transfer down to size, but at a raw byte offset; this is
+    # where the replay is made safe to blit. See ATTACH_SLACK for why it always lands here.
     if len(ring) <= ATTACH_TAIL:
         return ring
     tail = ring[-ATTACH_TAIL:]
@@ -4863,16 +3978,8 @@ def engine_send(sock: str) -> None:
         die(f"no daemon at {sock}")
 
 
-def sock_capture(sock: str) -> bytes:
-    # the whole ring, or b"" if no daemon answers (a probe reads that as "down"). No
-    # timeout: a full ring is tens of MB and the daemon sends it in one frame.
-    return sock_request(sock, C_CAPTURE, want=S_SNAPSHOT, timeout=None) or b""
-
-
 def sock_capture_at(sock: str, offset: int) -> tuple[int, bytes] | None:
-    # (current total, ring bytes past `offset`), or None when the daemon does not
-    # answer S_SNAPSHOT_AT — no daemon at all, or one predating C_CAPTURE_AT. Both
-    # leave the caller to fall back to a whole-ring capture.
+    # (current total, ring bytes past `offset`), or None when no daemon answers.
     got = sock_request(sock, C_CAPTURE_AT, struct.pack("!Q", offset & 0xFFFFFFFFFFFFFFFF),
                        want=S_SNAPSHOT_AT)
     if got is None:
@@ -4887,26 +3994,12 @@ def sock_send(sock: str, data: bytes) -> bool:
     return sock_request(sock, C_DATA, data) is not None
 
 
-def engine_capture(sock: str) -> None:
-    out = sock_capture(sock)
-    if out:
-        sys.stdout.buffer.write(out)
-        sys.stdout.buffer.flush()
-
-
 def engine_capture_at(sock: str, offset: int) -> None:
-    # like engine_capture, but ask only for ring bytes past `offset` (a prior `total`
-    # watermark). stdout is a 16-hex-digit `total` + "\n" header, then the raw tail.
-    # A daemon predating C_CAPTURE_AT never replies S_SNAPSHOT_AT; on the recv timeout
-    # fall back to a full capture under the "ffff…" sentinel header so the frontend
-    # transparently degrades to whole-ring search (no behavior change pre-upgrade).
+    # ring bytes past `offset` (a prior `total` watermark; 0 = the whole ring). stdout is
+    # a 16-hex-digit `total` + "\n" header, then the raw tail; empty when no daemon answers.
     got = sock_capture_at(sock, offset)
     if got is None:
-        if not os.path.exists(sock):
-            return  # no daemon => empty capture (probe reads this as "down")
-        sys.stdout.write("f" * 16 + "\n")
-        sys.stdout.flush()
-        return engine_capture(sock)
+        return
     sys.stdout.write("%016x\n" % got[0])
     sys.stdout.flush()
     sys.stdout.buffer.write(got[1])
@@ -4915,7 +4008,7 @@ def engine_capture_at(sock: str, offset: int) -> None:
 
 def engine_status(sock: str) -> None:
     pong = engine_ping(sock)
-    sys.stdout.write(f"up {pong[0]} {pong[1]} {pong[2] or '?'}\n" if pong else "down\n")
+    sys.stdout.write(f"up {pong[0]} {pong[1]} {pong[2]}\n" if pong else "down\n")
 
 
 def engine_kill(sock: str) -> None:
@@ -4924,9 +4017,7 @@ def engine_kill(sock: str) -> None:
 
 def engine_upgrade(sock: str) -> None:
     # ask the daemon to swap its code in place (re-exec the freshly-pushed tool while
-    # keeping urbit + the pty alive). A pre-versioning daemon has no C_UPGRADE handler
-    # and silently ignores the frame — the frontend detects that by polling the
-    # reported version and falls back to a restart.
+    # keeping urbit + the pty alive)
     sock_request(sock, C_UPGRADE)
 
 
@@ -4947,7 +4038,7 @@ def engine_pty_read(sock: str, offset: int) -> None:
     try:
         st = os.stat(sock + ".pty")
     except OSError:
-        sys.stdout.write("0 0 0\n")  # no tee (pre-0.0.6 daemon, or never booted)
+        sys.stdout.write("0 0 0\n")  # no tee: never booted under this daemon
         return
     recs = b""
     try:
@@ -4986,7 +4077,7 @@ def engine_pty_read(sock: str, offset: int) -> None:
     out.flush()
 
 
-ENGINE_SUBS = {"__daemon", "__attach", "__send", "__capture", "__capture-at",
+ENGINE_SUBS = {"__daemon", "__attach", "__send", "__capture-at",
                "__status", "__kill", "__upgrade", "__pty-read"}
 
 
@@ -5018,8 +4109,6 @@ def engine_main(argv: list[str]) -> None:
         return engine_send(sock)
     if sub == "__pty-read":
         return engine_pty_read(sock, int(rest[0]) if rest else 0)
-    if sub == "__capture":
-        return engine_capture(sock)
     if sub == "__capture-at":
         return engine_capture_at(sock, int(rest[0]) if rest else 0)
     if sub == "__status":

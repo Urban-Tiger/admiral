@@ -4,7 +4,7 @@
 
 import traceback
 
-from admiral import with_ship
+from harness import with_ship
 
 PAGE = """
 <main>

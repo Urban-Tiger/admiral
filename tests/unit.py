@@ -373,43 +373,6 @@ class ConfigFile(unittest.TestCase):
         p.write_text(text)
         return A.load_config(p)
 
-    def test_round_trip(self):
-        want = A.Ship("zod", A.PierConfig("piers/zod", 8080, 31, 31337, True), host="box",
-                      http="http://localhost:8080", code="lidlut-tabwed-pillex-ridrup",
-                      master_ticket="~sampel-ticket", mnemonic="a b c")
-        block = A.render_ship_block(want)
-        text = A.render_host_block("box", "u@box", "/home/u") + "\n\n" + block + "\n\n" + A.render_desk_block("d", "src")
-        cfg = self.load(text)
-        [ship] = cfg.ships
-        self.assertEqual(ship, want)
-        self.assertEqual(cfg.hosts["box"], A.Host("box", "/home/u", "u@box"))
-        self.assertEqual(cfg.desks, [A.Desk("d", "src")])
-
-    def test_render_block_shape(self):
-        # host survives without http; unset fields and a false local are left out
-        self.assertEqual(A.render_ship_block(A.Ship("z", A.PierConfig(), host="drain")),
-                         '[ships.z]\nhost = "drain"')
-        self.assertEqual(A.render_ship_block(A.Ship("z", A.PierConfig(port=1, local=False), host="local")),
-                         "[ships.z]\npier = { port = 1 }")
-        self.assertEqual(A.render_ship_block(A.Ship("z", A.PierConfig(), http="h", code="lidlut-tabwed-pillex-ridrup")),
-                         '[ships.z]\nhttp = "h"\ncode = "lidlut-tabwed-pillex-ridrup"')
-        # every Field round-trips through the writer and the loader
-        full = A.Ship("z", A.PierConfig("p", 2, 3, 4, True), http="h", code="lidlut-tabwed-pillex-ridrup",
-                      master_ticket="~ralnyt-botwyc", mnemonic="x y")
-        self.assertEqual(self.load(A.render_ship_block(full)).ships[0], full)
-
-    def test_field_from_text(self):
-        port = next(f for f in A.FIELDS if f.key == "port")
-        local = next(f for f in A.FIELDS if f.key == "local")
-        self.assertEqual(A.field_from_text(port, "8080"), (8080, None))
-        self.assertEqual(A.field_from_text(port, ""), (None, None))
-        self.assertIsNotNone(A.field_from_text(port, "x")[1])
-        self.assertIsNotNone(A.field_from_text(port, "70000")[1])
-        self.assertEqual(A.field_from_text(local, "Yes"), (True, None))
-        self.assertEqual(A.field_from_text(local, "0"), (False, None))
-        self.assertIsNotNone(A.field_from_text(local, "maybe")[1])
-        self.assertEqual(sorted(A.PIER_KEYS), ["ames", "local", "loom", "path", "port"])
-
     def test_minimal(self):
         cfg = self.load("[ships.zod]\n")
         self.assertEqual(cfg.ships[0].pier, A.PierConfig())
@@ -433,23 +396,6 @@ class ConfigFile(unittest.TestCase):
                 self.load(text)
             self.assertIn(msg, str(cm.exception), text)
 
-    def test_toml_str_escapes(self):
-        self.assertEqual(tomllib.loads(f"x = {A._toml_str(chr(34) + 'a' + chr(92))}")["x"], '"a\\')
-
-    def test_splice_ship_block(self):
-        text = "# head\n[ships.a]\nhttp = 'x'\n\n[ships.b]  # keep me\nhttp = 'y'\n\n[[desks]]\nname = 'd'\n"
-        out = A.splice_ship_block(text, "a", "[ships.a]\nhttp = 'z'")
-        self.assertIn("# head\n[ships.a]\nhttp = 'z'\n\n[ships.b]  # keep me", out)
-        self.assertNotIn("http = 'x'", out)
-        self.assertEqual(tomllib.loads(out)["ships"]["a"]["http"], "z")
-        out = A.splice_ship_block(text, "c", "[ships.c]\nhttp = 'w'")
-        self.assertTrue(out.endswith("[ships.c]\nhttp = 'w'\n"))
-        out = A.splice_ship_block(text, "b", None)
-        self.assertEqual(set(tomllib.loads(out)["ships"]), {"a"})
-        self.assertIn("[[desks]]", out)
-        with self.assertRaises(RuntimeError):
-            A.splice_ship_block(text, "zzz", None)
-
     def test_find_repo_walks_up(self):
         (self.dir / "admiral.toml").write_text("")
         sub = self.dir / "a" / "b"
@@ -463,43 +409,6 @@ class ConfigFile(unittest.TestCase):
                 A._find_repo()
         finally:
             os.chdir(cwd)
-
-
-class Upsert(unittest.TestCase):
-    hosts = ["drain"]
-
-    def draft(self, flags, existing=None):
-        get = lambda k: flags.get(k, A._UNSET)
-        d = A.ship_draft_upsert("add", "zod", get, existing, self.hosts)
-        return d, tomllib.loads(d.block)["ships"]["zod"]
-
-    def test_new_remote_host_needs_ssh_and_root(self):
-        with self.assertRaises(RuntimeError) as cm:
-            self.draft({"host": "new"})
-        self.assertIn("--ssh and --root", str(cm.exception))
-        d, ship = self.draft({"host": "new", "ssh": "u@b", "root": "/r", "port": "8080"})
-        self.assertEqual(d.new_host, A.HostDraft("new", "u@b", "/r"))
-        self.assertEqual(ship["pier"], {"port": 8080})
-
-    def test_ssh_rejected_for_known_hosts(self):
-        for host in ("local", "drain"):
-            with self.assertRaises(RuntimeError):
-                self.draft({"host": host, "ssh": "u@b"})
-
-    def test_coercion_and_validation(self):
-        _, ship = self.draft({"local": "yes", "loom": "31", "code": "lidlut-tabwed-pillex-ridrup"})
-        self.assertEqual(ship["pier"], {"loom": 31, "local": True})
-        for bad in ({"port": "x"}, {"port": "0"}, {"local": "maybe"}, {"code": "nope"},
-                    {"http": "has space"}, {"master-ticket": "nope"}):
-            with self.assertRaises(RuntimeError, msg=bad):
-                self.draft(bad)
-
-    def test_edit_keeps_unnamed_fields(self):
-        existing = A.Ship("zod", A.PierConfig(path="p", port=1, ames=2, local=True), host="drain",
-                          http="h", code=None, mnemonic="a b")
-        _, ship = self.draft({"port": "9"}, existing)
-        self.assertEqual(ship, {"host": "drain", "http": "h", "pier": {"path": "p", "port": 9, "ames": 2, "local": True},
-                                "mnemonic": "a b"})
 
 
 class HarnessDojo(unittest.TestCase):

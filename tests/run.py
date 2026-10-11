@@ -127,7 +127,7 @@ def _(ship, c):
     table = menu[menu.index("Commands") + 2:]
     names = [l.split()[0] for l in table[:next(i for i, l in enumerate(table) if not l)]]
     c.that(len(names) > 15, f"read {len(names)} commands off the menu")
-    for name in [n for n in names if n != "help"] + ["init", "enrich", "unenrich"]:
+    for name in [n for n in names if n != "help"] + ["enrich", "unenrich"]:
         rc, out, err, _ = admiral("help", name)
         c.that(rc == 0, f"help {name}: exit {rc}: {err[:200]!r}")
         c.that(f"admiral.py {name}" in err, f"help {name} has no header: {err[:200]!r}")

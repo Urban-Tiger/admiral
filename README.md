@@ -25,7 +25,8 @@ into clay, on this machine or on remote hosts over SSH.
 ```
 curl -O https://raw.githubusercontent.com/Urban-Tiger/admiral/main/admiral.py
 chmod +x admiral.py
-./admiral.py init --name <ship> --path <pier> --port <n> --http http://localhost:<n>
+curl -O https://raw.githubusercontent.com/Urban-Tiger/admiral/main/admiral.example.toml
+cp admiral.example.toml admiral.toml   # then edit it: one [ships.<name>] per ship
 ./admiral.py help          # every command
 ./admiral.py help <cmd>    # everything about one command
 ```

@@ -12,7 +12,7 @@
 #   a ship's host needs only python3. harness.py, beside this file, is the Playwright
 #   test harness for ships this manages.
 #
-#   ./admiral.py init                 # to get started
+#   cp admiral.example.toml admiral.toml   # to get started (edit it by hand)
 #
 #   ./admiral.py <ship> commit <desk> # to sync source code
 #
@@ -61,7 +61,7 @@ INVOKE = f"./{CLI}"          # how examples/usage render the invocation
 
 def _find_repo() -> tuple[Path, str]:
     # climb from cwd to the first ancestor holding a config. Fall back to cwd and the
-    # plain name when none is found, so a missing-config error (and init) names
+    # plain name when none is found, so a missing-config error names
     # ./admiral.toml in the current dir. Both names in one dir is ambiguous: refuse.
     cwd = Path.cwd()
     for d in (cwd, *cwd.parents):
@@ -75,7 +75,7 @@ def _find_repo() -> tuple[Path, str]:
 
 REPO, CONFIG = _find_repo()
 
-# config-value shapes, shared by load_config's validation and init/add.
+# config-value shapes, checked by load_config's validation.
 SHIP_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")  # ships.<name> map key
 DESK_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")          # desks[].name
 CODE_RE = re.compile(r"^[a-z]{6}(-[a-z]{6}){3}$")        # +code override
@@ -108,16 +108,14 @@ class PierConfig:
 
 # ── ship fields ──────────────────────────────────────────────────────────────
 # The one table behind everything that handles a ship's settings: config load
-# validates against it, add/edit take a --flag per row, and the TOML writer renders
-# from it. A new setting is one new row.
+# validates against it and builds the Ship from it. A new setting is one new row.
+# admiral.toml is edited by hand; admiral never writes it.
 @dataclass(frozen=True)
 class Field:
-    key: str                  # TOML key, and the --flag name ("master-ticket")
+    key: str                  # TOML key ("master-ticket")
     attr: str                 # attribute on Ship (or on PierConfig when pier)
     kind: str                 # "str" | "int" | "bool"
-    desc: str                 # the --flag's help
     hint: str                 # what a good value looks like; the error for a bad one
-    ph: str = "<val>"         # value placeholder in usage
     pier: bool = False        # lives in the ship's `pier = { ... }` table
     lo: int = 1               # int range, inclusive
     hi: int = 2**31
@@ -125,32 +123,21 @@ class Field:
 
 
 FIELDS: list[Field] = [
-    Field("http", "http", "str", "http origin the ship's web UI answers at",
-          'must be a non-empty hostname or URL (e.g. "example.com")', ph="<url>",
+    Field("http", "http", "str", 'must be a non-empty hostname or URL (e.g. "example.com")',
           ok=lambda s: bool(s.strip()) and not re.search(r"\s", s)),
-    Field("path", "path", "str", "pier path (relative to the host root, or absolute)", "must be a string",
-          ph="<path>", pier=True),
-    Field("port", "port", "int", "http bind port on the box (1-65535)",
-          "must be an integer 1-65535", ph="<port>", pier=True, hi=65535),
-    Field("ames", "ames", "int", "ames UDP port; pin it so peers' lanes survive a restart",
-          "must be an integer 1-65535", ph="<port>", pier=True, hi=65535),
-    Field("loom", "loom", "int", "loom size (memory pages, power of 2)",
-          "must be a positive integer", ph="<pages>", pier=True),
-    Field("local", "local", "bool", "boot with -L (fake networking) — pin it for a COPIED pier "
-          "whose original still runs elsewhere",
-          "must be a boolean", ph="<true|false>", pier=True),
-    Field("code", "code", "str", "+code override (skips the live dojo read)",
-          'must be a +code key (e.g. "ralnyt-botwyc-batnyt-dozzod")', ph="<code>",
+    Field("path", "path", "str", "must be a string", pier=True),
+    Field("port", "port", "int", "must be an integer 1-65535", pier=True, hi=65535),
+    Field("ames", "ames", "int", "must be an integer 1-65535", pier=True, hi=65535),
+    Field("loom", "loom", "int", "must be a positive integer", pier=True),
+    Field("local", "local", "bool", "must be a boolean", pier=True),
+    Field("code", "code", "str", 'must be a +code key (e.g. "ralnyt-botwyc-batnyt-dozzod")',
           ok=lambda s: bool(CODE_RE.match(s))),
-    Field("master-ticket", "master_ticket", "str", "ship master ticket (key material)",
-          'must be a ticket like "~ralnyt-botwyc-batnyt-dozzod"', ph="<ticket>",
+    Field("master-ticket", "master_ticket", "str", 'must be a ticket like "~ralnyt-botwyc-batnyt-dozzod"',
           ok=lambda s: bool(TICKET_RE.match(s))),
-    Field("mnemonic", "mnemonic", "str", "BIP39 mnemonic seed phrase (quote it)",
-          "must be a space-separated word list (BIP39 mnemonic)", ph="<words>",
+    Field("mnemonic", "mnemonic", "str", "must be a space-separated word list (BIP39 mnemonic)",
           ok=lambda s: bool(MNEMONIC_RE.match(s))),
 ]
-# every key `pier = { ... }` may carry. Config load rejects anything else, because
-# add/edit rewrite that table from these fields alone — see load_config.
+# every key `pier = { ... }` may carry. Config load rejects anything else — see load_config.
 PIER_KEYS = frozenset(f.key for f in FIELDS if f.pier)
 
 
@@ -166,24 +153,6 @@ def field_error(f: Field, v: Any) -> str | None:
     else:
         bad = not isinstance(v, str) or (f.ok is not None and not f.ok(v))
     return f"{f.hint}, got {v!r}" if bad else None
-
-
-def field_from_text(f: Field, raw: str) -> tuple[Any, str | None]:
-    # a --flag's text -> (typed value, error). "" unsets the field.
-    if raw == "":
-        return (None, None)
-    v: Any = raw
-    if f.kind == "int":
-        try:
-            v = int(raw)
-        except ValueError:
-            return (None, f"{f.hint}, got {raw!r}")
-    elif f.kind == "bool":
-        word = raw.strip().lower()
-        if word not in ("true", "yes", "on", "1", "false", "no", "off", "0"):
-            return (None, f"{f.hint}, got {raw!r}")
-        v = word in ("true", "yes", "on", "1")
-    return (v, field_error(f, v))
 
 
 def field_get(ship: "Ship", f: Field) -> Any:
@@ -250,7 +219,7 @@ def load_config(file: Path | None = None) -> Config:
         raw = file.read_text("utf8")
     except OSError:
         raise RuntimeError(
-            f"{file} not found — create it with\n"
+            f"{file} not found — create it by hand (see admiral.example.toml), e.g.\n"
             f"  [ships.<name>]\n"
             f'  http = "http://localhost:<port>"\n'
             f"  pier = {{ port = <port> }}\n\n"
@@ -313,17 +282,13 @@ def load_config(file: Path | None = None) -> Config:
         pier = ship.get("pier") or {}
         if not isinstance(pier, dict):
             raise RuntimeError(f'{CONFIG}: ships["{sname}"].pier must be a table {{ {", ".join(sorted(PIER_KEYS))} }}')
-        # Reject keys we don't know rather than ignoring them. `add`/`edit` rewrite
-        # this table from FIELDS alone, so a key we merely ignored would be silently
-        # DELETED the next time anyone edited the ship — the config would lose settings
-        # without ever saying so. Refusing here means a typo (or a setting from a newer
-        # admiral) is loud instead of load-bearing.
+        # Reject keys we don't know rather than ignoring them: a typo (or a setting
+        # from a newer admiral) is loud instead of silently doing nothing.
         unknown = sorted(set(pier) - PIER_KEYS)
         if unknown:
             raise RuntimeError(
                 f'{CONFIG}: ships["{sname}"].pier has unknown key(s) {", ".join(unknown)} '
-                f'(known: {", ".join(sorted(PIER_KEYS))}). admiral would drop these on the '
-                f'next `add`/`edit`, so it refuses to run instead.')
+                f'(known: {", ".join(sorted(PIER_KEYS))})')
         values: dict[str, Any] = {}
         for f in FIELDS:
             v = (pier if f.pier else ship).get(f.key)
@@ -1082,25 +1047,6 @@ def guard_port(host: Host, ship: Ship) -> None:
         assert_port_match(host, ship, st)
 
 
-def guard_not_running(ship: Ship, cfg: Config, action: str) -> None:
-    # Refuse to edit a ship's config while that ship is running. The config is what
-    # the running daemon was started from (pier path, port, host) — mutating or
-    # removing it mid-flight desyncs the live pier from the config that owns it.
-    # pier_held is the authoritative lockfile-based liveness gate and FAILS SAFE:
-    # any positive signal => held, and a held result is always trustworthy, so we
-    # only ever block on a running ship we can positively prove is up.
-    host = host_for(ship, cfg)
-    held = pier_held(host, ship)
-    if not held.held:
-        return
-    who = ", ".join(map(str, held.holders)) or "?"
-    raise RuntimeError(
-        f'cannot {action} ship "{ship.name}" while it is running '
-        f'(pier held by PID {who} via {", ".join(held.via)}) — '
-        f'stop it first with `{INVOKE} {ship.name} exit`'
-    )
-
-
 # ── text helpers ──────────────────────────────────────────────────────────────
 def trim_blank(lines: list[str]) -> list[str]:
     s, e = 0, len(lines)
@@ -1791,14 +1737,14 @@ class Cmd:
     details: str | None = None
     examples: list[str] | None = None
     complete: Callable[[Config | None], list[str]] | None = None
-    ship: bool = True        # takes a <ship> selector and a loaded config; init/enrich don't
+    ship: bool = True        # takes a <ship> selector and a loaded config; enrich doesn't
 
 
 @dataclass
 class Parsed:
     cmd: Cmd
     selector: str | None
-    cfg: Config | None       # None only for a shipless command (init has no config yet)
+    cfg: Config | None       # None only for a shipless command (enrich needs none)
     flags: dict[str, Any]
     pos: list[str]
 
@@ -2832,267 +2778,6 @@ def cmd_unenrich(a: Parsed) -> None:
     sys.stdout.write(_installed_uninstall(shell) + "\n")
 
 
-# ── TOML emit (hand-rolled: stdlib has no writer; our schema is small + fixed) ──
-def _toml_str(s: str) -> str:
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def render_host_block(name: str, ssh: str, root: str) -> str:
-    return f"[hosts.{name}]\nssh = {_toml_str(ssh)}\nroot = {_toml_str(root)}"
-
-
-def render_ship_block(ship: Ship) -> str:
-    # the [ships.<name>] table. Unset fields are left out, a false `local` too (absent
-    # reads as false), and the pier fields share one inline table after http/host.
-    def lit(f: Field, v: Any) -> str:
-        return _toml_str(v) if f.kind == "str" else ("true" if f.kind == "bool" else str(v))
-
-    lines = [f"[ships.{ship.name}]"]
-    pier: list[str] = []
-    pier_at = 0
-    for f in FIELDS:
-        v = field_get(ship, f)
-        if f.pier:
-            pier_at = pier_at or len(lines)
-            if v is not None and v is not False:
-                pier.append(f"{f.key} = {lit(f, v)}")
-            continue
-        if v is not None:
-            lines.append(f"{f.key} = {lit(f, v)}")
-        if f.key == "http" and ship.host and ship.host != "local":
-            lines.append(f"host = {_toml_str(ship.host)}")
-    if pier:
-        lines.insert(pier_at, "pier = { " + ", ".join(pier) + " }")
-    return "\n".join(lines)
-
-
-def render_desk_block(name: str, src: str) -> str:
-    return f"[[desks]]\nname = {_toml_str(name)}\nsrc = {_toml_str(src)}"
-
-
-# ── ship drafts (init / add / edit) ───────────────────────────────────────────
-@dataclass
-class HostDraft:
-    name: str
-    ssh: str
-    root: str
-
-
-@dataclass
-class ShipDraft:
-    ship: Ship
-    new_host: HostDraft | None = None  # a remote host defined inline, to also emit
-
-    @property
-    def name(self) -> str:
-        return self.ship.name
-
-    @property
-    def block(self) -> str:
-        return render_ship_block(self.ship)
-
-
-# ── config edits, driven by --flags ──────────────────────────────────────────
-# init/add/edit/delete take their values as flags, validated through FIELDS, and edit
-# the TOML text in place: `admiral sampel-palnet add --host drain --port 8080`. (init
-# keeps its own bare-key flag set since it is a top-level verb that also takes
-# --name/--desk/--src.)
-
-# the per-ship field flags, shared by the `add` and `edit` Cmd entries. All are strings
-# (typed when applied, through field_from_text) so add/edit can carry every field.
-SHIP_FIELD_FLAGS: list[Flag] = [
-    Flag("--host", "str", "host the ship runs on (a hosts.<name>, or 'local')", ph="<host>"),
-    Flag("--ssh", "str", "ssh target when defining a NEW remote --host (needs --root)", ph="<user@box>"),
-    Flag("--root", "str", "absolute base dir when defining a NEW remote --host (needs --ssh)", ph="<dir>"),
-    *(Flag(f"--{f.key}", "str", f.desc, ph=f.ph) for f in FIELDS),
-]
-
-_UNSET = object()  # "flag not provided" — distinct from an explicit empty/None value
-
-
-def resolve_upsert_name(selector: str, cfg: Config, *, must_exist: bool) -> str:
-    # the selector for add/edit/delete IS the ship name.
-    name = selector.lstrip("~")
-    if not SHIP_NAME_RE.match(name):
-        raise RuntimeError(f"ship name {name!r} must match {SHIP_NAME_RE.pattern}")
-    if must_exist and ship_by_name(name, cfg) is None:
-        raise RuntimeError(f'no ship named "{name}" in {CONFIG} (have: {", ".join(s.name for s in cfg.ships)})')
-    return name
-
-
-def ship_draft_upsert(verb: str, name: str, get: Callable[[str], Any],
-                      existing: Ship | None, existing_hosts: list[str]) -> ShipDraft:
-    # build a ShipDraft for an UPSERT: each field takes its provided value (via get(key),
-    # which returns _UNSET when the flag was omitted), else the existing record's value
-    # when editing, else unset. --host may be "local", an existing host, or a NEW host
-    # name (then --ssh + --root are required to define it inline).
-    def pick(key: str, cur: Any) -> Any:
-        v = get(key)
-        return cur if v is _UNSET else v
-
-    ssh, root = pick("ssh", None), pick("root", None)
-    host = pick("host", (existing.host if existing else None)) or "local"
-    new_host: HostDraft | None = None
-    if host == "local":
-        if ssh or root:
-            raise RuntimeError(f"{verb}: --ssh/--root only apply when defining a NEW remote --host")
-    elif host in existing_hosts:
-        if ssh or root:
-            raise RuntimeError(f"{verb}: host {host!r} already exists — drop --ssh/--root (they only define a new host)")
-    else:
-        if not ssh or not root:
-            raise RuntimeError(f"{verb}: host {host!r} is new — pass --ssh and --root to define it "
-                               f"(or pick an existing host: {', '.join(['local', *existing_hosts])})")
-        if not SHIP_NAME_RE.match(host):
-            raise RuntimeError(f"{verb}: host name {host!r} must match {SHIP_NAME_RE.pattern}")
-        if not os.path.isabs(root):
-            raise RuntimeError(f"{verb}: --root {root!r} must be an absolute path")
-        new_host = HostDraft(host, ssh, root)
-
-    values: dict[str, Any] = {}
-    for f in FIELDS:
-        raw = get(f.key)
-        if raw is _UNSET:
-            values[f.attr] = field_get(existing, f) if existing else None
-            continue
-        v, err = field_from_text(f, raw)
-        if err:
-            raise RuntimeError(f"{verb}: --{f.key} {err}")
-        values[f.attr] = v
-    return ShipDraft(make_ship(name, host, values), new_host)
-
-
-def splice_ship_block(text: str, name: str, block: str | None) -> str:
-    # replace the [ships.<name>] table IN PLACE with `block` — header line through the
-    # line before the next top-level [table]/[[array]] (or EOF) — or drop it when `block`
-    # is None; a ship not yet in the file is appended. Editing the text (not re-rendering)
-    # preserves comments + every other ship's hand formatting.
-    hdr = re.compile(r"^\s*\[ships\." + re.escape(name) + r"\]\s*(#.*)?$")
-    table = re.compile(r"^\s*\[")
-    lines = text.split("\n")
-    out: list[str] = []
-    i, found = 0, False
-    while i < len(lines):
-        if not found and hdr.match(lines[i]):
-            found = True
-            if block is not None:
-                out.extend(block.split("\n"))
-                out.append("")  # keep a blank line before whatever followed the old block
-            i += 1
-            while i < len(lines) and not table.match(lines[i]):
-                i += 1
-        else:
-            out.append(lines[i])
-            i += 1
-    if not found:
-        if block is None:
-            raise RuntimeError(f"no [ships.{name}] block found in {CONFIG}")
-        return text.rstrip("\n") + "\n\n" + block + "\n"
-    # collapse the blank-line run a removal can leave behind
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).rstrip("\n") + "\n"
-
-
-def _config_target() -> Path:
-    # init writes into the current directory; add edits the config found by walk-up.
-    return Path.cwd() / CONFIG
-
-
-def _validate_written(p: Path) -> None:
-    # re-parse what we just wrote through the real loader so a malformed result
-    # surfaces immediately, not on the next command.
-    try:
-        load_config()
-    except Exception as e:
-        raise RuntimeError(f"wrote {p} but it failed validation: {e}")
-
-
-def cmd_init(a: Parsed) -> None:
-    # create admiral.toml in the current directory (one host? + one ship + one desk),
-    # the minimum a working config needs.
-    target = _config_target()
-    if target.exists():
-        raise RuntimeError(f"{target} already exists — use `{INVOKE} <ship> add` to add a ship to it")
-    if REPO != Path.cwd():
-        # the walk-up found a config above us; a second one here would shadow it from
-        # this directory down and split the project's ships across two files.
-        raise RuntimeError(f"{REPO / CONFIG} already governs this directory — use "
-                           f"`{INVOKE} <ship> add` to add a ship to it, or init outside that tree")
-    kv = {k.lstrip("-"): v for k, v in a.flags.items()}
-    name = (kv.get("name") or "").lstrip("~")
-    if not name:
-        raise RuntimeError("init: --name is required (the first ship's name, without ~; e.g. "
-                           f"{INVOKE} init --name sampel-palnet --http http://localhost:80 --port 80)")
-    if not SHIP_NAME_RE.match(name):
-        raise RuntimeError(f"init: ship name {name!r} must match {SHIP_NAME_RE.pattern}")
-    ship = ship_draft_upsert("init", name, lambda k: kv.get(k, _UNSET), None, [])
-    # --desk defaults to "base"; pass --desk "" for a deskless config (no commits).
-    desk_name = kv.get("desk", "base")
-    if desk_name and not DESK_NAME_RE.match(desk_name):
-        raise RuntimeError(f"init: --desk {desk_name!r} must match {DESK_NAME_RE.pattern}")
-    desk_src = kv.get("src", ".")
-
-    blocks = [f"# {NAME} config — see `{INVOKE} help` and this script's header for the full schema."]
-    if ship.new_host:
-        h = ship.new_host
-        blocks.append(render_host_block(h.name, h.ssh, h.root))
-    blocks.append(ship.block)
-    if desk_name:
-        blocks.append(render_desk_block(desk_name, desk_src))
-    target.write_text("\n\n".join(blocks) + "\n")
-    _validate_written(target)
-    sys.stderr.write(
-        f"\n{NAME}: wrote {target}\n"
-        f"  ship {ship.name}, {f'desk {desk_name}' if desk_name else 'no desk (add [[desks]] to enable commits)'}\n"
-        f"  next: `{INVOKE} {ship.name} run` (the pier must already exist; `boot` is a stub)\n")
-
-
-def cmd_add(a: Parsed) -> None:
-    # Upsert one ship (the selector is its name): add it when new, or edit its fields when
-    # it already exists — `add` and `edit` are the same command. Only the fields named by
-    # a flag change.
-    cfg = a.cfg
-    name = resolve_upsert_name(a.selector, cfg, must_exist=False)
-    existing = ship_by_name(name, cfg)
-    if existing:
-        guard_not_running(existing, cfg, "edit")  # config is frozen while the ship runs
-    verb = "edit" if existing else "add"
-    target = REPO / CONFIG
-    existing_hosts = list(cfg.hosts)
-
-    if not a.flags:
-        raise RuntimeError(f"{verb}: nothing to {'change' if existing else 'set'} — pass the fields as "
-                           f"flags (`{INVOKE} help {verb}` lists them)")
-    ship = ship_draft_upsert(verb, name, lambda k: a.flags.get(f"--{k}", _UNSET), existing, existing_hosts)
-
-    text = target.read_text()
-    if ship.new_host:
-        h = ship.new_host
-        text = text.rstrip("\n") + "\n\n" + render_host_block(h.name, h.ssh, h.root) + "\n"
-    target.write_text(splice_ship_block(text, name, ship.block))
-    _validate_written(target)
-    sys.stderr.write(f"\n{NAME}: {'updated' if existing else 'added'} ship {name} in {target}\n")
-
-
-def cmd_delete(a: Parsed) -> None:
-    # The opposite of `add`: remove a ship (the selector) from the config. Leaves the pier
-    # on disk untouched — this only edits admiral.toml. --yes is the confirmation.
-    cfg = a.cfg
-    if len(cfg.ships) == 1:
-        raise RuntimeError(f"delete: \"{cfg.ships[0].name}\" is the only ship; {CONFIG} must list at least one "
-                           f"(add another first, or edit the file directly)")
-    name = resolve_upsert_name(a.selector, cfg, must_exist=True)
-    guard_not_running(resolve_ship(name, cfg), cfg, "delete")  # config is frozen while the ship runs
-    target = REPO / CONFIG
-
-    if not a.flags.get("--yes"):
-        raise RuntimeError(f"delete: pass --yes to remove ship {name} from {CONFIG} "
-                           "(the pier on disk is left in place)")
-
-    target.write_text(splice_ship_block(target.read_text(), name, None))
-    _validate_written(target)
-    sys.stderr.write(f"\n{NAME}: removed ship {name} from {target} (pier on disk left in place)\n")
-
-
 # ── command registry ──────────────────────────────────────────────────────────
 COMMANDS: list[Cmd] = [
     Cmd(
@@ -3205,9 +2890,11 @@ COMMANDS: list[Cmd] = [
                  "    urbit -w sampel-palnet -k sampel-palnet.key -c piers/sampel-palnet\n"
                  "  a comet:\n"
                  "    urbit -c piers/comet\n\n"
-                 "Once it reaches the dojo, stop it with Ctrl-D in that terminal. Then:\n\n"
-                 f"  {INVOKE} sampel-palnet add --path piers/sampel-palnet --port 8080 \\\n"
-                 "      --http http://localhost:8080\n"
+                 "Once it reaches the dojo, stop it with Ctrl-D in that terminal. Then list it "
+                 f"in {CONFIG} and run it:\n\n"
+                 "  [ships.sampel-palnet]\n"
+                 "  http = \"http://localhost:8080\"\n"
+                 "  pier = { path = \"piers/sampel-palnet\", port = 8080 }\n\n"
                  f"  {INVOKE} sampel-palnet run"),
         run=cmd_boot,
     ),
@@ -3348,37 +3035,6 @@ COMMANDS: list[Cmd] = [
         examples=[f"{INVOKE} sampel-palnet attach"],
         run=cmd_attach,
     ),
-    Cmd(
-        name="add", summary="add the ship to the config, or change its fields",
-        flags=SHIP_FIELD_FLAGS, positionals=[],
-        details=("Create the ship's [ships.<name>] entry, or edit an existing one (add and edit "
-                 "are the same command). Only the fields you pass change; a new ship needs at "
-                 "least one. A new remote --host needs --ssh and --root to define it. The pier "
-                 "on disk is never touched.\n\n"
-                 "--master-ticket and --mnemonic are stored in admiral.toml as plain text."),
-        examples=[f"{INVOKE} sampel-palnet add --path piers/sampel-palnet --port 8080 --http http://localhost:8080",
-                  f"{INVOKE} marnec-dozzod add --host drain --ssh urb@box --root /home/urb --port 8080"],
-        complete=lambda cfg: (["local", *cfg.hosts] if cfg else []),
-        run=cmd_add,
-    ),
-    Cmd(
-        name="edit", summary="the same as add",
-        flags=SHIP_FIELD_FLAGS, positionals=[],
-        details="The same command as add: only the fields you pass change.",
-        examples=[f"{INVOKE} sampel-palnet edit --port 8080",
-                  f"{INVOKE} sampel-palnet edit --code ralnyt-botwyc-batnyt-dozzod"],
-        complete=lambda cfg: (["local", *cfg.hosts] if cfg else []),
-        run=cmd_add,
-    ),
-    Cmd(
-        name="delete", summary="remove the ship from the config; its pier stays",
-        flags=[Flag("--yes", "bool", "confirm the removal (required)")],
-        positionals=[],
-        details=("Remove the ship's [ships.<name>] entry from admiral.toml. The pier on disk is "
-                 "not touched. The last ship in a config can't be removed."),
-        examples=[f"{INVOKE} sampel-palnet delete --yes"],
-        run=cmd_delete,
-    ),
 ]
 
 ENRICH_FLAGS = [Flag("--no-persist", "bool", "this shell only; don't touch the rc file"),
@@ -3386,21 +3042,6 @@ ENRICH_FLAGS = [Flag("--no-persist", "bool", "this shell only; don't touch the r
 SHELL_POS = [Pos("shell", False, "bash or zsh (default: your $SHELL)")]
 
 COMMANDS += [
-    Cmd(
-        name="init", summary=f"create {CONFIG} in this directory", ship=False,
-        flags=[Flag("--name", "str", "the first ship's name, without ~", ph="<ship>"),
-               Flag("--desk", "str", "a desk to list (default base; \"\" for none)", ph="<desk>"),
-               Flag("--src", "str", "the desk's source dir, relative to here (default .)", ph="<dir>"),
-               *SHIP_FIELD_FLAGS],
-        positionals=[],
-        details=("Write a new admiral.toml here with one ship and, optionally, one desk. It takes "
-                 "--name plus any field add takes, and --desk / --src for the desk. Refuses when "
-                 f"admiral.toml already exists: use `{INVOKE} <ship> add` for more ships.\n\n"
-                 "admiral finds its config by walking up from the current directory to the nearest "
-                 "admiral.toml (or .admiral.toml), like git finds .git."),
-        examples=[f"{INVOKE} init --name zod --path piers/zod --port 8080 --http http://localhost:8080"],
-        run=cmd_init,
-    ),
     Cmd(
         name="enrich", summary=f"add an `{NAME}` command and tab completion to your shell", ship=False,
         flags=ENRICH_FLAGS, positionals=SHELL_POS,
@@ -3475,11 +3116,11 @@ def help_menu() -> None:
     inv = INVOKE
     config_file = os.path.join(str(REPO), CONFIG)
     config_line = (f"Config: {config_file}" if os.path.exists(config_file)
-                   else red(f"No config here yet: {INVOKE} init creates one."))
+                   else red(f"No config here yet: write {CONFIG} by hand (see admiral.example.toml)."))
 
     def sig(c: Cmd) -> str:
-        # collapse a long flag list to "[opts]" so one verbose command (add/edit) can't
-        # blow out the whole menu's column width; `help <cmd>` shows every flag in full.
+        # collapse a long flag list to "[opts]" so one verbose command can't blow out
+        # the whole menu's column width; `help <cmd>` shows every flag in full.
         flags = ["[opts]"] if len(c.flags) > 1 else [flag_brief(f) for f in c.flags]
         return " ".join([c.name, *flags, *[pos_brief(p) for p in c.positionals]])
 
@@ -3501,7 +3142,7 @@ Usage
 Getting started
 
   1. create a pier with the urbit binary       {gray(f"{inv} help boot")}
-  2. {gray(f"{inv} init --name <ship> ...")}      write {CONFIG} for it
+  2. list it in {CONFIG}                   {gray("see admiral.example.toml")}
   3. {gray(f"{inv} <ship> run")}                   turn it on
   4. {gray(f"{inv} <ship> code")}                  its web login password
   5. open the ship's http address and log in with that code
@@ -4285,8 +3926,7 @@ def main() -> None:
     # hidden completion subcommand (not in the menu): it owns argv[0].
     if first == "__complete":
         return cmd_complete(argv[1:])
-    # commands that take no ship (init, enrich, unenrich) own argv[0] too. init has no
-    # config to load yet, so none of them get one.
+    # commands that take no ship (enrich, unenrich) own argv[0] too; they get no config.
     shipless = by_name(first)
     if shipless and not shipless.ship:
         flags, pos = parse_args(shipless, argv[1:])

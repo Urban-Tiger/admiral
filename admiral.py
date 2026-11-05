@@ -1152,7 +1152,10 @@ def sync_flags() -> list[str]:
     # depth (vere never ingests them, so copying one only costs the transfer — .git,
     # the script dir, a sibling desk living beside this one), and this control file
     # and its config: infra, not desk source. --delete prunes stale dest files.
-    return ["-avL", "--delete", "--filter=:- .gitignore", "--exclude=.*",
+    # --checksum compares content, not rsync's default size+mtime quick check: a
+    # rebuild can rewrite a file to the same size (lodge-ui's index.html only swaps
+    # hashed asset names), and with a matching mtime the quick check skips it.
+    return ["-avL", "--checksum", "--delete", "--filter=:- .gitignore", "--exclude=.*",
             *(f"--exclude={n}" for n in CONFIG_NAMES), f"--exclude={CLI}"]
 
 

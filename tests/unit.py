@@ -533,6 +533,7 @@ class Resolution(unittest.TestCase):
         self.assertIn("--exclude=.*", flags)
         self.assertIn("--exclude=admiral.toml", flags)
         self.assertIn("--delete", flags)
+        self.assertIn("--checksum", flags)
 
     def test_usage_strings(self):
         c = cmd([A.Flag("-t", "int", "", ph="<secs>"), A.Flag("--yes", "bool", "")],

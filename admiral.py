@@ -87,10 +87,10 @@ TICKET_RE = re.compile(r"^~?[a-z]{6}(-[a-z]{6})+$")      # master ticket (~ opti
 MNEMONIC_RE = re.compile(r"^[a-z]+( [a-z]+)+$")          # BIP39 mnemonic (2+ lowercase words)
 
 # per-command dojo timeouts (seconds); commit drives a full build, rest are quick.
-T_COMMIT = 300  # a first build of a big desk takes minutes; a timeout aborts it
+T_COMMIT = 300  # a first build of a big desk takes minutes
 T_RUN = 15
 T_HTTP = 3  # the status probe's GET; a dead origin must not stall the card
-T_DOJO = 60  # a dojo command's budget; past it the command is aborted, so builds need room
+T_DOJO = 60  # a dojo command's budget; past it a thread is aborted, an event is waited out
 T_CHOP = 900  # roll copies the snapshot into the new epoch — minutes on a big pier
 
 
@@ -1207,6 +1207,12 @@ ASK_ROW = re.compile(r"^~[a-z][a-z0-9-]*:dojo[^ <>:]*: ")
 YES_NO = re.compile(r"\((?:y/N|Y/n|y/n)\)")
 BACKSPACE = "\x7f"  # backs out of an open entry, cancels a question, aborts a thread
 INTERRUPT = "\x03"  # interrupts an arvo event mid-computation; a thread ignores it
+# vere redoes an interrupted behn wake once, silently; a second interrupt of it logs
+# "behn: timer failed; queue blocked" and exits vere. A mute dojo is often a gall
+# agent's wake, not ours, so admiral never sends INTERRUPT unless the run asked for it
+# (--interrupt), and then at most once per ship per run.
+_interrupted: set[str] = set()
+_interrupted_lock = threading.Lock()
 SPINNER = re.compile(r"[|/\\-]\x08")  # vere paints this while an event computes
 
 
@@ -1285,41 +1291,76 @@ def dojo_probe(host: Host, ship: Ship, total: int) -> tuple[str, int, str]:
     return ("mute", ptotal, reaction)
 
 
-def dojo_abort(host: Host, ship: Ship, verdict: str) -> None:
-    # stop what the dojo is doing: backspace aborts a thread, Ctrl-C interrupts an event
-    # still computing. An interrupted command comes back as text on the input row, so
-    # empty the row after.
-    send_data(host, ship, INTERRUPT if verdict == "mute" else BACKSPACE)
+def still_computing(ship: Ship, secs: float, interrupted: bool) -> str:
+    # why a drive gave up on a mute dojo, and where to look
+    slog = f"`{INVOKE} {ship.name} slog` shows what it's doing."
+    if interrupted:
+        return (f"the ship is still computing an event after {int(secs)}s; admiral "
+                f"interrupted it once and will not again this run.\n{slog}")
+    return (f"the ship is still computing an event after {int(secs)}s; it was not "
+            f"interrupted.\n{slog} Wait for it, or give a longer -t. --interrupt sends one "
+            f"Ctrl-C,\nfor a ship truly stuck in your own command; a second interrupt of a "
+            f"timer event exits vere.")
+
+
+def dojo_interrupt(host: Host, ship: Ship) -> bool:
+    # send the run's one INTERRUPT to this ship; False when it was already spent. An
+    # interrupted command comes back as text on the input row, so empty the row after.
+    with _interrupted_lock:
+        if ship.name in _interrupted:
+            return False
+        _interrupted.add(ship.name)
+    send_data(host, ship, INTERRUPT)
+    time.sleep(0.8)
+    clear_input(host, ship)
+    return True
+
+
+def dojo_abort(host: Host, ship: Ship) -> None:
+    # abort the thread the dojo is running: backspace, then empty the input row
+    send_data(host, ship, BACKSPACE)
     time.sleep(0.8)
     clear_input(host, ship)
 
 
-def dojo_settle(host: Host, ship: Ship, until: float, log: Callable[[str], None]) -> None:
-    # wait for an eval someone else left running; abort it once `until` passes.
-    aborts = 0
+def dojo_settle(host: Host, ship: Ship, until: float, budget: float,
+                log: Callable[[str], None], interrupt: bool = False) -> None:
+    # wait for the dojo to go idle. Past `until`:
+    #
+    #   busy   a thread: abort it with backspace, at most twice
+    #   mute   arvo computing an event, often not ours: raise, never interrupt,
+    #          unless `interrupt` and this ship's one interrupt is unspent
+    aborts, interrupted = 0, False
     while True:
         verdict, _, _ = dojo_probe(host, ship, ring_mark(host, ship))
         if verdict == "idle":
             return
         if time.monotonic() >= until:
+            if verdict == "mute":
+                if interrupt and not interrupted and dojo_interrupt(host, ship):
+                    log("interrupted an event still computing in the dojo (--interrupt)")
+                    interrupted = True
+                    until = time.monotonic() + 5
+                    continue
+                raise RuntimeError(still_computing(ship, budget, ship.name in _interrupted))
             if aborts == 2:
-                raise RuntimeError(f"the dojo is still {verdict} after two aborts; "
+                raise RuntimeError("the dojo is still running a thread after two aborts; "
                                    f"`{INVOKE} {ship.name} slog -n 40` shows what it is doing")
-            log(f"aborted {'a running thread' if verdict == 'busy' else 'an event still computing'}"
-                f" left in the dojo")
-            dojo_abort(host, ship, verdict)
+            log("aborted a running thread left in the dojo")
+            dojo_abort(host, ship)
             aborts += 1
             until = time.monotonic() + 5
             continue
         time.sleep(0.5)
 
 
-def dojo_ready(host: Host, ship: Ship, wait: float, log: Callable[[str], None]) -> None:
+def dojo_ready(host: Host, ship: Ship, wait: float, log: Callable[[str], None],
+               interrupt: bool = False) -> None:
     # bring the dojo to an empty idle prompt, whatever the last driver left there:
     #
     #   open   a continuation entry: backspace backs out one level
     #   ask    a generator's question: backspace cancels it
-    #   None   arvo mid-event: wait up to `wait`, then interrupt
+    #   None   arvo mid-event: wait up to `wait`, then fail (see dojo_settle)
     #
     # A thread still running paints the idle prompt; the accept loop meets it as a busy
     # notice and settles it there.
@@ -1327,7 +1368,7 @@ def dojo_ready(host: Host, ship: Ship, wait: float, log: Callable[[str], None]) 
     for _ in range(10):
         state = dojo_prompt(host, ship)
         if state is None:
-            dojo_settle(host, ship, until, log)
+            dojo_settle(host, ship, until, wait, log, interrupt)
             continue
         mode, text = state
         if mode == "idle":
@@ -1388,13 +1429,14 @@ def truncate_output(text: str, ship: Ship) -> str:
 
 def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
              desk: Desk | None = None, log: Callable[[str], None] | None = None,
-             yes: bool = False) -> str:
+             yes: bool = False, interrupt: bool = False) -> str:
     # Sentinel-free dojo drive. The daemon ring records every pty byte and capture_at
     # hands back (total, tail-past-watermark) — so a watermark taken just before the
     # command bounds this command's ENTIRE transcript, sync ~& included.
     #
     #   ready    dojo_ready empties the row and backs out of whatever the last driver
-    #            left: an open entry, a question, an event still computing.
+    #            left: an open entry, a question, a thread. An event still computing
+    #            is waited out, never interrupted unless `interrupt` (see INTERRUPT).
     #   accept   the dojo commits a line by echoing `> <command>` into scrollback. A
     #            busy notice means a thread was running: settle it, type the line again.
     #   reject   "dojo: failed to process input", or the whole line painted on a quiet
@@ -1402,8 +1444,9 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
     #   done     bare prompt + quiet ring, CONFIRMED by the probe. On a chatty ship the
     #            ring is never quiet, so the probe also fires every 3s.
     #
-    # Nothing is left behind: a timeout or Ctrl-C aborts the command before raising, and
-    # a question the command asks is answered (--yes) or cancelled.
+    # A thread is never left behind: a timeout or Ctrl-C aborts it before raising, and a
+    # question the command asks is answered (--yes) or cancelled. An event still
+    # computing is left to finish, unless `interrupt`.
     check_dojo_input(command)
     host = host_for(ship, cfg)
     if log is None:
@@ -1426,7 +1469,7 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
         sync_thread.start()
 
     try:
-        dojo_ready(host, ship, timeout, log)
+        dojo_ready(host, ship, timeout, log, interrupt)
     finally:
         if sync_thread is not None:
             sync_thread.join()
@@ -1480,7 +1523,7 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
                 # land the command two or three times.
                 if resends == 3:
                     break
-                dojo_settle(host, ship, t_send + timeout, log)
+                dojo_settle(host, ship, t_send + timeout, timeout, log, interrupt)
                 clear_input(host, ship)
                 # the transcript restarts at the resend: what the settle printed (an
                 # aborted thread's `! cancel`) was never this command's output
@@ -1572,18 +1615,31 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
                 last_total, last_change = ptotal, time.monotonic()
             time.sleep(0.1)
         verdict, _, _ = dojo_probe(host, ship, ring_mark(host, ship))
-        if verdict != "idle":
-            dojo_abort(host, ship, verdict)
+        transcript = tail_n(render_transcript(raw), 30)
+        if verdict == "mute":
+            if interrupt and dojo_interrupt(host, ship):
+                raise RuntimeError(f"TIMEOUT after {timeout}s — interrupted the command "
+                                   f"(--interrupt)\n" + transcript)
+            raise RuntimeError(f"TIMEOUT: {still_computing(ship, timeout, ship.name in _interrupted)}\n"
+                               + transcript)
+        if verdict == "busy":
+            dojo_abort(host, ship)
         raise RuntimeError(f"TIMEOUT after {timeout}s"
-                           + (" — aborted the command" if verdict != "idle" else "") + "\n"
-                           + tail_n(render_transcript(raw), 30))
+                           + (" — aborted the command" if verdict == "busy" else "") + "\n"
+                           + transcript)
     except KeyboardInterrupt:
-        # Ctrl-C or SIGTERM: leave the dojo as we found it. A command still running is
-        # aborted; one typed but not taken is wiped off the row.
-        if accepted:
-            dojo_abort(host, ship, "mute" if SPINNER.search(raw[-256:]) else "busy")
-        else:
+        # Ctrl-C or SIGTERM: leave the dojo as we found it. A thread still running is
+        # aborted; one typed but not taken is wiped off the row. An event still
+        # computing is left to finish, unless --interrupt.
+        if not accepted:
             clear_input(host, ship)
+        elif not SPINNER.search(raw[-256:]):
+            dojo_abort(host, ship)
+        elif interrupt and dojo_interrupt(host, ship):
+            log("interrupted the command's event (--interrupt)")
+        else:
+            log(f"the command's event is still computing; it was not interrupted. "
+                f"`{INVOKE} {ship.name} slog` shows it")
         raise
 
 
@@ -1846,9 +1902,11 @@ def cmd_dojo(a: Parsed) -> None:
     command = a.pos[0]
     timeout = a.flags.get("-t") or T_DOJO
     yes = bool(a.flags.get("--yes"))
+    interrupt = bool(a.flags.get("--interrupt"))
 
     def work(ship, host, log):
-        return truncate_output(dojo_one(ship, command, a.cfg, timeout=timeout, log=log, yes=yes), ship)
+        return truncate_output(dojo_one(ship, command, a.cfg, timeout=timeout, log=log, yes=yes,
+                                        interrupt=interrupt), ship)
 
     sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
@@ -1880,10 +1938,13 @@ def commit_verdict(desk: Desk, out: str) -> tuple[bool, str, list[str]]:
     return (True, f"commit %{desk.name}: {files} file{'s' if files > 1 else ''} ({counts}), {loaded}", agents)
 
 
-def desk_suspended(ship: Ship, desk: Desk, cfg: Config, log: Callable[[str], None]) -> bool:
+def desk_suspended(ship: Ship, desk: Desk, cfg: Config, timeout: int,
+                   interrupt: bool = False) -> bool:
     # a desk whose bill names agents, but which +vats reports suspended, runs nothing:
-    # its commits land in clay and deploy nowhere.
-    vats = dojo_one(ship, f"+vats %{desk.name}", cfg, log=lambda m: None)
+    # its commits land in clay and deploy nowhere. It runs right after a commit, while
+    # gall's rebuild may still hold arvo, so it waits under the commit's timeout.
+    vats = dojo_one(ship, f"+vats %{desk.name}", cfg, timeout=timeout, log=lambda m: None,
+                    interrupt=interrupt)
     status = re.search(r"app status:\s+(\S+)", vats)
     bill = re.search(r"/desk/bill:\s+~\[", vats)
     return bool(status and status.group(1) == "suspended" and bill)
@@ -1911,6 +1972,7 @@ def ring_settle(host: Host, ship: Ship, mark: int, quiet: float = 1.0, limit: fl
 def cmd_commit(a: Parsed) -> None:
     desk = resolve_desk(a.pos[0], a.cfg)
     remount = bool(a.flags.get("--remount"))
+    interrupt = bool(a.flags.get("--interrupt"))
     timeout = a.flags.get("-t") or T_COMMIT
     ship = resolve_ship(a.selector, a.cfg)
     if remount and self_mounted(ship, desk, a.cfg):
@@ -1929,9 +1991,12 @@ def cmd_commit(a: Parsed) -> None:
             log(f"the sync deletes {len(deletes)} file{'s' if len(deletes) > 1 else ''} "
                 f"({', '.join(deletes[:3])}{', …' if len(deletes) > 3 else ''}); remounting")
         if remount or deletes:
-            dojo_one(ship, f"|unmount %{desk.name}", a.cfg, log=log)
-            dojo_one(ship, f"|mount %{desk.name}", a.cfg, log=log)
-        out = dojo_one(ship, f"|commit %{desk.name}", a.cfg, timeout=timeout, desk=desk, log=log)
+            dojo_one(ship, f"|unmount %{desk.name}", a.cfg, timeout=timeout, log=log,
+                     interrupt=interrupt)
+            dojo_one(ship, f"|mount %{desk.name}", a.cfg, timeout=timeout, log=log,
+                     interrupt=interrupt)
+        out = dojo_one(ship, f"|commit %{desk.name}", a.cfg, timeout=timeout, desk=desk, log=log,
+                       interrupt=interrupt)
         # the commit itself returns at hood's ack; gall's reloads and build errors follow
         # in later events. Wait for the console to go quiet so they count toward THIS
         # commit's verdict rather than leaking into the next command's transcript.
@@ -1941,7 +2006,7 @@ def cmd_commit(a: Parsed) -> None:
                 out = out + "\n" + late
         ok, verdict, reloaded = commit_verdict(desk, out)
         # a desk that just reloaded an agent is running; only an idle verdict needs +vats
-        if ok and not reloaded and desk_suspended(ship, desk, a.cfg, log):
+        if ok and not reloaded and desk_suspended(ship, desk, a.cfg, timeout, interrupt):
             verdict += (f"\nwarning: %{desk.name} is suspended, so nothing it commits runs. "
                         f"Start it: {INVOKE} {ship.name} dojo '|revive %{desk.name}'")
         return (ok, out, verdict)
@@ -2176,8 +2241,11 @@ def print_detail(ship: Ship, cfg: Config) -> None:
     vere = vere.removeprefix("urbit ").strip() or "-"
     kelvin = "-"
     if st.dojo:
-        m = re.search(r"\d+", dojo_one(ship, "zuse", cfg, log=lambda m: None))
-        kelvin = m.group(0) if m else "?"
+        try:
+            m = re.search(r"\d+", dojo_one(ship, "zuse", cfg, log=lambda m: None))
+            kelvin = m.group(0) if m else "?"
+        except RuntimeError:
+            kelvin = "? (the dojo did not answer; see slog)"
 
     pier_extra = [
         f"port {ship.pier.port}" if ship.pier.port is not None else None,
@@ -2929,15 +2997,21 @@ COMMANDS: list[Cmd] = [
     Cmd(
         name="dojo", summary="run a dojo command and print what it printed",
         flags=[Flag("-t", "int", f"seconds to wait for the dojo and for CMD (default {T_DOJO})", ph="<secs>"),
-               Flag("--yes", "bool", "answer y when CMD asks a (y/N) question")],
+               Flag("--yes", "bool", "answer y when CMD asks a (y/N) question"),
+               Flag("--interrupt", "bool", "past -t, send ONE Ctrl-C to an event still computing; "
+                    "a second interrupt of a timer event exits vere")],
         positionals=[Pos("CMD", True, "the dojo command, quoted as one argument")],
         details=("Type CMD into the ship's dojo and print what came back: the result, then "
                  "everything the ship printed while it ran (~&, +dbug, slogs).\n\n"
                  "Before typing, admiral clears whatever the dojo was left holding: a half-typed "
-                 "line, an unclosed entry, a question nobody answered, an eval still running. A "
-                 "running eval gets -t seconds to finish, then it is aborted. When CMD runs past "
-                 "-t, it is aborted too, and so is a CMD you Ctrl-C. Nothing is left for the next "
-                 "command to trip over.\n\n"
+                 "line, an unclosed entry, a question nobody answered, a thread still running. A "
+                 "running thread gets -t seconds to finish, then it is aborted. When CMD runs a "
+                 "thread past -t, it is aborted too, and so is one you Ctrl-C.\n\n"
+                 "An event still computing (the dojo is mute: an eval, or often a gall agent's "
+                 "timer) is never interrupted. Past -t admiral gives up, says so, and exits "
+                 "nonzero; the event finishes on its own, and slog shows what it is doing. "
+                 "--interrupt sends one Ctrl-C instead, at most once per run: vere redoes an "
+                 "interrupted timer once, and a second interrupt of it exits vere.\n\n"
                  "Effects that come back later are not waited for: |hi is an ames round trip, so "
                  "its answer lands after dojo returns. Read those with slog.\n\n"
                  "What the dojo can't take:\n\n"
@@ -2960,7 +3034,9 @@ COMMANDS: list[Cmd] = [
     Cmd(
         name="commit", summary="sync a desk's source into the ship and |commit it",
         flags=[Flag("--remount", "bool", "|unmount and |mount the desk first, even with nothing to delete"),
-               Flag("-t", "int", f"seconds to wait for the commit and its build (default {T_COMMIT})", ph="<secs>")],
+               Flag("-t", "int", f"seconds to wait for the commit and its build (default {T_COMMIT})", ph="<secs>"),
+               Flag("--interrupt", "bool", "past -t, send ONE Ctrl-C to an event still computing; "
+                    "a second interrupt of a timer event exits vere")],
         positionals=[Pos("desk", True, "a desk from the config's [[desks]] list")],
         details=("Copy the desk's source into the ship's mounted desk (rsync, honoring "
                  ".gitignore, deleting what the source no longer has), then |commit it. The "
@@ -2971,6 +3047,9 @@ COMMANDS: list[Cmd] = [
                  "The last line says what happened: files added (+), deleted (-) and changed "
                  "(:), and the agents that reloaded; or the build error, with a nonzero exit. A "
                  "desk whose agents are suspended gets a warning: what it commits runs nowhere.\n\n"
+                 "-t bounds every dojo wait the commit makes, the checks after it included. An "
+                 "event still computing past -t is not interrupted: the commit fails and says "
+                 "so. See `help dojo` for --interrupt.\n\n"
                  "A new desk:\n\n"
                  f"  {INVOKE} <ship> dojo '|new-desk %mydesk, =gall &'\n"
                  f"  {INVOKE} <ship> dojo '|mount %mydesk'\n"

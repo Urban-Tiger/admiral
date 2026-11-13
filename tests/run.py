@@ -299,11 +299,45 @@ def _(ship, c):
     c.that(dt < 3.0, f"next command took {dt:.1f}s")
 
 
-@case("dojo", "timeout-interrupts-own-computation")
+# one event of a jetted hash: CPU-bound in constant memory, ~1.2 us an iteration. A
+# counting loop allocates on every step and runs the loom out first.
+LONG_EVAL = "(met 3 (pbk:scr:crypto 'pw' 'salt' 200.000.000 32))"  # ~4 minutes
+SHORT_EVAL = "(met 3 (pbk:scr:crypto 'pw' 'salt' 5.000.000 32))"   # ~6 seconds
+
+
+def interrupts(ship):
+    # how many interrupts vere has logged in the console's recent history
+    rc, out, err, _ = admiral(ship, "slog", "-n", "2000")
+    return out.count("dig: intr")
+
+
+def wait_idle(ship, secs=600):
+    # wait out an event the case left computing: a dojo call that finally answers
+    end = time.monotonic() + secs
+    while time.monotonic() < end:
+        rc, out, err, _ = dojo(ship, "(add 0 0)", "-t", "30", timeout=60)
+        if out == "0":
+            return True
+    return False
+
+
+@case("dojo", "timeout-leaves-own-computation")
 def _(ship, c):
-    rc, out, err, dt = dojo(ship, "=|(i=@ |-(?:(=(i 2.000.000.000) i $(i +(i)))))", "-t", "4")
+    # an event past -t is never interrupted: admiral fails, the event finishes
+    before = interrupts(ship)
+    rc, out, err, dt = dojo(ship, SHORT_EVAL, "-t", "1")
     c.that(rc != 0, "timed-out computation reported success")
-    c.that("TIMEOUT" in err and "aborted" in err, f"no abort in {err[:300]!r}")
+    c.that("still computing" in err and "not interrupted" in err, f"{err[:300]!r}")
+    c.that(wait_idle(ship), "the ship never came back")
+    c.that(interrupts(ship) == before, "vere logged an interrupt")
+
+
+@case("dojo", "timeout-interrupt-flag")
+def _(ship, c):
+    rc, out, err, dt = dojo(ship, LONG_EVAL, "-t", "4", "--interrupt")
+    c.that(rc != 0, "timed-out computation reported success")
+    c.that("interrupted the command" in err, f"no interrupt in {err[:300]!r}")
+    c.that(wait_idle(ship), "the ship never came back")
     rc, out, err, dt = dojo(ship, "(add 1 2)")
     c.that(out == "3", f"next command: want 3, got {out!r} {err[-300:]}")
 
@@ -379,11 +413,18 @@ def _(ship, c):
 
 @case("dojo", "left-computation")
 def _(ship, c):
-    type_raw(ship, "=|(i=@ |-(?:(=(i 2.000.000.000) i $(i +(i)))))\r")
+    # an event another driver left computing is waited out, then failed on, never
+    # interrupted
+    before = interrupts(ship)
+    type_raw(ship, SHORT_EVAL + "\r")
     time.sleep(1.0)
-    rc, out, err, dt = dojo(ship, "(add 11 11)", "-t", "3")
+    rc, out, err, dt = dojo(ship, "(add 11 11)", "-t", "1")
+    c.that(rc != 0, f"want a clean failure, got {out!r}")
+    c.that("still computing" in err and "not interrupted" in err, f"not reported: {err!r}")
+    c.that(wait_idle(ship), "the ship never came back")
+    c.that(interrupts(ship) == before, "vere logged an interrupt")
+    rc, out, err, dt = dojo(ship, "(add 11 11)")
     c.that(out == "22", f"want 22, got {out!r} {err[-300:]}")
-    c.that("aborted an event still computing" in err, f"not reported: {err!r}")
 
 
 @case("dojo", "ctrl-c-aborts")

@@ -128,6 +128,99 @@ class CommitVerdict(unittest.TestCase):
         self.assertTrue(line.startswith("commit %admiral-test FAILED: syntax error"), line)
 
 
+class DojoSettle(unittest.TestCase):
+    # dojo_settle and the drive's keys, against a dojo whose verdicts are canned: no
+    # ship, no sleeps. Records every key sent.
+    def setUp(self):
+        self.sent, self.verdicts = [], []
+        self.clock = [0.0]
+        patches = {
+            "dojo_probe": lambda h, s, t: (self.verdicts.pop(0) if len(self.verdicts) > 1
+                                           else self.verdicts[0], 0, ""),
+            "send_data": lambda h, s, d: self.sent.append(d),
+            "ring_mark": lambda h, s: 0,
+            "clear_input": lambda h, s: None,
+        }
+        self.saved = {k: getattr(A, k) for k in patches}
+        for k, v in patches.items():
+            setattr(A, k, v)
+        self.saved_time = A.time
+        clock = self.clock
+
+        class FakeTime:
+            @staticmethod
+            def monotonic():
+                return clock[0]
+
+            @staticmethod
+            def sleep(s):
+                clock[0] += s
+        A.time = FakeTime
+        A._interrupted.clear()
+        self.ship = A.Ship("zod", A.PierConfig())
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(A, k, v)
+        A.time = self.saved_time
+        A._interrupted.clear()
+
+    def settle(self, interrupt=False):
+        logs = []
+        A.dojo_settle(None, self.ship, 10.0, 10, logs.append, interrupt)
+        return logs
+
+    def test_idle_returns(self):
+        self.verdicts = ["idle"]
+        self.settle()
+        self.assertEqual(self.sent, [])
+
+    def test_mute_is_waited_out(self):
+        self.verdicts = ["mute"] * 5 + ["idle"]
+        self.settle()
+        self.assertEqual(self.sent, [])
+
+    def test_mute_past_budget_fails_without_interrupt(self):
+        self.verdicts = ["mute"]
+        with self.assertRaises(RuntimeError) as e:
+            self.settle()
+        self.assertNotIn(A.INTERRUPT, self.sent)
+        self.assertEqual(self.sent, [])
+        self.assertIn("still computing an event after 10s", str(e.exception))
+        self.assertIn("not interrupted", str(e.exception))
+        self.assertIn("zod slog", str(e.exception))
+
+    def test_busy_is_aborted_with_backspace(self):
+        self.verdicts = ["busy"] * 30 + ["idle"]
+        logs = self.settle()
+        self.assertEqual(self.sent, [A.BACKSPACE])
+        self.assertIn("aborted a running thread left in the dojo", logs)
+
+    def test_busy_gives_up_after_two_aborts(self):
+        self.verdicts = ["busy"]
+        with self.assertRaises(RuntimeError):
+            self.settle()
+        self.assertEqual(self.sent, [A.BACKSPACE, A.BACKSPACE])
+
+    def test_interrupt_flag_sends_one_ctrl_c_per_run(self):
+        self.verdicts = ["mute"]
+        with self.assertRaises(RuntimeError) as e:
+            self.settle(interrupt=True)
+        self.assertEqual(self.sent, [A.INTERRUPT])
+        self.assertIn("will not again", str(e.exception))
+        # a second wait in the same run, on the same ship: no second Ctrl-C
+        self.clock[0] = 0.0
+        with self.assertRaises(RuntimeError):
+            self.settle(interrupt=True)
+        self.assertEqual(self.sent, [A.INTERRUPT])
+
+    def test_interrupt_flag_then_idle(self):
+        self.verdicts = ["mute"] * 22 + ["idle"]
+        logs = self.settle(interrupt=True)
+        self.assertEqual(self.sent, [A.INTERRUPT])
+        self.assertTrue(any("--interrupt" in l for l in logs))
+
+
 class DojoText(unittest.TestCase):
     def test_prompt_state(self):
         self.assertEqual(A.prompt_state("~zod:dojo> "), ("idle", ""))

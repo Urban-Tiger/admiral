@@ -1208,6 +1208,16 @@ YES_NO = re.compile(r"\((?:y/N|Y/n|y/n)\)")
 BACKSPACE = "\x7f"  # backs out of an open entry, cancels a question, aborts a thread
 INTERRUPT = "\x03"  # interrupts an arvo event mid-computation; a thread ignores it
 SPINNER = re.compile(r"[|/\\-]\x08")  # vere paints this while an event computes
+# one frame of vere's spinner, labeled with the vane that is working or not: `/«behn»`
+# then a backspace over each character. Frames land after the prompt on its row, and
+# a busy ship paints one every 250 ms, so neither the prompt's text nor the ring's
+# growth means anything until they are taken out.
+SPIN_FRAME = re.compile(r"[|/\\-](?:«[^»\s]{1,16}»)?\x08+")
+
+
+def unspin(raw: str) -> str:
+    # `raw` with every spinner frame taken out
+    return SPIN_FRAME.sub("", raw)
 
 
 def check_dojo_input(command: str) -> None:
@@ -1226,7 +1236,7 @@ def check_dojo_input(command: str) -> None:
 
 def prompt_state(raw: str) -> tuple[str, str] | None:
     # the last prompt painted in `raw`: ("idle" | "open" | "ask", the text after it).
-    for line in reversed(_regex_clean(raw).split("\n")):
+    for line in reversed(_regex_clean(unspin(raw)).split("\n")):
         m = PROMPT_ROW.match(line.strip())
         if m:
             return ({">": "idle", "<": "open", ": ": "ask"}[m.group(1)], m.group(2))
@@ -1521,13 +1531,21 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
             return "\n".join(trim_blank(out))
 
         # completion loop: on bare prompt + quiet (or every 3s on a chatty ship), probe
-        # to confirm the dojo is idle.
+        # to confirm the dojo is idle. Quiet is measured without spinner frames: a ship
+        # whose vanes keep painting one would otherwise never be quiet.
         last_probe, asked_from = 0.0, 0
+        last_seen, waiting, last_verdict = len(unspin(raw)), time.monotonic(), ""
         while time.monotonic() < deadline:
             total, raw = capture_at(host, ship, mark)
             now = time.monotonic()
-            if total != last_total:
-                last_total, last_change = total, now
+            seen = len(unspin(raw))
+            if seen != last_seen:
+                last_seen, last_change = seen, now
+            if now - waiting >= 60:
+                # a long wait says so, so a stuck one is visible before -t runs out
+                waiting = now
+                log(f"still waiting on the dojo after {int(now - t_send)}s: "
+                    + (f"it answers {last_verdict}" if last_verdict else "no bare prompt yet"))
             tail = raw[max(asked_from, len(raw) - 8192):]
             state = prompt_state(tail)
             ask = state
@@ -1569,7 +1587,8 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
                     log("OK")
                     return emit(render_transcript(raw + reaction))
                 # busy, mute, or somebody else's output — not done; re-arm the quiet window.
-                last_total, last_change = ptotal, time.monotonic()
+                last_verdict = verdict
+                last_seen, last_change = len(unspin(raw + reaction)), time.monotonic()
             time.sleep(0.1)
         verdict, _, _ = dojo_probe(host, ship, ring_mark(host, ship))
         if verdict != "idle":
@@ -1895,12 +1914,13 @@ def ring_settle(host: Host, ship: Ship, mark: int, quiet: float = 1.0, limit: fl
     # trails a command's prompt: gall rebuilds a committed desk in events of its own, so
     # its "reloading %app" and build errors can land after the dojo has already returned.
     end = time.monotonic() + limit
-    last_total, last_change = -1, time.monotonic()
+    last_seen, last_change = -1, time.monotonic()
     while True:
         total, raw = capture_at(host, ship, mark)
         now = time.monotonic()
-        if total != last_total:
-            last_total, last_change = total, now
+        seen = len(unspin(raw))
+        if seen != last_seen:
+            last_seen, last_change = seen, now
         if now - last_change >= quiet or now >= end:
             break
         time.sleep(0.1)

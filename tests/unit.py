@@ -229,6 +229,14 @@ class DojoText(unittest.TestCase):
         self.assertEqual(A.prompt_state("~zod:dojo> (add 2 2)\r\n4\r\n~zod:dojo> x"), ("idle", " x"))
         self.assertIsNone(A.prompt_state("no prompt here"))
 
+    def test_prompt_under_spinner_is_bare(self):
+        # vere's spinner paints after the prompt on its row, a frame every 250 ms
+        frames = "".join(f"{c}«ames»" + "\x08" * 7 for c in "|/-\\" * 3)
+        raw = "\x1b[24;1H\x1b[K~zod:dojo> \x1b[u" + frames
+        self.assertEqual(A.prompt_state(raw), ("idle", ""))
+        self.assertEqual(A.unspin("a|\x08b/«behn»\x08\x08\x08\x08\x08\x08\x08c"), "abc")
+        self.assertEqual(A.unspin("[1 2]\n|/-"), "[1 2]\n|/-")
+
     def test_reject_report_points_at_drop(self):
         rep = A.dojo_reject_report("(add 2 2)", "(add 2", "pane")
         self.assertIn("char 7", rep)

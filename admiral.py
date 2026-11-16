@@ -716,10 +716,18 @@ def cook_pty(raw: str, stamps: list[tuple[int, float]], base: int) -> list[str]:
             if text:  # blank + prompt-only redraw rows carry nothing
                 out.append(f"{fmt_stamp(when)}\t{text}")
 
+    # `.idx` offsets count BYTES and `raw` is decoded text, so the segments are cut from
+    # the bytes. Cut from the text, every `«»` in a spinner frame (two bytes, one char
+    # each) moved later cuts two chars on: after a few hundred frames, a line typed at
+    # 12:50 was stamped 12:35, the time of the last read before a quiet stretch. The
+    # incremental decoder carries a character split across a cut into the next chunk.
+    import codecs
+    data = raw.encode("utf-8", "replace")
+    utf8 = codecs.getincrementaldecoder("utf-8")("replace")
     segs = stamps or [(base, time.time())]
     for i, (off, when) in enumerate(segs):
-        end = segs[i + 1][0] if i + 1 < len(segs) else base + len(raw)
-        chunk = raw[max(off - base, 0):max(end - base, 0)]
+        end = segs[i + 1][0] if i + 1 < len(segs) else base + len(data)
+        chunk = utf8.decode(data[max(off - base, 0):max(end - base, 0)])
         if not chunk:
             continue
         stream.feed(chunk)
@@ -1232,6 +1240,19 @@ def unspin(raw: str) -> str:
     return SPIN_FRAME.sub("", raw)
 
 
+# a move to column 1 then erase-line: the row is repainted in place. Vere does this
+# after a spinner frame, with no line feed, measured as
+#   `~zod:dojo> ` ESC[u ESC[39;29H ESC[s `|«behn»` BS*7 ESC[39;1H ESC[K `~zod:dojo> `
+# A regex strip drops both sequences and joins the two paints into one row that reads
+# as a prompt with text after it, so a line break goes where the row restarts.
+REPAINT = re.compile(r"\x1b\[\d*(?:;1?)?H\x1b\[[02]?K")
+
+
+def unrepaint(raw: str) -> str:
+    # `raw` with every in-place row repaint turned into a line break
+    return REPAINT.sub("\n", raw)
+
+
 def check_dojo_input(command: str) -> None:
     # refuse what the dojo cannot take as one typed line, before a keystroke is sent.
     if "\n" in command or "\r" in command:
@@ -1248,7 +1269,7 @@ def check_dojo_input(command: str) -> None:
 
 def prompt_state(raw: str) -> tuple[str, str] | None:
     # the last prompt painted in `raw`: ("idle" | "open" | "ask", the text after it).
-    for line in reversed(_regex_clean(unspin(raw)).split("\n")):
+    for line in reversed(_regex_clean(unrepaint(unspin(raw))).split("\n")):
         m = PROMPT_ROW.match(line.strip())
         if m:
             return ({">": "idle", "<": "open", ": ": "ask"}[m.group(1)], m.group(2))
@@ -1305,6 +1326,30 @@ def dojo_probe(host: Host, ship: Ship, total: int) -> tuple[str, int, str]:
     if BELL in reaction:
         return ("idle", ptotal, reaction)
     return ("mute", ptotal, reaction)
+
+
+REPROBE_QUIET = 5.0  # seconds of a ring printing nothing, spinner frames included,
+# before the drive probes a prompt it does not read as bare (see the completion loop)
+
+
+def prompt_row(state: tuple[str, str] | None) -> str:
+    # a prompt_state result as a log phrase
+    if not state:
+        return "no prompt"
+    kind, text = state
+    return f"{kind}, holding {text.strip()!r}" if text.strip() else f"{kind}, bare"
+
+
+def waiting_why(verdict: str, verdict_age: float, silent_for: float,
+                state: tuple[str, str] | None) -> str:
+    # the "still waiting" line's reason: the last probe and how old it is, then what the
+    # pane shows now. A verdict is a moment, so it is never repeated as the present.
+    probe = f"a probe {int(verdict_age)}s ago read {verdict}" if verdict else "no probe yet"
+    if silent_for < 1.0:
+        now = "the ship is printing or computing"
+    else:
+        now = f"silent {int(silent_for)}s, prompt {prompt_row(state)}"
+    return f"{probe}; {now}"
 
 
 def still_computing(ship: Ship, secs: float, interrupted: bool) -> str:
@@ -1458,7 +1503,9 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
     #   reject   "dojo: failed to process input", or the whole line painted on a quiet
     #            prompt row with no echo behind it.
     #   done     bare prompt + quiet ring, CONFIRMED by the probe. On a chatty ship the
-    #            ring is never quiet, so the probe also fires every 3s.
+    #            ring is never quiet, so the probe also fires every 3s. A ring silent for
+    #            REPROBE_QUIET is probed whatever its prompt reads, and the deadline
+    #            probes once more: the probe decides, not the scrape.
     #
     # A thread is never left behind: a timeout or Ctrl-C aborts it before raising, and a
     # question the command asks is answered (--yes) or cancelled. An event still
@@ -1582,19 +1629,31 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
         # completion loop: on bare prompt + quiet (or every 3s on a chatty ship), probe
         # to confirm the dojo is idle. Quiet is measured without spinner frames: a ship
         # whose vanes keep painting one would otherwise never be quiet.
+        #
+        # The bare prompt is a screen-scrape, and a scrape can be wrong: a repaint
+        # nobody had measured once left a prompt that read as holding text, and the
+        # drive sat 15 minutes on a dojo idle since second 14. So a ring that has
+        # printed nothing at all, spinner frames included, for REPROBE_QUIET is probed
+        # whatever its prompt row reads. A ship mid-event paints a frame every 250 ms;
+        # a silent one is waiting on input, and the probe asks whether that is us.
         last_probe, asked_from = 0.0, 0
         last_seen, waiting, last_verdict = len(unspin(raw)), time.monotonic(), ""
+        last_total, last_any, verdict_at = total, time.monotonic(), 0.0
         while time.monotonic() < deadline:
             total, raw = capture_at(host, ship, mark)
             now = time.monotonic()
             seen = len(unspin(raw))
             if seen != last_seen:
                 last_seen, last_change = seen, now
+            if total != last_total:
+                last_total, last_any = total, now
             if now - waiting >= 60:
-                # a long wait says so, so a stuck one is visible before -t runs out
+                # a long wait says so, so a stuck one is visible before -t runs out. The
+                # verdict is dated: one from minutes ago is history, not the dojo now.
                 waiting = now
                 log(f"still waiting on the dojo after {int(now - t_send)}s: "
-                    + (f"it answers {last_verdict}" if last_verdict else "no bare prompt yet"))
+                    + waiting_why(last_verdict, now - verdict_at, now - last_any,
+                                  prompt_state(raw[-8192:])))
             tail = raw[max(asked_from, len(raw) - 8192):]
             state = prompt_state(tail)
             ask = state
@@ -1627,19 +1686,32 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
             prompt_bare = bool(state) and state[0] == "idle" and not state[1].strip()
             grace = 1.5 if ">=" in raw else 0.25  # effects can trail a poke ack
             quiet_enough = now - last_change >= grace
-            if prompt_bare and (quiet_enough or now - last_probe >= 3.0) and now - last_probe >= 0.8:
+            silent = now - last_any >= REPROBE_QUIET and now - last_probe >= REPROBE_QUIET
+            if (prompt_bare and (quiet_enough or now - last_probe >= 3.0)
+                    and now - last_probe >= 0.8) or silent:
                 verdict, ptotal, reaction = dojo_probe(host, ship, total)
-                last_probe = time.monotonic()
+                last_probe = verdict_at = time.monotonic()
                 if verdict == "idle":
                     # `raw` is exactly [mark, total) and `reaction` exactly [total, ptotal),
                     # so their concatenation is the whole transcript as of now.
+                    if not prompt_bare:
+                        log(f"the prompt row read {prompt_row(state)}, but a probe found "
+                            f"the dojo idle")
                     log("OK")
                     return emit(render_transcript(raw + reaction))
                 # busy, mute, or somebody else's output — not done; re-arm the quiet window.
                 last_verdict = verdict
                 last_seen, last_change = len(unspin(raw + reaction)), time.monotonic()
             time.sleep(0.1)
-        verdict, _, _ = dojo_probe(host, ship, ring_mark(host, ship))
+        # one last probe before giving up: the scrape may have misled the loop, and a
+        # dojo idle now has finished the command, however late admiral noticed
+        total, raw = capture_at(host, ship, mark)
+        verdict, _, reaction = dojo_probe(host, ship, total)
+        if verdict == "idle":
+            log(f"the dojo was idle at the deadline ({timeout}s); its prompt read "
+                f"{prompt_row(prompt_state(raw[-8192:]))}")
+            log("OK")
+            return emit(render_transcript(raw + reaction))
         transcript = tail_n(render_transcript(raw), 30)
         if verdict == "mute":
             if interrupt and dojo_interrupt(host, ship):

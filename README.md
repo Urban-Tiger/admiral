@@ -78,7 +78,8 @@ Two suites:
 
 - `uv run tests/unit.py` — the pure functions (argument parsing, commit
   verdicts, prompt parsing, terminal rendering, config load/write, the engine's
-  framing), no ship needed. CI runs these on every push.
+  framing), no ship needed. CI runs these on every push. `tests/raw` holds console
+  bytes saved from real ships that once fooled the dojo driver.
 - `tests/run.py <ship>` — the live suite against a running ship: the dojo
   driver, commits, attach, and the Playwright harness. The file's header
   explains how to set up the fixture desk in `tests/desk`.

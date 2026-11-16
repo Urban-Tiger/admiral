@@ -100,6 +100,9 @@ class PierConfig:
     path: str | None = None   # pier dir; omit => .piers/<name> (defaulted in pier_dir)
     port: int | None = None   # http bind port on the box
     loom: int | None = None   # loom size (memory pages, power of 2) passed at boot
+    memo: int | None = None   # vere's persistent memo cache, in entries (-M); omit =>
+                              # vere's 50000. clay memoizes every +mint there, and an
+                              # entry can be a big type: cap it on a ship that builds
     ames: int | None = None   # ames UDP port; omit => vere picks one, and a different
                               # one each boot. pin it for ships that must reach each
                               # other: the lane a peer holds for you IS a port, so one
@@ -136,6 +139,7 @@ FIELDS: list[Field] = [
     Field("port", "port", "int", "must be an integer 1-65535", pier=True, hi=65535),
     Field("ames", "ames", "int", "must be an integer 1-65535", pier=True, hi=65535),
     Field("loom", "loom", "int", "must be a positive integer", pier=True),
+    Field("memo", "memo", "int", "must be a positive integer", pier=True),
     Field("local", "local", "bool", "must be a boolean", pier=True),
     Field("persist", "persist", "bool", "must be a boolean", pier=True),
     Field("code", "code", "str", 'must be a +code key (e.g. "ralnyt-botwyc-batnyt-dozzod")',
@@ -398,6 +402,8 @@ def run_argv(ship: Ship, host: Host) -> list[str]:
         cmd += ["-L"]
     if ship.pier.loom is not None:
         cmd += ["--loom", str(ship.pier.loom)]
+    if ship.pier.memo is not None:
+        cmd += ["--keep-cache-limit", str(ship.pier.memo)]
     if ship.pier.port is not None:
         cmd += ["--http-port", str(ship.pier.port)]
     if ship.pier.ames is not None:
@@ -2270,6 +2276,7 @@ def print_detail(ship: Ship, cfg: Config) -> None:
     pier_extra = [
         f"port {ship.pier.port}" if ship.pier.port is not None else None,
         f"loom {ship.pier.loom}" if ship.pier.loom is not None else None,
+        f"memo {ship.pier.memo}" if ship.pier.memo is not None else None,
     ]
     pier_extra = [x for x in pier_extra if x]
     # daemon up == pier held (the daemon owns the urbit child); show the held child PID inline.
@@ -2885,6 +2892,7 @@ FIELD_DOC: dict[str, str] = {
     "port": "the http bind port",
     "ames": "the ames UDP port; pin it so peers' lanes survive a restart",
     "loom": "loom size in memory pages, a power of 2",
+    "memo": "vere's persistent memo cache cap, in entries (default 50000)",
     "local": "boot with -L (fake networking): for a COPIED pier whose original still runs",
     "persist": "come up at boot through a systemd user unit that `run` writes (Linux only)",
 }

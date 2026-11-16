@@ -1995,7 +1995,7 @@ def ring_settle(host: Host, ship: Ship, mark: int, quiet: float = 1.0, limit: fl
     return "\n".join(r for r in rows if r and not DOJO_NOISE.match(r))
 
 
-def cmd_commit(a: Parsed) -> None:
+def cmd_commit(a: Parsed, pick: bool = False) -> None:
     desk = resolve_desk(a.pos[0], a.cfg)
     remount = bool(a.flags.get("--remount"))
     interrupt = bool(a.flags.get("--interrupt"))
@@ -2035,6 +2035,9 @@ def cmd_commit(a: Parsed) -> None:
         if ok and not reloaded and desk_suspended(ship, desk, a.cfg, timeout, interrupt):
             verdict += (f"\nwarning: %{desk.name} is suspended, so nothing it commits runs. "
                         f"Start it: {INVOKE} {ship.name} dojo '|revive %{desk.name}'")
+        if ok and pick:
+            ok, picked = collect_garbage(ship, desk, a.cfg, timeout, log, interrupt)
+            verdict += "\n" + picked
         return (ok, out, verdict)
 
     [r] = fan([ship], a.cfg, work)
@@ -2049,6 +2052,29 @@ def cmd_commit(a: Parsed) -> None:
         sys.stdout.flush()  # the verdict is the LAST line, even through a pipe
     sys.stderr.write(paint(verdict, "green" if ok else "red", is_tty(sys.stderr)) + "\n")
     sys.exit(0 if ok else 1)
+
+
+def collect_garbage(ship: Ship, desk: Desk, cfg: Config, timeout: int, log,
+                    interrupt: bool = False) -> tuple[bool, str]:
+    # clay keeps every old version of every file until a |pick drops the ones its desk's
+    # norm marks as tombstones; it never picks on its own. A norm of `/ |` tombstones
+    # all of the desk's history but the files its latest revision holds. Setting it
+    # again is a no-op, so every commit-pick sets it.
+    lines = []
+    for label, command in ((f"norm %{desk.name}: tombstone all but the latest",
+                            f"|clay/norm our %{desk.name} / |"),
+                           ("pick: old versions freed", "|pick")):
+        out = dojo_one(ship, command, cfg, timeout=timeout, log=log, interrupt=interrupt)
+        errors = [l for l in out.split("\n") if COMMIT_ERROR.match(l)]
+        if errors:
+            lines.append(f"{command} FAILED: " + "\n  ".join(errors[:3]))
+            return (False, "\n".join(lines))
+        lines.append(label)
+    return (True, "\n".join(lines))
+
+
+def cmd_commit_pick(a: Parsed) -> None:
+    cmd_commit(a, pick=True)
 
 
 def cmd_code(a: Parsed) -> None:
@@ -3094,6 +3120,26 @@ COMMANDS: list[Cmd] = [
         run=cmd_commit,
     ),
     Cmd(
+        name="commit-pick", summary="commit a desk, then free clay's old file versions",
+        flags=[Flag("--remount", "bool", "|unmount and |mount the desk first, even with nothing to delete"),
+               Flag("-t", "int", f"seconds to wait for each dojo step (default {T_COMMIT})", ph="<secs>"),
+               Flag("--interrupt", "bool", "past -t, send ONE Ctrl-C to an event still computing; "
+                    "a second interrupt of a timer event exits vere")],
+        positionals=[Pos("desk", True, "a desk from the config's [[desks]] list")],
+        details=("Run `commit`, then collect clay's garbage. Clay keeps every old version of "
+                 "every file of every desk, and never frees one on its own: a ship that "
+                 "commits often runs out of loom.\n\n"
+                 "After a commit that lands, it sets the desk's tombstone norm, so all its "
+                 "history but the latest revision's files may go:\n\n"
+                 "  |clay/norm our %<desk> / |\n\n"
+                 "then runs one |pick, which drops what every desk's norm lets go. Setting the "
+                 "norm again is a no-op. A failed commit picks nothing.\n\n"
+                 "Old revisions of the desk can no longer be read after a pick."),
+        examples=[f"{INVOKE} sampel-palnet commit-pick base"],
+        complete=lambda cfg: [d.name for d in cfg.desks] if cfg else [],
+        run=cmd_commit_pick,
+    ),
+    Cmd(
         name="code", summary="print the ship's +code, its web login",
         flags=[], positionals=[],
         details=("Print +code, the password for the ship's web interface. The config's code "
@@ -3326,7 +3372,7 @@ MENU_GROUPS: list[list[str]] = [
     # group lands in a final group of its own so a new one is never silently hidden.
     ["status"],
     ["run", "exit", "open", "code"],
-    ["attach", "dojo", "commit"],
+    ["attach", "dojo", "commit", "commit-pick"],
     ["engine-upgrade", "vere-upgrade", "chop"],
     ["slog", "exec", "capture"],
 ]

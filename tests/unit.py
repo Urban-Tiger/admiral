@@ -9,6 +9,7 @@
 
 import io
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -304,10 +305,21 @@ class DojoWait(unittest.TestCase):
         self.assertEqual(len(self.probes), 3)
         self.assertLess(self.clock[0], 4 * (A.REPROBE_QUIET + 1))
 
+    def test_misread_prompt_under_a_spinner_is_probed(self):
+        # a misread row on a ring that never goes silent (an agent's spinner): the
+        # REPROBE_EVERY probe finds the dojo idle, at most that late
+        self.script = [(0.0, self.ECHO + self.STALE)] + self.spin(0.5, 900)
+        self.verdicts = ["idle"]
+        self.run_one(900)
+        self.assertEqual(self.logs[-1], "OK")
+        self.assertEqual(len(self.probes), 1)
+        self.assertGreaterEqual(self.probes[0], A.REPROBE_EVERY)
+        self.assertLess(self.probes[0], A.REPROBE_EVERY + 1)
+
     def test_waiting_line_dates_its_verdict(self):
         # one mute probe on a bare prompt, then a misread row under a spinner that
-        # never stops: the minute line dates the verdict and says the ship is busy, and
-        # the deadline's last probe still reads mute
+        # never stops, probed mute every REPROBE_EVERY: the minute line dates the
+        # verdict and says the ship is busy, and the deadline's probe reads mute
         self.script = ([(0.0, self.ECHO + self.PROMPT), (1.5, self.STALE)]
                        + self.spin(2.0, 200))
         self.verdicts = ["mute"]
@@ -316,23 +328,25 @@ class DojoWait(unittest.TestCase):
         self.assertIn("still computing an event after 130s", str(e.exception))
         waits = [l for l in self.logs if l.startswith("still waiting")]
         self.assertEqual(len(waits), 2)
-        self.assertRegex(waits[0], r"after 6\ds: a probe 5\ds ago read mute; "
-                                   r"the ship is printing or computing$")
-        self.assertRegex(waits[1], r"after 12\ds: a probe 11\ds ago read mute; ")
+        for w in waits:
+            m = re.search(r"after \d+s: a probe (\d+)s ago read mute; "
+                          r"the ship is printing or computing$", w)
+            self.assertIsNotNone(m, w)
+            self.assertLessEqual(int(m.group(1)), A.REPROBE_EVERY)
 
     def test_idle_at_the_deadline_is_still_a_timeout(self):
-        # a misread row on a ring that never goes silent (a chatty agent's spinner): no
-        # probe fires in the loop. The deadline's probe finds the dojo idle, and that is
-        # still a TIMEOUT, saying the drive missed the end, never an OK.
+        # a misread row under a spinner, probed mute in the loop, then idle at the
+        # deadline: still a TIMEOUT, saying the drive missed the end, never an OK
         self.script = [(0.0, self.ECHO + self.STALE)] + self.spin(0.5, 200)
-        self.verdicts = ["idle"]
+        self.verdicts = ["mute", "idle"]  # one probe at REPROBE_EVERY, one at 60s
         with self.assertRaises(RuntimeError) as e:
             self.run_one(60)
         self.assertTrue(str(e.exception).startswith("TIMEOUT after 60s\n"), str(e.exception))
         self.assertIn("missed the command's end", str(e.exception))
         self.assertIn("holding '~zod:dojo> stale'", str(e.exception))
         self.assertNotIn("OK", self.logs)
-        self.assertEqual(len(self.probes), 1)
+        self.assertEqual(len(self.probes), 2)
+
 
 class DojoText(unittest.TestCase):
     def test_prompt_state(self):

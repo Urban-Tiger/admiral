@@ -1330,6 +1330,8 @@ def dojo_probe(host: Host, ship: Ship, total: int) -> tuple[str, int, str]:
 
 REPROBE_QUIET = 5.0  # seconds of a ring printing nothing, spinner frames included,
 # before the drive probes a prompt it does not read as bare (see the completion loop)
+REPROBE_EVERY = 30.0  # seconds between probes however the pane reads: a misread on a
+# ring that never goes silent costs at most this, never the whole -t
 
 
 def prompt_row(state: tuple[str, str] | None) -> str:
@@ -1504,8 +1506,8 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
     #            prompt row with no echo behind it.
     #   done     bare prompt + quiet ring, CONFIRMED by the probe. On a chatty ship the
     #            ring is never quiet, so the probe also fires every 3s. A ring silent for
-    #            REPROBE_QUIET is probed whatever its prompt reads: the probe decides,
-    #            not the scrape.
+    #            REPROBE_QUIET, or REPROBE_EVERY since the last probe, is probed whatever
+    #            its prompt reads: the probe decides, the scrape only hurries it.
     #
     # A thread is never left behind: a timeout or Ctrl-C aborts it before raising, and a
     # question the command asks is answered (--yes) or cancelled. An event still
@@ -1636,7 +1638,11 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
         # printed nothing at all, spinner frames included, for REPROBE_QUIET is probed
         # whatever its prompt row reads. A ship mid-event paints a frame every 250 ms;
         # a silent one is waiting on input, and the probe asks whether that is us.
+        # A ring that never goes silent (an agent's spinner, ames chatter) is probed
+        # every REPROBE_EVERY all the same. A probe typed mid-event is harmless: the key
+        # queues, and the dojo bells it away once the event ends.
         last_probe, asked_from = 0.0, 0
+        loop_start = time.monotonic()
         last_seen, waiting, last_verdict = len(unspin(raw)), time.monotonic(), ""
         last_total, last_any, verdict_at = total, time.monotonic(), 0.0
         while time.monotonic() < deadline:
@@ -1687,8 +1693,9 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
             grace = 1.5 if ">=" in raw else 0.25  # effects can trail a poke ack
             quiet_enough = now - last_change >= grace
             silent = now - last_any >= REPROBE_QUIET and now - last_probe >= REPROBE_QUIET
+            overdue = now - max(last_probe, loop_start) >= REPROBE_EVERY
             if (prompt_bare and (quiet_enough or now - last_probe >= 3.0)
-                    and now - last_probe >= 0.8) or silent:
+                    and now - last_probe >= 0.8) or silent or overdue:
                 verdict, ptotal, reaction = dojo_probe(host, ship, total)
                 last_probe = verdict_at = time.monotonic()
                 if verdict == "idle":

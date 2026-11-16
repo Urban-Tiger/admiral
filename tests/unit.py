@@ -9,6 +9,7 @@
 
 import io
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -20,6 +21,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import admiral as A  # noqa: E402
 import harness as H  # noqa: E402
+
+
+RAW = Path(__file__).resolve().parent / "raw"  # console bytes saved from real ships
 
 
 def cmd(flags=(), positionals=()):
@@ -221,6 +225,129 @@ class DojoSettle(unittest.TestCase):
         self.assertTrue(any("--interrupt" in l for l in logs))
 
 
+class DojoWait(unittest.TestCase):
+    # dojo_one's completion loop against a scripted console: `script` is (time, bytes)
+    # the fake ring has printed by then, and the probe's verdicts are canned. A fake
+    # clock, so a 900s wait takes no time. Each probe takes 1s, as a mute one does.
+    PROMPT = "\r\n\x1b[K\x1b[u~zod:dojo> \x1b[u"
+
+    def setUp(self):
+        self.clock, self.script, self.verdicts, self.probes = [0.0], [], [], []
+        ring = lambda: "".join(b for t, b in self.script if t <= self.clock[0])
+
+        def probe(h, s, total):
+            self.probes.append(self.clock[0])
+            self.clock[0] += 1.0
+            v = self.verdicts.pop(0) if len(self.verdicts) > 1 else self.verdicts[0]
+            return (v, total, A.BELL if v == "idle" else "")
+        patches = {
+            "host_for": lambda s, c: None,
+            "daemon_status": lambda h, s: "up",
+            "guard_port": lambda h, s: None,
+            "dojo_ready": lambda *a: None,
+            "ring_mark": lambda h, s: 0,
+            "capture_at": lambda h, s, off: (len(ring()), ring()[off:]),
+            "send_data": lambda h, s, d: None,
+            "dojo_probe": probe,
+        }
+        self.saved = {k: getattr(A, k) for k in patches}
+        for k, v in patches.items():
+            setattr(A, k, v)
+        self.saved_time = A.time
+        clock = self.clock
+
+        class FakeTime:
+            @staticmethod
+            def monotonic():
+                return clock[0]
+
+            @staticmethod
+            def sleep(s):
+                clock[0] += s
+        A.time = FakeTime
+        self.ship = A.Ship("zod", A.PierConfig())
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(A, k, v)
+        A.time = self.saved_time
+
+    ECHO = "~zod:dojo> |commit %x\r\n> |commit %x"
+    STALE = PROMPT + "~zod:dojo> stale"  # a row that reads as a prompt holding text
+
+    def spin(self, start, secs):
+        # vere's spinner: a frame every 250 ms from `start` for `secs`
+        return [(start + i / 4, "|«behn»" + "\x08" * 7) for i in range(int(secs * 4))]
+
+    def run_one(self, timeout):
+        self.logs = []
+        return A.dojo_one(self.ship, "|commit %x", None, timeout=timeout, log=self.logs.append)
+
+    def test_misread_prompt_on_a_silent_ring_is_probed(self):
+        # the incident's shape: the event computes with the row misread, then the ring
+        # goes silent. One probe on the silence finds the dojo idle, long before -t.
+        self.script = [(0.0, self.ECHO + self.PROMPT + ">=" + self.STALE)] + self.spin(0.5, 14)
+        self.verdicts = ["idle"]
+        self.run_one(900)
+        self.assertEqual(self.logs, ["the prompt row read idle, holding '~zod:dojo> stale', "
+                                     "but a probe found the dojo idle", "OK"])
+        self.assertEqual(len(self.probes), 1)
+        last_frame = self.script[-1][0]
+        self.assertGreaterEqual(self.probes[0], last_frame + A.REPROBE_QUIET)
+        self.assertLess(self.probes[0], last_frame + A.REPROBE_QUIET + 1)
+
+    def test_silent_probes_repeat(self):
+        # a silent ring that probes mute (a key queued behind something that paints
+        # nothing) is probed again every REPROBE_QUIET, not once
+        self.script = [(0.0, self.ECHO + self.STALE)]
+        self.verdicts = ["mute", "mute", "idle"]
+        self.run_one(900)
+        self.assertEqual(len(self.probes), 3)
+        self.assertLess(self.clock[0], 4 * (A.REPROBE_QUIET + 1))
+
+    def test_misread_prompt_under_a_spinner_is_probed(self):
+        # a misread row on a ring that never goes silent (an agent's spinner): the
+        # REPROBE_EVERY probe finds the dojo idle, at most that late
+        self.script = [(0.0, self.ECHO + self.STALE)] + self.spin(0.5, 900)
+        self.verdicts = ["idle"]
+        self.run_one(900)
+        self.assertEqual(self.logs[-1], "OK")
+        self.assertEqual(len(self.probes), 1)
+        self.assertGreaterEqual(self.probes[0], A.REPROBE_EVERY)
+        self.assertLess(self.probes[0], A.REPROBE_EVERY + 1)
+
+    def test_waiting_line_dates_its_verdict(self):
+        # one mute probe on a bare prompt, then a misread row under a spinner that
+        # never stops, probed mute every REPROBE_EVERY: the minute line dates the
+        # verdict and says the ship is busy, and the deadline's probe reads mute
+        self.script = ([(0.0, self.ECHO + self.PROMPT), (1.5, self.STALE)]
+                       + self.spin(2.0, 200))
+        self.verdicts = ["mute"]
+        with self.assertRaises(RuntimeError) as e:
+            self.run_one(130)
+        self.assertIn("still computing an event after 130s", str(e.exception))
+        waits = [l for l in self.logs if l.startswith("still waiting")]
+        self.assertEqual(len(waits), 2)
+        for w in waits:
+            m = re.search(r"after \d+s: a probe (\d+)s ago read mute; "
+                          r"the ship is printing or computing$", w)
+            self.assertIsNotNone(m, w)
+            self.assertLessEqual(int(m.group(1)), A.REPROBE_EVERY)
+
+    def test_idle_at_the_deadline_is_still_a_timeout(self):
+        # a misread row under a spinner, probed mute in the loop, then idle at the
+        # deadline: still a TIMEOUT, saying the drive missed the end, never an OK
+        self.script = [(0.0, self.ECHO + self.STALE)] + self.spin(0.5, 200)
+        self.verdicts = ["mute", "idle"]  # one probe at REPROBE_EVERY, one at 60s
+        with self.assertRaises(RuntimeError) as e:
+            self.run_one(60)
+        self.assertTrue(str(e.exception).startswith("TIMEOUT after 60s\n"), str(e.exception))
+        self.assertIn("missed the command's end", str(e.exception))
+        self.assertIn("holding '~zod:dojo> stale'", str(e.exception))
+        self.assertNotIn("OK", self.logs)
+        self.assertEqual(len(self.probes), 2)
+
+
 class DojoText(unittest.TestCase):
     def test_prompt_state(self):
         self.assertEqual(A.prompt_state("~zod:dojo> "), ("idle", ""))
@@ -236,6 +363,29 @@ class DojoText(unittest.TestCase):
         self.assertEqual(A.prompt_state(raw), ("idle", ""))
         self.assertEqual(A.unspin("a|\x08b/«behn»\x08\x08\x08\x08\x08\x08\x08c"), "abc")
         self.assertEqual(A.unspin("[1 2]\n|/-"), "[1 2]\n|/-")
+
+    def test_prompt_repainted_in_place_is_bare(self):
+        # tests/raw/groups-wait.raw is a ship's console, byte for byte, from `|commit
+        # %gnat-dms` to `|commit %gnat-board`. After the groups commit, vere painted a
+        # spinner frame and repainted the prompt over it with no line feed, and the row
+        # read as a prompt holding `~ship:dojo>`. The drive never probed again and timed
+        # out after 900s on a dojo idle the whole time.
+        raw = RAW.joinpath("groups-wait.raw").read_bytes().decode("utf-8")
+        start = raw.index("> |commit %gnat-groups")
+        row = "\x1b[K~migrev-migrev-dolseg:dojo> \x1b[u"
+        end = raw.rindex(row, start, raw.index("|commit %gnat-board")) + len(row)
+        self.assertEqual(A.prompt_state(raw[start:end]), ("idle", ""))
+        # every cut through the window: a repaint never reads as text on the prompt
+        for cut in range(start, raw.index("|commit %gnat-board")):
+            state = A.prompt_state(raw[start:cut])
+            if state and state[0] == "idle":
+                self.assertNotIn("dojo>", state[1], raw[cut - 80:cut])
+        # the measured shape, and a move to mid-row that is NOT a repaint
+        frame = "|«behn»" + "\x08" * 7
+        self.assertEqual(A.prompt_state(f"~zod:dojo> \x1b[u\x1b[39;29H\x1b[s{frame}"
+                                        f"\x1b[39;1H\x1b[K~zod:dojo> \x1b[u"), ("idle", ""))
+        self.assertEqual(A.prompt_state("~zod:dojo> \x1b[H\x1b[2K~zod:dojo> "), ("idle", ""))
+        self.assertEqual(A.prompt_state("~zod:dojo> ab\x1b[39;13Hc"), ("idle", " abc"))
 
     def test_reject_report_points_at_drop(self):
         rep = A.dojo_reject_report("(add 2 2)", "(add 2", "pane")
@@ -283,6 +433,20 @@ class Render(unittest.TestCase):
         self.assertEqual([l.split("\t")[1] for l in out], ["line one", "line two", "line three"])
         self.assertEqual([l.split("\t")[0] for l in out],
                          [A.fmt_stamp(t0), A.fmt_stamp(t1), A.fmt_stamp(t1)])
+
+    def test_cook_pty_cuts_segments_by_byte(self):
+        # `.idx` offsets count bytes, and a spinner frame's `«»` is two bytes a char.
+        # Cut by char, each frame moved the cut two chars on, so after a quiet stretch
+        # a line written at 12:50 was stamped 12:35, the last read before the silence.
+        frames = ("|«behn»" + "\x08" * 7) * 40  # 80 bytes more than chars
+        early = f"line one\r\n~zod:dojo> {frames}\r\n"
+        late = "|commit %x\r\n~zod:dojo> \r\n"
+        t0, t1 = 1_700_000_000.0, 1_700_000_900.0
+        out = A.cook_pty(early + late, [(0, t0), (len(early.encode()), t1)], 0)
+        self.assertEqual(out[-1], f"{A.fmt_stamp(t1)}\t|commit %x")
+        # a cut through the middle of a two-byte char loses nothing
+        out = A.cook_pty("«a»\r\nb\r\n", [(0, t0), (1, t1)], 0)
+        self.assertEqual([l.split("\t")[1] for l in out], ["«a»", "b"])
 
     def test_fmt_stamp(self):
         self.assertRegex(A.fmt_stamp(time.time()), r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}$")

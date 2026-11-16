@@ -1504,8 +1504,8 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
     #            prompt row with no echo behind it.
     #   done     bare prompt + quiet ring, CONFIRMED by the probe. On a chatty ship the
     #            ring is never quiet, so the probe also fires every 3s. A ring silent for
-    #            REPROBE_QUIET is probed whatever its prompt reads, and the deadline
-    #            probes once more: the probe decides, not the scrape.
+    #            REPROBE_QUIET is probed whatever its prompt reads: the probe decides,
+    #            not the scrape.
     #
     # A thread is never left behind: a timeout or Ctrl-C aborts it before raising, and a
     # question the command asks is answered (--yes) or cancelled. An event still
@@ -1703,15 +1703,10 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
                 last_verdict = verdict
                 last_seen, last_change = len(unspin(raw + reaction)), time.monotonic()
             time.sleep(0.1)
-        # one last probe before giving up: the scrape may have misled the loop, and a
-        # dojo idle now has finished the command, however late admiral noticed
-        total, raw = capture_at(host, ship, mark)
-        verdict, _, reaction = dojo_probe(host, ship, total)
-        if verdict == "idle":
-            log(f"the dojo was idle at the deadline ({timeout}s); its prompt read "
-                f"{prompt_row(prompt_state(raw[-8192:]))}")
-            log("OK")
-            return emit(render_transcript(raw + reaction))
+        # a timeout is a timeout, whatever the last probe reads: an idle dojo here
+        # means the drive missed the end, and when is unknown, so the command's result
+        # is not vouched for. The probe only says which failure it was.
+        verdict, _, _ = dojo_probe(host, ship, ring_mark(host, ship))
         transcript = tail_n(render_transcript(raw), 30)
         if verdict == "mute":
             if interrupt and dojo_interrupt(host, ship):
@@ -1721,9 +1716,12 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
                                + transcript)
         if verdict == "busy":
             dojo_abort(host, ship)
+        missed = (f"the dojo is idle now, so admiral missed the command's end: its prompt "
+                  f"read {prompt_row(prompt_state(raw[-8192:]))}.\nCheck the result by hand; "
+                  f"this is an admiral bug worth reporting with the slog.\n")
         raise RuntimeError(f"TIMEOUT after {timeout}s"
                            + (" — aborted the command" if verdict == "busy" else "") + "\n"
-                           + transcript)
+                           + (missed if verdict == "idle" else "") + transcript)
     except KeyboardInterrupt:
         # Ctrl-C or SIGTERM: leave the dojo as we found it. A thread still running is
         # aborted; one typed but not taken is wiped off the row. An event still

@@ -320,16 +320,19 @@ class DojoWait(unittest.TestCase):
                                    r"the ship is printing or computing$")
         self.assertRegex(waits[1], r"after 12\ds: a probe 11\ds ago read mute; ")
 
-    def test_idle_at_the_deadline_is_done(self):
-        # a misread row on a ring that never goes silent (a chatty agent's spinner):
-        # no probe fires in the loop, and the deadline's probe finds the command done
+    def test_idle_at_the_deadline_is_still_a_timeout(self):
+        # a misread row on a ring that never goes silent (a chatty agent's spinner): no
+        # probe fires in the loop. The deadline's probe finds the dojo idle, and that is
+        # still a TIMEOUT, saying the drive missed the end, never an OK.
         self.script = [(0.0, self.ECHO + self.STALE)] + self.spin(0.5, 200)
         self.verdicts = ["idle"]
-        self.run_one(60)
-        self.assertEqual(self.logs[-1], "OK")
-        self.assertIn("idle at the deadline (60s)", self.logs[-2])
+        with self.assertRaises(RuntimeError) as e:
+            self.run_one(60)
+        self.assertTrue(str(e.exception).startswith("TIMEOUT after 60s\n"), str(e.exception))
+        self.assertIn("missed the command's end", str(e.exception))
+        self.assertIn("holding '~zod:dojo> stale'", str(e.exception))
+        self.assertNotIn("OK", self.logs)
         self.assertEqual(len(self.probes), 1)
-
 
 class DojoText(unittest.TestCase):
     def test_prompt_state(self):

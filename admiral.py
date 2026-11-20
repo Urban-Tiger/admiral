@@ -500,21 +500,12 @@ def resolve_ship(name: str, cfg: Config) -> Ship:
     return ship
 
 
-def select_ships(selector: str | None, cfg: Config) -> list[Ship]:
-    # None only from a bare `admiral`, which shows the status of every ship.
-    if selector is None:
-        return cfg.ships
-    return [resolve_ship(selector, cfg)]
-
-
 def resolve_desk(name: str, cfg: Config) -> Desk:
     if not cfg.desks:
         raise RuntimeError(
             f'{CONFIG} has no desks — nothing to commit. '
             f'Add a [[desks]] entry to enable committing.'
         )
-    if not name:
-        return cfg.desks[0]
     desk = next((d for d in cfg.desks if d.name == name), None)
     if not desk:
         raise RuntimeError(
@@ -558,7 +549,7 @@ def shq(s: str) -> str:
 # ssh connection multiplexing: the FIRST exec to a host opens a master connection;
 # every later exec within ControlPersist reuses it over the existing socket. This
 # is what makes the ~9 probes/ship a status run fires cost one handshake. Every
-# flag is bounded so one unreachable/auth-prompting host can't wedge a fan forever.
+# flag is bounded so one unreachable/auth-prompting host can't wedge status forever.
 # The control socket name is DERIVED from this file's stem, never hardcoded.
 SSH_MUX = [
     "-o", "BatchMode=yes",
@@ -1858,56 +1849,14 @@ def fetch_code(ship: Ship, cfg: Config, log: Callable[[str], None] | None = None
     return m.group(0)
 
 
-# ── fan: run a per-ship fn across selected ships in parallel ──────────────────
-@dataclass
-class FanResult:
-    ship: str
-    ok: bool
-    log: str
-    value: Any = None
-    err: str | None = None
-
-
-def fan(ships: list[Ship], cfg: Config,
-        fn: Callable[[Ship, Host, Callable[[str], None]], Any]) -> list[FanResult]:
-    def work(ship: Ship) -> FanResult:
-        host = host_for(ship, cfg)
-        lines: list[str] = []
-        log = lambda m: lines.append(m)
-        try:
-            value = fn(ship, host, log)
-            return FanResult(ship.name, True, "\n".join(lines), value=value)
-        except Exception as e:
-            return FanResult(ship.name, False, "\n".join(lines), err=str(e))
-    # one ship runs inline, so Ctrl-C lands in its own thread and can clean up.
-    if len(ships) == 1:
-        return [work(ships[0])]
-    with ThreadPoolExecutor(max_workers=max(1, min(16, len(ships)))) as ex:
-        return list(ex.map(work, ships))
-
-
-def fan_exit(results: list[FanResult]) -> int:
-    # the one exit-code rule for every fanned command: nonzero iff any ship failed.
-    return 1 if any(not r.ok for r in results) else 0
-
-
-def report(results: list[FanResult], header: Any = None) -> int:
-    # the one printer for a fanned command: status log + errors -> stderr, each ship's
-    # output -> stdout. With several ships a `=== ship: x ===` line precedes each; it
-    # goes to `header` (stderr by default, so stdout stays the bare output; slog and
-    # capture put it on stdout so a grep over many ships keeps its labels). Returns the
-    # exit code.
-    header = header or sys.stderr
-    many = len(results) > 1
-    for r in results:
-        if many:
-            header.write(f"=== ship: {r.ship} ===\n")
-        err = "\n".join(x for x in [r.log, "" if r.ok else (r.err or "")] if x)
-        if err:
-            sys.stderr.write(err + "\n")
-        if r.ok and r.value:
-            sys.stdout.write(r.value.rstrip("\n") + "\n")
-    return fan_exit(results)
+# ── on_ship: every command but status acts on the one ship it names ──────────
+def on_ship(a: Parsed, fn: Callable[[Ship, Host, Callable[[str], None]], str | None]) -> None:
+    # run fn against the named ship: its progress log goes to stderr as it happens, what
+    # it returns to stdout. A failure raises to main, which prints it and exits 1.
+    ship = resolve_ship(a.selector, a.cfg)
+    out = fn(ship, host_for(ship, a.cfg), lambda m: sys.stderr.write(m + "\n"))
+    if out:
+        sys.stdout.write(out.rstrip("\n") + "\n")
 
 
 # ── probes: read a ship's actual state (read-only) ────────────────────────────
@@ -2118,7 +2067,7 @@ def cmd_dojo(a: Parsed) -> None:
         return truncate_output(dojo_one(ship, command, a.cfg, timeout=timeout, log=log, yes=yes,
                                         interrupt=interrupt), ship)
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 COMMIT_ERROR = re.compile(r"^(crud: |syntax error|bail: |-find\.|-mint|nest-fail|mint-|"
@@ -2225,13 +2174,7 @@ def cmd_commit(a: Parsed, pick: bool = False) -> None:
             verdict += "\n" + picked
         return (ok, out, verdict)
 
-    [r] = fan([ship], a.cfg, work)
-    if r.log:
-        sys.stderr.write(r.log + "\n")
-    if not r.ok:
-        sys.stderr.write((r.err or "") + "\n")
-        sys.exit(1)
-    ok, out, verdict = r.value
+    ok, out, verdict = work(ship, host_for(ship, a.cfg), lambda m: sys.stderr.write(m + "\n"))
     if out:
         sys.stdout.write(out + "\n")
         sys.stdout.flush()  # the verdict is the LAST line, even through a pipe
@@ -2263,9 +2206,7 @@ def cmd_commit_pick(a: Parsed) -> None:
 
 
 def cmd_code(a: Parsed) -> None:
-    results = fan(select_ships(a.selector, a.cfg), a.cfg,
-                  lambda ship, host, log: fetch_code(ship, a.cfg, log))
-    sys.exit(report(results))
+    on_ship(a, lambda ship, host, log: fetch_code(ship, a.cfg, log))
 
 
 def login_page(base: str, code: str, path: str) -> str:
@@ -2302,7 +2243,7 @@ def cmd_open(a: Parsed) -> None:
             raise RuntimeError(f"no browser could be opened — sign in at {base}/~/login with code {code}")
         return f"opened {base}{path}, signed in"
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 def cmd_exec(a: Parsed) -> None:
@@ -2317,8 +2258,7 @@ def cmd_exec(a: Parsed) -> None:
         cmd = command.replace("{pier}", pier_dir(ship, host)).replace("{root}", host.root)
         return host.exec("sh", ["-c", cmd], timeout_ms=timeout * 1000).rstrip("\n")
 
-    results = fan(select_ships(a.selector, a.cfg), a.cfg, work)
-    sys.exit(report(results))
+    on_ship(a, work)
 
 
 def cmd_slog(a: Parsed) -> None:
@@ -2354,7 +2294,7 @@ def cmd_slog(a: Parsed) -> None:
 
     if follow:
         return slog_follow(a, work)
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work), header=sys.stdout))
+    on_ship(a, work)
 
 
 def parse_since(s: str) -> float:
@@ -2368,10 +2308,7 @@ def slog_follow(a: Parsed, work) -> None:
     # poll-and-print. The tee is a FILE, so following it is just re-syncing the
     # watermark — no subscription, no reconnect, and it resumes cleanly across a
     # daemon restart because the file (and our offset into it) outlive the process.
-    ships = select_ships(a.selector, a.cfg)
-    if len(ships) != 1:
-        die("slog -f: follow one ship at a time")
-    ship = ships[0]
+    ship = resolve_ship(a.selector, a.cfg)
     host = host_for(ship, a.cfg)
     seen = 0
     try:
@@ -2389,8 +2326,6 @@ def slog_follow(a: Parsed, work) -> None:
 
 
 def cmd_capture(a: Parsed) -> None:
-    # routed through the one scheduler so capture handles + reports per-ship
-    # failures like every other multi-ship command.
     nlines = a.flags.get("-n") or 0
 
     def work(ship, host, log):
@@ -2400,7 +2335,7 @@ def cmd_capture(a: Parsed) -> None:
             return tail_n(capture_pane(host, ship, LINE_BYTES * nlines).rstrip("\n"), nlines)
         return capture_pane(host, ship)  # the daemon's whole scrollback ring buffer
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work), header=sys.stdout))
+    on_ship(a, work)
 
 
 def cmd_status(a: Parsed) -> None:
@@ -2409,27 +2344,32 @@ def cmd_status(a: Parsed) -> None:
     cfg = a.cfg
     if a.selector is not None:
         return print_detail(resolve_ship(a.selector, cfg), cfg)
-    ships = select_ships(None, cfg)
-    results = fan(ships, cfg,
-                  lambda ship, host, log: probe_ship(ship, cfg, host))
+    ships = cfg.ships
+
+    def probe(ship: Ship) -> ShipState | Exception:
+        try:
+            return probe_ship(ship, cfg, host_for(ship, cfg))
+        except Exception as e:
+            return e
+    with ThreadPoolExecutor(max_workers=min(16, len(ships))) as ex:
+        results = list(ex.map(probe, ships))  # in config order
     print_status(ships, results, cfg)
-    sys.exit(fan_exit(results))
+    sys.exit(1 if any(isinstance(r, Exception) for r in results) else 0)
 
 
-def print_status(ships: list[Ship], results: list[FanResult], cfg: Config) -> None:
+def print_status(ships: list[Ship], results: list[ShipState | Exception], cfg: Config) -> None:
     # One card per ship: the live signals (STATE / version / daemon / dojo / http)
     # joined with the static config inventory (host:port, pier, code) — everything
     # knowable about a ship in one place. A card (not a wide table) so a long pier
-    # path can't push the line past 80 cols. fan() preserves input order, so ships
-    # zip 1:1 with results.
+    # path can't push the line past 80 cols. results zip 1:1 with ships; an Exception
+    # is a ship whose probe failed.
     on = is_tty(sys.stdout)
 
     def ver_cell(v: ShipState) -> str:
         return engine_cell(v, on) if v.daemon else paint("-", "red", on)
 
     namew = max((len(s.name) for s in ships), default=0)
-    statew = max((len(r.value.verdict) for r in results if r.ok and r.value),
-                 default=0)
+    statew = max((len(r.verdict) for r in results if isinstance(r, ShipState)), default=0)
     statew = max(statew, len("error"))
 
     out: list[str] = ["", f"  {paint('config', 'gray', on)} {REPO / CONFIG}", ""]
@@ -2438,12 +2378,12 @@ def print_status(ships: list[Ship], results: list[FanResult], cfg: Config) -> No
         host_cell = f"{host.name}:{ship.pier.port}" if ship.pier.port is not None else host.name
         pier = pier_rel(ship)
         code = "set" if ship.code else "live"
-        v: ShipState | None = r.value if (r.ok and r.value is not None) else None
+        v = r if isinstance(r, ShipState) else None
 
         # pad the PLAIN verdict to width, then color, so ANSI codes never skew it.
         word = v.verdict if v else "error"
         state = verdict_color(word, on) + " " * (statew - len(word))
-        ver = ver_cell(v) if v else paint(f"error: {r.err or ''}", "red", on)
+        ver = ver_cell(v) if v else paint(f"error: {r}", "red", on)
         signals = (f"daemon {sig(v.daemon, on)}   dojo {sig(v.dojo, on)}   http {sig(v.http, on)}"
                    if v else "daemon -   dojo -   http -")
 
@@ -2602,7 +2542,7 @@ def cmd_latency(a: Parsed) -> None:
         origin = re.sub(r":\d+$", "", (ship.http or "http://localhost").rstrip("/"))
         return f"{brief}   {origin}:{ship.latency_port}"
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 def cmd_attach(a: Parsed) -> None:
@@ -2800,7 +2740,7 @@ def cmd_run(a: Parsed) -> None:
         st = daemon_start(ship, host)
         return f"running (daemon {st[0]} child {st[1]})" + run_latency(ship, host)
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 def run_latency(ship: Ship, host: Host) -> str:
@@ -2837,7 +2777,7 @@ def reconcile_unit(ship: Ship, host: Host, log: Callable[[str], None]) -> str:
         systemctl(host, "daemon-reload")
     return ""
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 def cmd_exit(a: Parsed) -> None:
@@ -2851,7 +2791,7 @@ def cmd_exit(a: Parsed) -> None:
         eng(host, ship, "__kill", check=False)
         return "exited"
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 def cmd_engine_upgrade(a: Parsed) -> None:
@@ -2883,7 +2823,7 @@ def cmd_engine_upgrade(a: Parsed) -> None:
         raise RuntimeError(f"engine did not swap (still v{running}); the daemon's .log says why — "
                            f"`{INVOKE} {ship.name} exit` then `run` restarts it onto the new tool")
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 def event_log_dir(ship: Ship, host: Host) -> str:
@@ -2990,7 +2930,7 @@ def cmd_chop(a: Parsed) -> None:
 
         return offline(ship, host, log, "chop", op)
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 def cmd_vere_upgrade(a: Parsed) -> None:
@@ -3009,7 +2949,7 @@ def cmd_vere_upgrade(a: Parsed) -> None:
 
         return offline(ship, host, log, "next", op)
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 # ── shell tab-completion (hidden subcommands) ─────────────────────────────────

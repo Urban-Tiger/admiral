@@ -563,20 +563,21 @@ class Engine(unittest.TestCase):
         self.assertEqual(A.pty_read(FakeHost({"python3": "0 0 0\n"}, ssh=None), ship, 0), (0, 0, [], ""))
         self.assertEqual(A.pty_read(FakeHost(ssh=None), ship, 0), (0, 0, [], ""))
 
-    def test_report_routes_streams(self):
+    def test_on_ship_routes_streams(self):
         import contextlib
-        results = [A.FanResult("a", True, "note", value="out\n"), A.FanResult("b", False, "", err="boom"),
-                   A.FanResult("c", True, "", value="")]
+        cfg = A.Config(ships=[A.Ship("zod", A.PierConfig())], desks=[], hosts={})
+        a = A.Parsed(cmd=None, selector="~zod", cfg=cfg, flags={}, pos=[])
+
+        def work(ship, host, log):
+            log(f"note {ship.name} {host.name}")
+            return "out\n"
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = A.report(results, header=sys.stdout)
-        self.assertEqual(code, 1)
-        self.assertEqual(out.getvalue(), "=== ship: a ===\nout\n=== ship: b ===\n=== ship: c ===\n")
-        self.assertEqual(err.getvalue(), "note\nboom\n")
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            self.assertEqual(A.report(results[:1]), 0)
-        self.assertEqual((out.getvalue(), err.getvalue()), ("out\n", "note\n"))
+            A.on_ship(a, work)
+            A.on_ship(a, lambda ship, host, log: "")
+        self.assertEqual((out.getvalue(), err.getvalue()), ("out\n", "note zod local\n"))
+        with self.assertRaises(RuntimeError):
+            A.on_ship(a, lambda ship, host, log: (_ for _ in ()).throw(RuntimeError("boom")))
 
     def test_vere_argv(self):
         ship = A.Ship("zod", A.PierConfig(path="/p"))
@@ -1030,10 +1031,9 @@ class Resolution(unittest.TestCase):
         with self.assertRaises(RuntimeError) as cm:
             A.resolve_ship("bus", self.cfg)
         self.assertIn("zod, nec", str(cm.exception))
-        self.assertEqual(A.select_ships(None, self.cfg), self.cfg.ships)
 
     def test_desks(self):
-        self.assertIs(A.resolve_desk("", self.cfg), self.cfg.desks[0])
+        self.assertIs(A.resolve_desk("other", self.cfg), self.cfg.desks[1])
         with self.assertRaises(RuntimeError):
             A.resolve_desk("nope", self.cfg)
         with self.assertRaises(RuntimeError):

@@ -47,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # ── identity ──────────────────────────────────────────────────────────────────
 # Name is hardcoded to "admiral". SELF is the script's real on-disk path (the rsync
@@ -126,7 +126,7 @@ class PierConfig:
 class Field:
     key: str                  # TOML key ("master-ticket")
     attr: str                 # attribute on Ship (or on PierConfig when pier)
-    kind: str                 # "str" | "int" | "bool" | "ms" (an int, or a string of digits)
+    kind: str                 # "str" | "int" | "bool" | "latency" (the { ms, port } table)
     hint: str                 # what a good value looks like; the error for a bad one
     pier: bool = False        # lives in the ship's `pier = { ... }` table
     lo: int = 1               # int range, inclusive
@@ -150,8 +150,7 @@ FIELDS: list[Field] = [
           ok=lambda s: bool(TICKET_RE.match(s))),
     Field("mnemonic", "mnemonic", "str", "must be a space-separated word list (BIP39 mnemonic)",
           ok=lambda s: bool(MNEMONIC_RE.match(s))),
-    Field("latency", "latency", "ms", 'must be milliseconds, e.g. 1000 or "1000"', lo=0, hi=600000),
-    Field("latency-port", "latency_port", "int", "must be an integer 1-65535", hi=65535),
+    Field("latency", "latency", "latency", "see latency_error"),
 ]
 # every key `pier = { ... }` may carry. Config load rejects anything else — see load_config.
 PIER_KEYS = frozenset(f.key for f in FIELDS if f.pier)
@@ -166,13 +165,39 @@ def field_error(f: Field, v: Any) -> str | None:
         bad = not isinstance(v, int) or isinstance(v, bool) or v < f.lo or v > f.hi
     elif f.kind == "bool":
         bad = not isinstance(v, bool)
-    elif f.kind == "ms":
-        n = v if isinstance(v, int) and not isinstance(v, bool) else (
-            int(v) if isinstance(v, str) and v.strip().isdigit() else None)
-        bad = n is None or n < f.lo or n > f.hi
+    elif f.kind == "latency":
+        return latency_error(v)
     else:
         bad = not isinstance(v, str) or (f.ok is not None and not f.ok(v))
     return f"{f.hint}, got {v!r}" if bad else None
+
+
+LATENCY_FORM = "latency = { ms = 1000, port = 8080 }"
+LATENCY_MS_MAX = 600000
+
+
+def latency_error(v: Any) -> str | None:
+    # why `latency` is not a { ms, port } table admiral can run a proxy from, or None.
+    # Both keys are required; ms 0 is a proxy turned off (none runs).
+    def is_int(x: Any) -> bool:
+        return isinstance(x, int) and not isinstance(x, bool)
+    if not isinstance(v, dict):
+        ms = v if is_int(v) else (int(v) if isinstance(v, str) and v.strip().isdigit() else None)
+        form = LATENCY_FORM if ms is None else f"latency = {{ ms = {ms}, port = <port> }}"
+        return f"is a table now, with the proxy's port: write {form}, got {v!r}"
+    unknown = sorted(set(v) - {"ms", "port"})
+    if unknown:
+        return f"has unknown key(s) {', '.join(unknown)} (known: ms, port): write {LATENCY_FORM}"
+    ms, port = v.get("ms"), v.get("port")
+    if ms is None:
+        return f"needs ms, the round trip in milliseconds: write {LATENCY_FORM}"
+    if not is_int(ms) or not 0 <= ms <= LATENCY_MS_MAX:
+        return f"ms must be an integer 0-{LATENCY_MS_MAX} (the round trip), got {ms!r}"
+    if port is None:
+        return f"needs port, where the proxy listens (there is no default): write {LATENCY_FORM}"
+    if not is_int(port) or not 1 <= port <= 65535:
+        return f"port must be an integer 1-65535, got {port!r}"
+    return None
 
 
 def field_get(ship: "Ship", f: Field) -> Any:
@@ -183,7 +208,7 @@ def make_ship(name: str, host: str | None, values: dict[str, Any]) -> "Ship":
     # a Ship from field values keyed by attr; a missing or empty value is unset.
     pier = PierConfig(**{f.attr: (bool(values.get(f.attr)) if f.kind == "bool" else values.get(f.attr))
                          for f in FIELDS if f.pier})
-    return Ship(name=name, pier=pier, host=host,
+    return Ship(name=name, pier=pier, host=host, latency_port=values.get("latency_port"),
                 **{f.attr: values.get(f.attr) or None for f in FIELDS if not f.pier})
 
 @dataclass
@@ -195,8 +220,8 @@ class Ship:
     code: str | None = None   # optional +code override; skips the live dojo read
     master_ticket: str | None = None  # ship master ticket (key material; for boot)
     mnemonic: str | None = None       # BIP39 mnemonic seed phrase (key material)
-    latency: int | None = None        # ms of round trip the latency proxy adds (see DelayProxy)
-    latency_port: int | None = None   # where the proxy listens; omit => pier.port + 8000
+    latency: int | None = None        # ms of round trip the latency proxy adds (see DelayProxy); None = no proxy
+    latency_port: int | None = None   # where the proxy listens; latency.port, required with latency
 
 
 @dataclass
@@ -311,13 +336,22 @@ def load_config(file: Path | None = None) -> Config:
             raise RuntimeError(
                 f'{CONFIG}: ships["{sname}"].pier has unknown key(s) {", ".join(unknown)} '
                 f'(known: {", ".join(sorted(PIER_KEYS))})')
+        if "latency-port" in ship:
+            raise RuntimeError(f'{CONFIG}: ships["{sname}"].latency-port is gone: the port goes in the '
+                               f'latency table, {LATENCY_FORM}')
         values: dict[str, Any] = {}
         for f in FIELDS:
             v = (pier if f.pier else ship).get(f.key)
             err = field_error(f, v)
             if err:
                 raise RuntimeError(f'{CONFIG}: ships["{sname}"].{"pier." if f.pier else ""}{f.key} {err}')
-            values[f.attr] = int(v) if f.kind == "ms" and isinstance(v, str) else v
+            values[f.attr] = v
+        lat = values.pop("latency", None)
+        if lat is not None:
+            if lat["port"] == values.get("port"):
+                raise RuntimeError(f'{CONFIG}: ships["{sname}"].latency.port {lat["port"]} is the ship\'s '
+                                   f'own http port; the proxy needs a port of its own')
+            values["latency"], values["latency_port"] = lat["ms"] or None, lat["port"]
         ships.append(make_ship(sname, host, values))
 
     desks: list[Desk] = []
@@ -912,28 +946,23 @@ def daemon_status(host: Host, ship: Ship) -> tuple[int, int, str] | None:
         return None
 
 
-LATENCY_SINCE = (0, 2, 0)  # the first engine whose daemon has the latency proxy
-LATENCY_DEFAULT = 1000     # ms `latency on` uses when the config sets none
-LATENCY_PORT_OFFSET = 8000  # default proxy port: the ship's + this (80 -> 8080)
+LATENCY_SINCE = (0, 2, 0)       # the first engine whose daemon has the latency proxy
+LATENCY_STOP_SINCE = (0, 2, 1)  # the first that can stop it (C_LATENCY "stop")
 
 
-def engine_has_latency(version: str | None) -> bool:
+def engine_has_latency(version: str | None, since: tuple[int, ...] = LATENCY_SINCE) -> bool:
     try:
-        return tuple(int(x) for x in (version or "").split(".")) >= LATENCY_SINCE
+        return tuple(int(x) for x in (version or "").split(".")) >= since
     except ValueError:
         return False
 
 
-def latency_port(ship: Ship) -> int:
-    if ship.latency_port is not None:
-        return ship.latency_port
-    if ship.pier.port is None:
-        raise RuntimeError(f'ship "{ship.name}" has no pier.port for the latency proxy to sit in front of')
-    port = ship.pier.port + LATENCY_PORT_OFFSET
-    if port > 65535:
-        raise RuntimeError(f'ship "{ship.name}": port {ship.pier.port} + {LATENCY_PORT_OFFSET} is past '
-                           f'65535; set latency-port')
-    return port
+def latency_want(ship: Ship) -> str:
+    # the proxy state (DelayProxy.state) this ship's config asks for: "none", or
+    # "<listen> <target> <ms>"
+    if not ship.latency or ship.latency_port is None or ship.pier.port is None:
+        return "none"
+    return f"{ship.latency_port} {ship.pier.port} {ship.latency}"
 
 
 def daemon_latency(host: Host, ship: Ship, msg: str = "") -> str | None:
@@ -958,16 +987,20 @@ def latency_brief(state: str | None) -> str | None:
     return f"{ms}ms :{listen} -> :{target}" if ms else f"off :{listen} -> :{target} (direct)"
 
 
-def latency_apply(host: Host, ship: Ship, ms: int) -> str:
-    # start (or retune) the proxy at `ms`; its brief, or raise with the daemon's reason
-    if ship.pier.port is None:
-        raise RuntimeError(f'ship "{ship.name}" has no pier.port for the latency proxy to sit in front of')
-    got = daemon_latency(host, ship, f"set {latency_port(ship)} {ship.pier.port} {ms}")
+def latency_apply(host: Host, ship: Ship, msg: str | None = None) -> str:
+    # put the daemon's proxy where the config says (or send `msg`): its brief, or raise
+    # with the daemon's reason
+    if msg is None:
+        if ship.latency and ship.pier.port is None:
+            raise RuntimeError(f'ship "{ship.name}" has no pier.port for the latency proxy to sit in front of')
+        want = latency_want(ship)
+        msg = "stop" if want == "none" else f"set {want}"
+    got = daemon_latency(host, ship, msg)
     if got is None:
         raise RuntimeError("the daemon did not answer")
     if got.startswith("error"):
         raise RuntimeError(got.removeprefix("error").strip())
-    return latency_brief(got) or got
+    return latency_brief(got) or "none"
 
 
 def pier_exists(host: Host, ship: Ship) -> bool:
@@ -2529,38 +2562,45 @@ def print_detail(ship: Ship, cfg: Config) -> None:
 
 
 def latency_detail(ship: Ship, st: ShipState) -> str:
-    # the live proxy, else what the config would start
-    if st.latency:
-        return st.latency
-    want = f"config {ship.latency}ms" if ship.latency else ""
-    if st.daemon and not engine_has_latency(st.version):
-        return ", ".join(x for x in [want, "engine too old: engine-upgrade"] if x)
-    return f"none ({want}; `latency on` starts it)" if want and st.daemon else (want or "none")
+    # the live proxy, and whether it is what the config asks for
+    want = latency_want(ship)
+    wanted = latency_brief(want)
+    if not st.daemon:
+        return f"config {wanted}" if wanted else "none"
+    if not engine_has_latency(st.version):
+        return f"config {wanted}, engine too old: engine-upgrade" if wanted else "none"
+    live = st.latency or "none"
+    if live == (wanted or "none"):
+        return live
+    return f"{live} (config: {wanted or 'none'}; `latency reload` applies it)"
 
 
 def cmd_latency(a: Parsed) -> None:
-    # show or set the latency proxy in front of the ship's http port; see DelayProxy
-    setting = a.pos[0] if a.pos else None
-    if setting is not None and setting not in ("on", "off") and not setting.isdigit():
-        raise UsageError(a.cmd, f"expected on, off, or a number of ms; got {setting!r}")
+    # bring a running daemon's latency proxy to what the config says: start it, change
+    # its ms or port, or stop it. Config is the only setting; see DelayProxy.
+    if a.pos[0] != "reload":
+        raise UsageError(a.cmd, f"expected reload; got {a.pos[0]!r} (the config sets latency: {LATENCY_FORM})")
 
     def work(ship, host, log):
         st = daemon_status(host, ship)
         if st is None:
-            raise RuntimeError(f"not running — `{INVOKE} {ship.name} run` first")
+            raise RuntimeError(f"not running — `{INVOKE} {ship.name} run` starts it with its proxy")
         assert_port_match(host, ship, st)
+        upgrade = (f"`{INVOKE} {ship.name} engine-upgrade` swaps in v{VERSION} in place "
+                   f"(urbit is not restarted)")
         if not engine_has_latency(st[2]):
-            raise RuntimeError(
-                f"its daemon runs engine v{st[2]}, which has no latency proxy. "
-                f"`{INVOKE} {ship.name} engine-upgrade` swaps in v{VERSION} in place "
-                f"(urbit is not restarted)")
-        if setting is None:
-            return latency_brief(daemon_latency(host, ship)) or (
-                f"no proxy (`{INVOKE} {ship.name} latency on` starts one on :{latency_port(ship)})")
-        ms = 0 if setting == "off" else (ship.latency or LATENCY_DEFAULT) if setting == "on" else int(setting)
-        brief = latency_apply(host, ship, ms)
+            raise RuntimeError(f"its daemon runs engine v{st[2]}, which has no latency proxy. {upgrade}")
+        want = latency_want(ship)
+        if want == "none":
+            if (daemon_latency(host, ship) or "none") == "none":
+                return "no proxy (the config sets none)"
+            if not engine_has_latency(st[2], LATENCY_STOP_SINCE):
+                raise RuntimeError(f"its daemon runs engine v{st[2]}, which can't stop the proxy. {upgrade}")
+            latency_apply(host, ship)
+            return "proxy stopped (the config sets none)"
+        brief = latency_apply(host, ship)
         origin = re.sub(r":\d+$", "", (ship.http or "http://localhost").rstrip("/"))
-        return f"{brief}   {origin}:{latency_port(ship)}"
+        return f"{brief}   {origin}:{ship.latency_port}"
 
     sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
@@ -2769,7 +2809,7 @@ def run_latency(ship: Ship, host: Host) -> str:
     if not ship.latency:
         return ""
     try:
-        return f", latency {latency_apply(host, ship, ship.latency)}"
+        return f", latency {latency_apply(host, ship)}"
     except Exception as e:
         return f"\n  latency proxy not started: {e}"
 
@@ -3124,9 +3164,10 @@ FIELD_DOC: dict[str, str] = {
     "memo": "vere's persistent memo cache cap, in entries (default 50000)",
     "local": "boot with -L (fake networking): for a COPIED pier whose original still runs",
     "persist": "come up at boot through a systemd user unit that `run` writes (Linux only)",
-    "latency": "ms of round trip a proxy in front of the ship adds, like a hosted ship's; "
-               "`run` turns it on (see help latency)",
-    "latency-port": "where that proxy listens; default the http port + 8000 (80 -> 8080)",
+    "latency": "a proxy in front of the ship's http port that adds a hosted ship's round "
+               "trip: { ms = 1000, port = 8080 }, both required (port is where it listens; "
+               "ms 0 is none). `run` starts it; `latency reload` applies a change to a "
+               "running ship (see help latency)",
 }
 
 
@@ -3137,7 +3178,7 @@ def cmd_configure(a: Parsed) -> None:
     color = is_tty(sys.stderr)
     bold = lambda s: paint(s, "bold", color)
     gray = lambda s: paint(s, "gray", color)
-    kinds = {"str": "string", "int": "integer", "bool": "bool", "ms": "milliseconds"}
+    kinds = {"str": "string", "int": "integer", "bool": "bool", "latency": "table"}
     keys = ["host", *(f.key for f in FIELDS if not f.pier), *(f.key for f in FIELDS if f.pier)]
     w = max(len(k) for k in keys)
 
@@ -3497,28 +3538,26 @@ COMMANDS: list[Cmd] = [
         run=cmd_capture,
     ),
     Cmd(
-        name="latency", summary="put a hosted ship's latency in front of its http port",
-        flags=[], positionals=[Pos("setting", False, "on, off, or a round trip in ms (none: show it)")],
-        details=("A proxy the ship's daemon runs on a port beside the ship's, so a local ship "
-                 "feels like one in the cloud. Point the browser at the proxy's port: every "
-                 "request costs the round trip, half on the way in and half on the way out "
-                 "(±20%). A streamed response (eyre's channel, an SSE page stream, a websocket) "
-                 "stays open, and each chunk arrives that half later, in order. Requests in "
-                 "flight overlap: it is latency, not bandwidth. The proxy forwards bytes as they "
-                 "are, so headers, cookies, Host and redirects pass untouched and login works "
-                 "through it. The ship's own port never moves and the ship never restarts.\n\n"
-                 "  on      start it, or turn it back on, at the config's latency (default "
-                 f"{LATENCY_DEFAULT})\n"
-                 "  off     keep the port, forward directly\n"
-                 "  <ms>    set the round trip\n\n"
-                 "In the ship's table:\n\n"
-                 "  latency = \"1000\"       # ms; run starts the proxy\n"
-                 f"  latency-port = 8080    # default: the http port + {LATENCY_PORT_OFFSET}\n\n"
-                 "status shows it. It needs engine v0.2.0; engine-upgrade swaps an older daemon "
-                 "in place."),
-        examples=[f"{INVOKE} sampel-palnet latency on", f"{INVOKE} sampel-palnet latency 300",
-                  f"{INVOKE} sampel-palnet latency off"],
-        complete=lambda cfg: ["on", "off"],
+        name="latency", summary="apply the config's latency proxy to a running ship",
+        flags=[], positionals=[Pos("action", True, "reload: bring the running proxy to the config")],
+        details=("The config sets a proxy in front of the ship's http port, so a local ship "
+                 "feels like one in the cloud:\n\n"
+                 f"  {LATENCY_FORM}    # round trip in ms; the port it listens on\n\n"
+                 "Both keys are required. No latency key, or ms = 0, is no proxy. `run` starts "
+                 "it with a fresh daemon. `latency reload` brings a running daemon to the "
+                 "config: it starts the proxy, changes its ms or port, or stops it. Nothing "
+                 "else sets it.\n\n"
+                 "Point the browser at the proxy's port: every request costs the round trip, "
+                 "half on the way in and half on the way out (±20%). A streamed response "
+                 "(eyre's channel, an SSE page stream, a websocket) stays open, and each chunk "
+                 "arrives that half later, in order. Requests in flight overlap: it is latency, "
+                 "not bandwidth. The proxy forwards bytes as they are, so headers, cookies, Host "
+                 "and redirects pass untouched and login works through it. The ship's own port "
+                 "never moves and the ship never restarts.\n\n"
+                 "status shows it. It needs engine v0.2.0 (v0.2.1 to stop it); engine-upgrade "
+                 "swaps an older daemon in place."),
+        examples=[f"{INVOKE} sampel-palnet latency reload"],
+        complete=lambda cfg: ["reload"],
         run=cmd_latency,
     ),
     Cmd(
@@ -3745,7 +3784,8 @@ def cmd_help(name: str | None = None) -> None:
 HDR = struct.Struct("!BI")
 C_ATTACH, C_DATA, C_WINCH, C_PING, C_KILL, C_UPGRADE = 1, 2, 3, 5, 6, 7  # 4 was whole-ring capture
 C_CAPTURE_AT = 8  # capture ring bytes past a caller-held watermark (0 = the whole ring)
-C_LATENCY = 9     # the latency proxy: "" asks its state, "set <listen> <target> <ms>" sets it
+C_LATENCY = 9     # the latency proxy: "" asks its state, "set <listen> <target> <ms>" sets it,
+                  # "stop" closes its port (v0.2.1)
 S_DATA, S_EXIT, S_SNAPSHOT, S_PONG = 1, 2, 3, 4
 S_SNAPSHOT_AT = 5  # reply to C_CAPTURE_AT: 8-byte total-bytes-written + the requested tail
 S_LATENCY = 6      # reply to C_LATENCY: DelayProxy.state() text, or "error <why>"
@@ -3955,10 +3995,12 @@ class DelayProxy:
 
     def control(self, msg: str) -> str:
         # "" -> the state; "set <listen> <target> <ms>" -> (re)configure, then the state;
-        # failures come back as "error <why>"
+        # "stop" -> close the port ("none"); failures come back as "error <why>"
         parts = msg.split()
         if not parts:
             return self.state()
+        if parts == ["stop"]:
+            return self.stop()
         if parts[0] != "set" or len(parts) != 4:
             return f"error bad latency control {msg!r}"
         try:
@@ -3985,6 +4027,17 @@ class DelayProxy:
                 return f"error can't serve :{listen}: {e}"
             self.listen = listen
         self.target, self.ms = target, max(0, ms)
+        return self.state()
+
+    def stop(self) -> str:
+        # stop accepting; connections already open finish on their own
+        if self.server is not None and self.loop is not None:
+            async def close() -> None:
+                self.server.close()
+            asyncio.run_coroutine_threadsafe(close(), self.loop).result(5)
+            self.server = None
+        self.listen = self.target = None
+        self.ms = 0
         return self.state()
 
     @staticmethod
@@ -4314,8 +4367,11 @@ def engine_serve(path: str, master: int, pid: int, listen: socket.socket, ring: 
                         got = proxy.control(payload.decode("utf-8", "replace"))
                         if payload and not got.startswith("error"):
                             try:
-                                with open(path + ".latency", "w") as f:
-                                    f.write(got + "\n")
+                                if got == "none":
+                                    os.unlink(path + ".latency")
+                                else:
+                                    with open(path + ".latency", "w") as f:
+                                        f.write(got + "\n")
                             except OSError:
                                 pass
                         safe(c, S_LATENCY, got.encode())

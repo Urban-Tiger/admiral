@@ -698,30 +698,65 @@ class ConfigFile(unittest.TestCase):
 
 
 class LatencyConfig(ConfigFile):
-    def test_latency_is_ms_as_number_or_string(self):
-        self.assertEqual(self.load('[ships.zod]\nlatency = "1000"\n').ships[0].latency, 1000)
-        self.assertEqual(self.load('[ships.zod]\nlatency = 250\n').ships[0].latency, 250)
-        self.assertIsNone(self.load('[ships.zod]\n').ships[0].latency)
-        for bad in ('"1s"', '-5', 'true', '"x"'):
-            with self.assertRaises(RuntimeError, msg=bad) as cm:
-                self.load(f"[ships.zod]\nlatency = {bad}\n")
-            self.assertIn("milliseconds", str(cm.exception))
-
-    def test_latency_port_defaults_beside_the_ship(self):
+    def test_latency_is_a_table_with_ms_and_port(self):
+        ship = self.load('[ships.zod]\nlatency = { ms = 1000, port = 8080 }\npier = { port = 80 }\n').ships[0]
+        self.assertEqual((ship.latency, ship.latency_port), (1000, 8080))
+        self.assertEqual(A.latency_want(ship), "8080 80 1000")
         ship = self.load('[ships.zod]\npier = { port = 80 }\n').ships[0]
-        self.assertEqual(A.latency_port(ship), 8080)
-        ship = self.load('[ships.zod]\nlatency-port = 9000\npier = { port = 80 }\n').ships[0]
-        self.assertEqual(A.latency_port(ship), 9000)
-        with self.assertRaises(RuntimeError):
-            A.latency_port(self.load('[ships.zod]\npier = { port = 60000 }\n').ships[0])
+        self.assertIsNone(ship.latency)
+        self.assertEqual(A.latency_want(ship), "none")
+        ship = self.load('[ships.zod]\nlatency = { ms = 0, port = 8080 }\npier = { port = 80 }\n').ships[0]
+        self.assertIsNone(ship.latency)  # ms 0: no proxy
+        self.assertEqual(A.latency_want(ship), "none")
+
+    def test_the_old_string_form_is_refused_naming_the_table(self):
+        for old in ('"1000"', "1000"):
+            with self.assertRaises(RuntimeError, msg=old) as cm:
+                self.load(f"[ships.zod]\nlatency = {old}\n")
+            self.assertIn("latency = { ms = 1000, port = <port> }", str(cm.exception))
+        with self.assertRaises(RuntimeError) as cm:
+            self.load('[ships.zod]\nlatency = { ms = 1000, port = 9000 }\nlatency-port = 9000\n')
+        self.assertIn("latency-port is gone", str(cm.exception))
+
+    def test_the_port_is_required(self):
+        with self.assertRaises(RuntimeError) as cm:
+            self.load('[ships.zod]\nlatency = { ms = 1000 }\npier = { port = 80 }\n')
+        self.assertIn("needs port", str(cm.exception))
+        self.assertIn(A.LATENCY_FORM, str(cm.exception))
+
+    def test_bad_tables(self):
+        for bad, why in (('{ port = 8080 }', "needs ms"),
+                         ('{ ms = "1000", port = 8080 }', "ms must be"),
+                         ('{ ms = -5, port = 8080 }', "ms must be"),
+                         ('{ ms = 1000, port = 0 }', "port must be"),
+                         ('{ ms = 1000, port = true }', "port must be"),
+                         ('{ ms = 1000, port = 8080, jitter = 1 }', "unknown key")):
+            with self.assertRaises(RuntimeError, msg=bad) as cm:
+                self.load(f"[ships.zod]\nlatency = {bad}\npier = {{ port = 80 }}\n")
+            self.assertIn(why, str(cm.exception), bad)
+        with self.assertRaises(RuntimeError) as cm:
+            self.load('[ships.zod]\nlatency = { ms = 1000, port = 80 }\npier = { port = 80 }\n')
+        self.assertIn("own http port", str(cm.exception))
 
     def test_engine_gate_and_brief(self):
         self.assertFalse(A.engine_has_latency("0.1.0"))
         self.assertTrue(A.engine_has_latency("0.2.0"))
+        self.assertFalse(A.engine_has_latency("0.2.0", A.LATENCY_STOP_SINCE))
+        self.assertTrue(A.engine_has_latency(A.VERSION, A.LATENCY_STOP_SINCE))
         self.assertFalse(A.engine_has_latency(None))
         self.assertIsNone(A.latency_brief("none"))
         self.assertEqual(A.latency_brief("8080 80 1000"), "1000ms :8080 -> :80")
         self.assertEqual(A.latency_brief("8080 80 0"), "off :8080 -> :80 (direct)")
+
+    def test_detail_says_when_live_differs_from_config(self):
+        ship = self.load('[ships.zod]\nlatency = { ms = 1000, port = 8080 }\npier = { port = 80 }\n').ships[0]
+        st = lambda latency, version=A.VERSION: A.ShipState(
+            "zod", "local", True, False, False, True, [], "up", True, True, False, 80,
+            version=version, latency=latency)
+        self.assertEqual(A.latency_detail(ship, st("1000ms :8080 -> :80")), "1000ms :8080 -> :80")
+        self.assertIn("latency reload", A.latency_detail(ship, st("300ms :8080 -> :80")))
+        self.assertIn("latency reload", A.latency_detail(ship, st(None)))
+        self.assertIn("engine-upgrade", A.latency_detail(ship, st(None, "0.1.0")))
 
 
 class StubHandler(BaseHTTPRequestHandler):
@@ -851,6 +886,20 @@ class Latency(unittest.TestCase):
         self.assertEqual(data, b"hello")
         self.assertLess(took, 0.1)
 
+    def test_stop_closes_the_port(self):
+        p = A.DelayProxy()
+        port = free_port()
+        self.assertEqual(p.control(f"set {port} {self.target} 50"), f"{port} {self.target} 50")
+        socket.create_connection(("127.0.0.1", port), timeout=2).close()
+        self.assertEqual(p.control("stop"), "none")
+        with self.assertRaises(OSError):
+            socket.create_connection(("127.0.0.1", port), timeout=2).close()
+        self.assertEqual(p.control("stop"), "none")  # stopping no proxy is fine
+        # and it starts again, on another port
+        port2 = free_port()
+        self.assertEqual(p.control(f"set {port2} {self.target} 50"), f"{port2} {self.target} 50")
+        p.control("stop")
+
     def test_control_errors(self):
         self.assertTrue(self.proxy.control("set x y z").startswith("error"))
         self.assertTrue(self.proxy.control(f"set {self.target} {self.target} 5").startswith("error"))
@@ -891,6 +940,9 @@ class LatencyDaemon(unittest.TestCase):
                 self.assertEqual(A.engine_ping(sock)[0], pid)  # same process, new image
                 self.assertEqual(A.sock_latency(sock), want)
                 socket.create_connection(("127.0.0.1", port), timeout=2).close()  # listening again
+                self.assertEqual(A.sock_latency(sock, "stop"), "none")
+                self.assertFalse(os.path.exists(sock + ".latency"))  # an upgrade won't bring it back
+                self.assertEqual(A.sock_latency(sock, f"set {port} {target} 300"), want)
                 A.sock_request(sock, A.C_KILL)
                 proc.wait(15)
                 self.assertFalse(os.path.exists(sock + ".latency"))

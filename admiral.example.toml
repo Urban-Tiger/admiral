@@ -13,9 +13,9 @@ pier = { path = "piers/sampel-palnet", port = 8080 }
 # mnemonic = "word word word word word word"
 # master-ticket = "~sampel-ticket-sampel-ticket"
 # code = "lidlut-tabwed-pillex-ridrup"      # +code, without the ~
-# latency = "1000"     # ms of round trip a proxy adds in front of the ship, like a
-#                      # hosted one; `run` starts it. Browse via latency-port.
-# latency-port = 16080 # where the proxy listens; default the http port + 8000
+# latency = { ms = 1000, port = 16080 }  # a proxy in front of the ship that adds a
+#                      # hosted one's round trip (ms), listening on port; both required.
+#                      # `run` starts it; `latency reload` applies a change live.
 
 # a desk admiral syncs from a source dir with `./admiral.py <ship> commit <name>`
 [[desks]]

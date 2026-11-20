@@ -39,21 +39,25 @@ Admiral finds its config by climbing from the current directory to the first
 ## Latency
 
 A ship on your laptop answers in a millisecond; a hosted one doesn't. To feel
-that while you test, admiral's daemon can run a proxy beside the ship's http
-port that delays traffic each way:
-
-```
-./admiral.py <ship> latency on      # at the config's latency (default 1000ms)
-./admiral.py <ship> latency 300     # change it live
-./admiral.py <ship> latency off     # the port stays; traffic goes straight through
-```
+that while you test, give the ship a `latency` table, and admiral's daemon runs
+a proxy beside the ship's http port that delays traffic each way:
 
 ```toml
 [ships.sampel-palnet]
 pier = { port = 80 }
-latency = "1000"       # ms of round trip; `run` starts the proxy
-latency-port = 8080    # default: the http port + 8000
+latency = { ms = 1000, port = 8080 }   # round trip in ms; the port the proxy listens on
 ```
+
+Both keys are required. No `latency` key, or `ms = 0`, means no proxy. Like
+every other setting it lives only in the config: `run` starts the proxy with a
+fresh daemon, and on a ship that is already running
+
+```
+./admiral.py <ship> latency reload
+```
+
+brings the proxy to the config: it starts it, changes its ms or port, or stops
+it.
 
 Browse the ship at the proxy's port. A request pays half the round trip on
 the way in and half on the way out (±20%); a streamed response (eyre's
@@ -61,7 +65,8 @@ channel, SSE, a websocket) stays open and each chunk arrives that half later,
 in order. Requests overlap, as on a real network. The proxy forwards bytes as
 they are, so headers, cookies and redirects pass untouched and login works
 through it. The ship's own port never moves. `status` shows the proxy. It
-needs engine v0.2.0: `engine-upgrade` swaps an older daemon in place.
+needs engine v0.2.0, and v0.2.1 to stop it: `engine-upgrade` swaps an older
+daemon in place.
 
 ## Playwright harness
 

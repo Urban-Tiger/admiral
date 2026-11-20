@@ -475,7 +475,7 @@ class Render(unittest.TestCase):
     def test_parse_since(self):
         self.assertEqual(A.parse_since("5m"), 300)
         self.assertEqual(A.parse_since(" 2h "), 7200)
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(A.UsageError):
             A.parse_since("soon")
 
 
@@ -1063,6 +1063,58 @@ class Resolution(unittest.TestCase):
         c = cmd([A.Flag("-t", "int", "", ph="<secs>"), A.Flag("--yes", "bool", "")],
                 [A.Pos("CMD", True, ""), A.Pos("more", False, "", variadic=True)])
         self.assertEqual(A.usage_line(c), "Usage: ./admiral.py <ship> x [-t <secs>] [--yes] <CMD> [more...]")
+
+
+class ExitCodes(unittest.TestCase):
+    # the CLI run for real, in a scratch dir holding its own config
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        (self.dir / "admiral.toml").write_text('[ships.zod]\npier = { path = "p", port = 18080 }\n')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def cli(self, *args):
+        import subprocess
+        r = subprocess.run([sys.executable, str(Path(A.__file__)), *args], cwd=self.dir,
+                           capture_output=True, text=True, timeout=60)
+        return r.returncode, r.stdout, r.stderr
+
+    def test_help_and_configure_write_stdout(self):
+        for args in (["help"], ["help", "run"], ["configure"]):
+            code, out, err = self.cli(*args)
+            self.assertEqual((code, err), (0, ""), args)
+            self.assertGreater(len(out), 200, args)
+
+    def test_usage(self):
+        self.assertEqual(self.cli("zod", "nope")[0], A.EXIT_USAGE)
+        self.assertEqual(self.cli("zod", "dojo")[0], A.EXIT_USAGE)  # missing argument
+        self.assertEqual(self.cli("help", "nope")[0], A.EXIT_USAGE)
+        self.assertEqual(self.cli("run")[0], A.EXIT_USAGE)  # needs a ship first
+
+    def test_config(self):
+        (self.dir / "admiral.toml").write_text("[ships.zod]\npier = { colour = 1 }\n")
+        code, _, err = self.cli("zod", "exit")
+        self.assertEqual(code, A.EXIT_CONFIG, err)
+        (self.dir / "admiral.toml").write_text("not toml [")
+        self.assertEqual(self.cli("zod", "exit")[0], A.EXIT_CONFIG)
+
+    def test_down_and_refused(self):
+        code, _, err = self.cli("zod", "dojo", "(add 2 2)")
+        self.assertEqual(code, A.EXIT_DOWN, err)
+        self.assertEqual(self.cli("zod", "dojo", "a\nb")[0], A.EXIT_REFUSED)
+        self.assertEqual(self.cli("zod", "attach")[0], A.EXIT_DOWN)
+
+    def test_classes_carry_their_codes(self):
+        self.assertEqual(A.Timeout("x").exit_code, A.EXIT_TIMEOUT)
+        self.assertEqual(A.Refused("x").exit_code, A.EXIT_REFUSED)
+        self.assertEqual(len({n for n, _ in A.EXIT_CODES}), len(A.EXIT_CODES))
+
+    def test_readme_lists_every_code(self):
+        readme = (Path(A.__file__).parent / "README.md").read_text()
+        for n, _ in A.EXIT_CODES:
+            self.assertIn(f"| {n} |", readme)
 
 
 if __name__ == "__main__":

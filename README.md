@@ -36,6 +36,24 @@ cp admiral.example.toml admiral.toml   # then edit it: one [ships.<name>] per sh
 Admiral finds its config by climbing from the current directory to the first
 `admiral.toml` (or `.admiral.toml`). See `admiral.example.toml` for the schema.
 
+## Output and exit codes
+
+A command's output goes to stdout: dojo and capture output, `help`, `configure`,
+`code`. Progress and errors go to stderr. Each kind of failure has its own exit
+code:
+
+| code | meaning |
+|------|---------|
+| 0 | ok |
+| 1 | failed (anything not below) |
+| 2 | usage: a bad command, flag or argument |
+| 3 | config: the toml is missing, unreadable, or refused |
+| 4 | the ship's daemon is not running |
+| 5 | timeout: the command did not finish in time |
+| 6 | refused: the dojo would not take the line |
+| 7 | build failed: `commit`'s verdict is a build error |
+| 130 | interrupted (Ctrl-C or SIGTERM) |
+
 ## Latency
 
 A ship on your laptop answers in a millisecond; a hosted one doesn't. To feel

@@ -49,6 +49,40 @@ from typing import Any, Callable
 
 VERSION = "0.2.1"
 
+# ── exit codes ────────────────────────────────────────────────────────────────
+# Each kind of failure exits with its own code, so a script can tell them apart
+# without parsing the message. main maps an exception's `exit_code` to the exit;
+# anything else exits 1.
+EXIT_FAIL, EXIT_USAGE, EXIT_CONFIG, EXIT_DOWN, EXIT_TIMEOUT, EXIT_REFUSED, EXIT_BUILD = 1, 2, 3, 4, 5, 6, 7
+EXIT_INTERRUPTED = 130
+EXIT_CODES = [  # for help and the README
+    (0, "ok"),
+    (EXIT_FAIL, "failed (anything not below)"),
+    (EXIT_USAGE, "usage: a bad command, flag or argument"),
+    (EXIT_CONFIG, "config: the toml is missing, unreadable, or refused"),
+    (EXIT_DOWN, "the ship's daemon is not running"),
+    (EXIT_TIMEOUT, "timeout: the command did not finish in time"),
+    (EXIT_REFUSED, "refused: the dojo would not take the line"),
+    (EXIT_BUILD, "build failed: commit's verdict is a build error"),
+    (EXIT_INTERRUPTED, "interrupted (Ctrl-C or SIGTERM)"),
+]
+
+
+class ConfigError(RuntimeError):
+    exit_code = EXIT_CONFIG
+
+
+class NotRunning(RuntimeError):
+    exit_code = EXIT_DOWN
+
+
+class Timeout(RuntimeError):
+    exit_code = EXIT_TIMEOUT
+
+
+class Refused(RuntimeError):
+    exit_code = EXIT_REFUSED
+
 # ── identity ──────────────────────────────────────────────────────────────────
 # Name is hardcoded to "admiral". SELF is the script's real on-disk path (the rsync
 # source + on-host tool copy need it). REPO is the project root — found by walking up
@@ -73,7 +107,8 @@ def _find_repo() -> tuple[Path, str]:
     for d in (cwd, *cwd.parents):
         found = [n for n in CONFIG_NAMES if (d / n).is_file()]
         if len(found) > 1:
-            sys.exit(f"{d} has both {found[0]} and {found[1]}; keep one")
+            sys.stderr.write(f"{d} has both {found[0]} and {found[1]}; keep one\n")
+            sys.exit(EXIT_CONFIG)
         if found:
             return d, found[0]
     return cwd, CONFIG_NAMES[0]
@@ -265,7 +300,7 @@ def load_config(file: Path | None = None) -> Config:
     try:
         raw = file.read_text("utf8")
     except OSError:
-        raise RuntimeError(
+        raise ConfigError(
             f"{file} not found — create it by hand (see admiral.example.toml), e.g.\n"
             f"  [ships.<name>]\n"
             f'  http = "http://localhost:<port>"\n'
@@ -281,15 +316,15 @@ def load_config(file: Path | None = None) -> Config:
     try:
         cfg = tomllib.loads(raw)
     except Exception as e:
-        raise RuntimeError(f"{CONFIG}: invalid TOML: {e}")
+        raise ConfigError(f"{CONFIG}: invalid TOML: {e}")
 
     ships_raw = cfg.get("ships")
     if not isinstance(ships_raw, dict) or not ships_raw:
-        raise RuntimeError(f'{CONFIG}: "ships" must be a non-empty table of [ships.<name>] entries')
+        raise ConfigError(f'{CONFIG}: "ships" must be a non-empty table of [ships.<name>] entries')
     # desks: OPTIONAL. A config with no desks is valid — it just can't commit.
     desks_raw = cfg.get("desks", [])
     if not isinstance(desks_raw, list):
-        raise RuntimeError(f'{CONFIG}: "desks" must be an array of {{ name, src }} entries')
+        raise ConfigError(f'{CONFIG}: "desks" must be an array of {{ name, src }} entries')
 
     # hosts: a table of REMOTE machines, keyed by name (the local machine is
     # implicit — a ship with no "host" runs locally, root = REPO). Validate first
@@ -298,58 +333,58 @@ def load_config(file: Path | None = None) -> Config:
     hosts_raw = cfg.get("hosts")
     if hosts_raw is not None:
         if not isinstance(hosts_raw, dict):
-            raise RuntimeError(f'{CONFIG}: "hosts" must be a table of [hosts.<name>] entries')
+            raise ConfigError(f'{CONFIG}: "hosts" must be a table of [hosts.<name>] entries')
         for hname, h in hosts_raw.items():
             if hname == "local":
-                raise RuntimeError(f'{CONFIG}: hosts["local"] is reserved — the local machine is implicit (omit "host", or set it to "local")')
+                raise ConfigError(f'{CONFIG}: hosts["local"] is reserved — the local machine is implicit (omit "host", or set it to "local")')
             if not isinstance(h, dict):
-                raise RuntimeError(f'{CONFIG}: hosts["{hname}"] must be a table {{ ssh, root }}')
+                raise ConfigError(f'{CONFIG}: hosts["{hname}"] must be a table {{ ssh, root }}')
             if not h.get("ssh") or not isinstance(h["ssh"], str):
-                raise RuntimeError(f'{CONFIG}: hosts["{hname}"] missing "ssh" target')
+                raise ConfigError(f'{CONFIG}: hosts["{hname}"] missing "ssh" target')
             if not h.get("root"):
-                raise RuntimeError(f'{CONFIG}: hosts["{hname}"] missing "root" (absolute base dir for piers, e.g. /home/urb)')
+                raise ConfigError(f'{CONFIG}: hosts["{hname}"] missing "root" (absolute base dir for piers, e.g. /home/urb)')
             if not os.path.isabs(h["root"]):
-                raise RuntimeError(f'{CONFIG}: hosts["{hname}"].root "{h["root"]}" must be an absolute path')
+                raise ConfigError(f'{CONFIG}: hosts["{hname}"].root "{h["root"]}" must be an absolute path')
             hosts[hname] = Host(hname, h["root"], h["ssh"])
 
     ships: list[Ship] = []
     for sname, ship in ships_raw.items():
         if not isinstance(ship, dict):
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"] must be a table {{ pier, http, ... }}')
+            raise ConfigError(f'{CONFIG}: ships["{sname}"] must be a table {{ pier, http, ... }}')
         if not SHIP_NAME_RE.match(sname):
-            raise RuntimeError(f'{CONFIG}: ship name "{sname}" must match {SHIP_NAME_RE.pattern}')
+            raise ConfigError(f'{CONFIG}: ship name "{sname}" must match {SHIP_NAME_RE.pattern}')
         # host: top-level hosts key; empty/"local"/None => the local machine.
         host = ship.get("host") or None
         if host is not None and host != "local" and host not in hosts:
-            raise RuntimeError(
+            raise ConfigError(
                 f'{CONFIG}: ships["{sname}"].host "{host}" is not in "hosts" '
                 f'(have: {", ".join(["local", *hosts])})'
             )
         # pier: optional table of where the ship's pier lives + its boot params.
         pier = ship.get("pier") or {}
         if not isinstance(pier, dict):
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"].pier must be a table {{ {", ".join(sorted(PIER_KEYS))} }}')
+            raise ConfigError(f'{CONFIG}: ships["{sname}"].pier must be a table {{ {", ".join(sorted(PIER_KEYS))} }}')
         # Reject keys we don't know rather than ignoring them: a typo (or a setting
         # from a newer admiral) is loud instead of silently doing nothing.
         unknown = sorted(set(pier) - PIER_KEYS)
         if unknown:
-            raise RuntimeError(
+            raise ConfigError(
                 f'{CONFIG}: ships["{sname}"].pier has unknown key(s) {", ".join(unknown)} '
                 f'(known: {", ".join(sorted(PIER_KEYS))})')
         if "latency-port" in ship:
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"].latency-port is gone: the port goes in the '
+            raise ConfigError(f'{CONFIG}: ships["{sname}"].latency-port is gone: the port goes in the '
                                f'latency table, {LATENCY_FORM}')
         values: dict[str, Any] = {}
         for f in FIELDS:
             v = (pier if f.pier else ship).get(f.key)
             err = field_error(f, v)
             if err:
-                raise RuntimeError(f'{CONFIG}: ships["{sname}"].{"pier." if f.pier else ""}{f.key} {err}')
+                raise ConfigError(f'{CONFIG}: ships["{sname}"].{"pier." if f.pier else ""}{f.key} {err}')
             values[f.attr] = v
         lat = values.pop("latency", None)
         if lat is not None:
             if lat["port"] == values.get("port"):
-                raise RuntimeError(f'{CONFIG}: ships["{sname}"].latency.port {lat["port"]} is the ship\'s '
+                raise ConfigError(f'{CONFIG}: ships["{sname}"].latency.port {lat["port"]} is the ship\'s '
                                    f'own http port; the proxy needs a port of its own')
             values["latency"], values["latency_port"] = lat["ms"] or None, lat["port"]
         ships.append(make_ship(sname, host, values))
@@ -357,11 +392,11 @@ def load_config(file: Path | None = None) -> Config:
     desks: list[Desk] = []
     for i, desk in enumerate(desks_raw):
         if not isinstance(desk, dict):
-            raise RuntimeError(f"{CONFIG}: desks[{i}] must be a table {{ name, src }}")
+            raise ConfigError(f"{CONFIG}: desks[{i}] must be a table {{ name, src }}")
         if not desk.get("name"):
-            raise RuntimeError(f'{CONFIG}: desks[{i}] missing "name"')
+            raise ConfigError(f'{CONFIG}: desks[{i}] missing "name"')
         if not DESK_NAME_RE.match(desk["name"]):
-            raise RuntimeError(f'{CONFIG}: desks[{i}].name "{desk["name"]}" must match {DESK_NAME_RE.pattern}')
+            raise ConfigError(f'{CONFIG}: desks[{i}].name "{desk["name"]}" must match {DESK_NAME_RE.pattern}')
         desks.append(Desk(name=desk["name"], src=desk.get("src", ".")))
 
     cfg = Config(ships=ships, desks=desks, hosts=hosts)
@@ -589,7 +624,7 @@ def local_capture_at(ship: Ship, host: Host, offset: int) -> tuple[int, str]:
     sock = sock_path(ship, host)
     got = sock_capture_at(sock, offset)
     if got is None:
-        raise RuntimeError(f'ship "{ship.name}" daemon not running (no daemon at {sock})')
+        raise NotRunning(f'ship "{ship.name}" daemon not running (no daemon at {sock})')
     return (got[0], got[1].decode("utf-8", "replace"))
 
 
@@ -876,7 +911,7 @@ def capture_at(host: Host, ship: Ship, offset: int) -> tuple[int, str]:
     try:
         return (int(head, 16), tail)
     except ValueError:
-        raise RuntimeError(f'ship "{ship.name}" daemon not running (no daemon at '
+        raise NotRunning(f'ship "{ship.name}" daemon not running (no daemon at '
                            f'{sock_path(ship, host)})')
 
 
@@ -1233,7 +1268,7 @@ def mount_owner(desk: Desk, cfg: Config) -> Ship | None:
     src = os.path.realpath(desk_src_dir(desk))
     owners = [ship for ship, _, mount in _local_mounts(desk, cfg) if mount == src]
     if len(owners) > 1:
-        raise RuntimeError(f'desk "{desk.name}": source {desk.src} is the %{desk.name} mount of '
+        raise ConfigError(f'desk "{desk.name}": source {desk.src} is the %{desk.name} mount of '
                            f'{", ".join(s.name for s in owners)}; ships can\'t share a pier')
     return owners[0] if owners else None
 
@@ -1246,7 +1281,7 @@ def check_desk_srcs(cfg: Config) -> None:
         src = os.path.realpath(desk_src_dir(desk))
         for ship, pier, mount in _local_mounts(desk, cfg):
             if src != mount and os.path.commonpath([src, pier]) == pier:
-                raise RuntimeError(
+                raise ConfigError(
                     f'{CONFIG}: desk "{desk.name}" src {desk.src} is inside {ship.name}\'s pier '
                     f'but isn\'t its %{desk.name} mount ({mount})')
         mount_owner(desk, cfg)
@@ -1348,12 +1383,12 @@ def unrepaint(raw: str) -> str:
 def check_dojo_input(command: str) -> None:
     # refuse what the dojo cannot take as one typed line, before a keystroke is sent.
     if "\n" in command or "\r" in command:
-        raise RuntimeError(
+        raise Refused(
             "dojo input has a newline. The dojo reads one line: the first part runs and\n"
             "the rest types into whatever that left open. Put multi-line source in a desk\n"
             "file and read it from there.")
     if len(command) > DOJO_INPUT_MAX:
-        raise RuntimeError(
+        raise Refused(
             f"dojo input is {len(command)} chars; admiral types at most {DOJO_INPUT_MAX} "
             f"(the terminal drops\nkeystrokes past 1023). Split it across dojo variables, "
             f"one call each\n(=a \"...\"  =b \"...\"  then (weld a b)), or put it in a desk file.")
@@ -1609,7 +1644,7 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
     if log is None:
         log = lambda m: sys.stderr.write(m + "\n")
     if daemon_status(host, ship) is None:
-        raise RuntimeError(f'ship "{ship.name}" daemon not running — `{INVOKE} {ship.name} run` first')
+        raise NotRunning(f'ship "{ship.name}" daemon not running — `{INVOKE} {ship.name} run` first')
     guard_port(host, ship)  # don't drive a pier this config has the wrong port for
 
     # rsync the desk source while the dojo settles; joined before |commit needs the
@@ -1696,10 +1731,10 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
                 # order, so text that has been ECHOED was echoed by an arvo that already
                 # processed the Enter. A PARTIAL paint with no bell is arvo still working
                 # through the keystrokes — waiting on it is not a refusal.
-                raise RuntimeError(dojo_reject_report(command, painted, tail_n(clean_pane(raw), 20)))
+                raise Refused(dojo_reject_report(command, painted, tail_n(clean_pane(raw), 20)))
             time.sleep(0.08)
         if not accepted:
-            raise RuntimeError(dojo_reject_report(command, painted, tail_n(clean_pane(raw), 20)))
+            raise Refused(dojo_reject_report(command, painted, tail_n(clean_pane(raw), 20)))
 
         # the command only starts RUNNING here, so it gets the whole timeout.
         deadline = time.monotonic() + timeout
@@ -1809,16 +1844,16 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
         transcript = tail_n(render_transcript(raw), 30)
         if verdict == "mute":
             if interrupt and dojo_interrupt(host, ship):
-                raise RuntimeError(f"TIMEOUT after {timeout}s — interrupted the command "
+                raise Timeout(f"TIMEOUT after {timeout}s — interrupted the command "
                                    f"(--interrupt)\n" + transcript)
-            raise RuntimeError(f"TIMEOUT: {still_computing(ship, timeout, ship.name in _interrupted)}\n"
+            raise Timeout(f"TIMEOUT: {still_computing(ship, timeout, ship.name in _interrupted)}\n"
                                + transcript)
         if verdict == "busy":
             dojo_abort(host, ship)
         missed = (f"the dojo is idle now, so admiral missed the command's end: its prompt "
                   f"read {prompt_row(prompt_state(raw[-8192:]))}.\nCheck the result by hand; "
                   f"this is an admiral bug worth reporting with the slog.\n")
-        raise RuntimeError(f"TIMEOUT after {timeout}s"
+        raise Timeout(f"TIMEOUT after {timeout}s"
                            + (" — aborted the command" if verdict == "busy" else "") + "\n"
                            + (missed if verdict == "idle" else "") + transcript)
     except KeyboardInterrupt:
@@ -1996,8 +2031,10 @@ def usage_line(c: Cmd) -> str:
 
 
 class UsageError(Exception):
-    def __init__(self, cmd: Cmd, msg: str):
-        super().__init__(f"{msg}\n{usage_line(cmd)}\nSee: {INVOKE} help {cmd.name}")
+    exit_code = EXIT_USAGE
+
+    def __init__(self, cmd: Cmd | None, msg: str):
+        super().__init__(msg if cmd is None else f"{msg}\n{usage_line(cmd)}\nSee: {INVOKE} help {cmd.name}")
 
 
 def find_flag(c: Cmd, tok: str) -> Flag | None:
@@ -2165,6 +2202,7 @@ def cmd_commit(a: Parsed, pick: bool = False) -> None:
             if late:
                 out = out + "\n" + late
         ok, verdict, reloaded = commit_verdict(desk, out)
+        code = 0 if ok else EXIT_BUILD
         # a desk that just reloaded an agent is running; only an idle verdict needs +vats
         if ok and not reloaded and desk_suspended(ship, desk, a.cfg, timeout, interrupt):
             verdict += (f"\nwarning: %{desk.name} is suspended, so nothing it commits runs. "
@@ -2172,14 +2210,15 @@ def cmd_commit(a: Parsed, pick: bool = False) -> None:
         if ok and pick:
             ok, picked = collect_garbage(ship, desk, a.cfg, timeout, log, interrupt)
             verdict += "\n" + picked
-        return (ok, out, verdict)
+            code = 0 if ok else EXIT_FAIL
+        return (code, out, verdict)
 
-    ok, out, verdict = work(ship, host_for(ship, a.cfg), lambda m: sys.stderr.write(m + "\n"))
+    code, out, verdict = work(ship, host_for(ship, a.cfg), lambda m: sys.stderr.write(m + "\n"))
     if out:
         sys.stdout.write(out + "\n")
         sys.stdout.flush()  # the verdict is the LAST line, even through a pipe
-    sys.stderr.write(paint(verdict, "green" if ok else "red", is_tty(sys.stderr)) + "\n")
-    sys.exit(0 if ok else 1)
+    sys.stderr.write(paint(verdict, "red" if code else "green", is_tty(sys.stderr)) + "\n")
+    sys.exit(code)
 
 
 def collect_garbage(ship: Ship, desk: Desk, cfg: Config, timeout: int, log,
@@ -2275,7 +2314,7 @@ def cmd_slog(a: Parsed) -> None:
         try:
             counter = re.compile(count)
         except re.error as e:
-            die(f"--count: bad regex {count!r} ({e})")
+            raise UsageError(None, f"--count: bad regex {count!r} ({e})")
 
     def work(ship, host, log):
         if raw:
@@ -2300,7 +2339,7 @@ def cmd_slog(a: Parsed) -> None:
 def parse_since(s: str) -> float:
     m = re.fullmatch(r"(\d+)([smhd])", s.strip())
     if not m:
-        die(f"--since: want <n>[smhd] (e.g. 5m, 2h), got {s!r}")
+        raise UsageError(None, f"--since: want <n>[smhd] (e.g. 5m, 2h), got {s!r}")
     return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
 
 
@@ -2524,7 +2563,7 @@ def cmd_latency(a: Parsed) -> None:
     def work(ship, host, log):
         st = daemon_status(host, ship)
         if st is None:
-            raise RuntimeError(f"not running — `{INVOKE} {ship.name} run` starts it with its proxy")
+            raise NotRunning(f"not running — `{INVOKE} {ship.name} run` starts it with its proxy")
         assert_port_match(host, ship, st)
         upgrade = (f"`{INVOKE} {ship.name} engine-upgrade` swaps in v{VERSION} in place "
                    f"(urbit is not restarted)")
@@ -2555,7 +2594,7 @@ def cmd_attach(a: Parsed) -> None:
     ship = resolve_ship(a.selector, cfg)
     host = host_for(ship, cfg)
     if daemon_status(host, ship) is None:
-        raise RuntimeError(
+        raise NotRunning(
             f'ship "{ship.name}" daemon not running — `{INVOKE} {ship.name} run` first')
     guard_port(host, ship)  # a wrong-port config may not even attach to this pier
     eng(host, ship, "__attach", inherit=True)
@@ -3115,7 +3154,7 @@ def cmd_configure(a: Parsed) -> None:
     # explain how to write admiral.toml: where it is looked for, then every table and
     # key with its meaning and type. Keys come from FIELDS so the list cannot drift
     # from the loader.
-    color = is_tty(sys.stderr)
+    color = is_tty(sys.stdout)
     bold = lambda s: paint(s, "bold", color)
     gray = lambda s: paint(s, "gray", color)
     kinds = {"str": "string", "int": "integer", "bool": "bool", "latency": "table"}
@@ -3127,7 +3166,7 @@ def cmd_configure(a: Parsed) -> None:
         return "\n".join(label_wrap(label, len(indent) + w, f"{kind}. {FIELD_DOC[key]}", HELP_WIDTH))
     ship_rows = [row("host", "string"), *(row(f.key, kinds[f.kind]) for f in FIELDS if not f.pier)]
     pier_rows = [row(f.key, kinds[f.kind], "    ") for f in FIELDS if f.pier]
-    sys.stderr.write(f"""
+    sys.stdout.write(f"""
 {bold(f"{CONFIG}: how to write it")}
 
   {NAME} finds its config by climbing from the current directory to the
@@ -3610,7 +3649,7 @@ def menu_ships(cfg: Config, gray: Callable[[str], str]) -> str:
 
 
 def help_menu() -> None:
-    color = is_tty(sys.stderr)
+    color = is_tty(sys.stdout)
     red = lambda s: paint(s, "red", color)
     gray = lambda s: paint(s, "gray", color)
     bold = lambda s: paint(s, "bold", color)
@@ -3656,7 +3695,8 @@ def help_menu() -> None:
                 config += "\nDesks\n" + "\n".join(f"  {d.name.ljust(dw)}  {d.src}" for d in cfg.desks) + "\n"
             config += "\nShips\n" + menu_ships(cfg, gray)
 
-    sys.stderr.write(f"""
+    exits = "\n".join(f"  {str(n).rjust(3)}  {what}" for n, what in EXIT_CODES)
+    sys.stdout.write(f"""
 {bold(f"{CLI}: urbit ship manager")} {gray(f"v{VERSION}")}
 
 Commands
@@ -3666,6 +3706,10 @@ Commands
   {gray(f"{inv} <ship> <command> [opts]")}
 
 {table}
+
+Exit codes
+
+{exits}
 
 {config}
 
@@ -3677,12 +3721,11 @@ def cmd_help(name: str | None = None) -> None:
         return help_menu()
     c = by_name(name)
     W = HELP_WIDTH
-    color = is_tty(sys.stderr)
+    color = is_tty(sys.stdout)
     bold = lambda s: paint(s, "bold", color)
     gray = lambda s: paint(s, "gray", color)
     if not c:
-        sys.stderr.write(f'no command "{name}"; {INVOKE} help lists them\n')
-        sys.exit(1)
+        raise UsageError(None, f'no command "{name}"; {INVOKE} help lists them')
     out: list[str] = [""]
     head = f"{CLI} {c.name}"
     for i, l in enumerate(wrap(f"{head} — {c.summary}", W)):
@@ -3707,7 +3750,7 @@ def cmd_help(name: str | None = None) -> None:
         for e in c.examples:
             out.append("  " + gray(e))
         out.append("")
-    sys.stderr.write("\n".join(out) + "\n")
+    sys.stdout.write("\n".join(out) + "\n")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4682,7 +4725,7 @@ def main() -> None:
 
     selector = argv[0]
     if by_name(selector):
-        raise RuntimeError(f"`{selector}` needs a ship first: {INVOKE} <ship> {' '.join(argv)}")
+        raise UsageError(None, f"`{selector}` needs a ship first: {INVOKE} <ship> {' '.join(argv)}")
     # no command after the selector → status (the default command).
     subcmd = argv[1] if len(argv) > 1 else "status"
     args = argv[2:]
@@ -4691,7 +4734,7 @@ def main() -> None:
     cmd = by_name(subcmd)
     if not cmd or not cmd.ship:
         subs = "|".join(c.name for c in COMMANDS if c.ship)
-        raise RuntimeError(f'Unknown subcommand "{subcmd}" ({subs})  —  try: {INVOKE} help')
+        raise UsageError(None, f'Unknown subcommand "{subcmd}" ({subs})  —  try: {INVOKE} help')
     cfg = load_config()
     flags, pos = parse_args(cmd, args)
     return cmd.run(Parsed(cmd=cmd, selector=selector, cfg=cfg, flags=flags, pos=pos))
@@ -4709,7 +4752,10 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.stderr.write("interrupted\n")
-        sys.exit(130)
+        sys.exit(EXIT_INTERRUPTED)
+    except subprocess.TimeoutExpired as e:
+        sys.stderr.write(f"TIMEOUT after {e.timeout:g}s: {' '.join(map(str, e.cmd or []))[:200]}\n")
+        sys.exit(EXIT_TIMEOUT)
     except Exception as e:
         sys.stderr.write(str(e) + "\n")
-        sys.exit(1)
+        sys.exit(getattr(e, "exit_code", EXIT_FAIL))

@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import os
 import re
+import random
+import asyncio
 import sys
 import tty
 import time
@@ -45,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # ── identity ──────────────────────────────────────────────────────────────────
 # Name is hardcoded to "admiral". SELF is the script's real on-disk path (the rsync
@@ -124,7 +126,7 @@ class PierConfig:
 class Field:
     key: str                  # TOML key ("master-ticket")
     attr: str                 # attribute on Ship (or on PierConfig when pier)
-    kind: str                 # "str" | "int" | "bool"
+    kind: str                 # "str" | "int" | "bool" | "ms" (an int, or a string of digits)
     hint: str                 # what a good value looks like; the error for a bad one
     pier: bool = False        # lives in the ship's `pier = { ... }` table
     lo: int = 1               # int range, inclusive
@@ -148,6 +150,8 @@ FIELDS: list[Field] = [
           ok=lambda s: bool(TICKET_RE.match(s))),
     Field("mnemonic", "mnemonic", "str", "must be a space-separated word list (BIP39 mnemonic)",
           ok=lambda s: bool(MNEMONIC_RE.match(s))),
+    Field("latency", "latency", "ms", 'must be milliseconds, e.g. 1000 or "1000"', lo=0, hi=600000),
+    Field("latency-port", "latency_port", "int", "must be an integer 1-65535", hi=65535),
 ]
 # every key `pier = { ... }` may carry. Config load rejects anything else — see load_config.
 PIER_KEYS = frozenset(f.key for f in FIELDS if f.pier)
@@ -162,6 +166,10 @@ def field_error(f: Field, v: Any) -> str | None:
         bad = not isinstance(v, int) or isinstance(v, bool) or v < f.lo or v > f.hi
     elif f.kind == "bool":
         bad = not isinstance(v, bool)
+    elif f.kind == "ms":
+        n = v if isinstance(v, int) and not isinstance(v, bool) else (
+            int(v) if isinstance(v, str) and v.strip().isdigit() else None)
+        bad = n is None or n < f.lo or n > f.hi
     else:
         bad = not isinstance(v, str) or (f.ok is not None and not f.ok(v))
     return f"{f.hint}, got {v!r}" if bad else None
@@ -187,6 +195,8 @@ class Ship:
     code: str | None = None   # optional +code override; skips the live dojo read
     master_ticket: str | None = None  # ship master ticket (key material; for boot)
     mnemonic: str | None = None       # BIP39 mnemonic seed phrase (key material)
+    latency: int | None = None        # ms of round trip the latency proxy adds (see DelayProxy)
+    latency_port: int | None = None   # where the proxy listens; omit => pier.port + 8000
 
 
 @dataclass
@@ -307,7 +317,7 @@ def load_config(file: Path | None = None) -> Config:
             err = field_error(f, v)
             if err:
                 raise RuntimeError(f'{CONFIG}: ships["{sname}"].{"pier." if f.pier else ""}{f.key} {err}')
-            values[f.attr] = v
+            values[f.attr] = int(v) if f.kind == "ms" and isinstance(v, str) else v
         ships.append(make_ship(sname, host, values))
 
     desks: list[Desk] = []
@@ -900,6 +910,64 @@ def daemon_status(host: Host, ship: Ship) -> tuple[int, int, str] | None:
         return (int(parts[1]), int(parts[2]), parts[3])
     except (IndexError, ValueError):
         return None
+
+
+LATENCY_SINCE = (0, 2, 0)  # the first engine whose daemon has the latency proxy
+LATENCY_DEFAULT = 1000     # ms `latency on` uses when the config sets none
+LATENCY_PORT_OFFSET = 8000  # default proxy port: the ship's + this (80 -> 8080)
+
+
+def engine_has_latency(version: str | None) -> bool:
+    try:
+        return tuple(int(x) for x in (version or "").split(".")) >= LATENCY_SINCE
+    except ValueError:
+        return False
+
+
+def latency_port(ship: Ship) -> int:
+    if ship.latency_port is not None:
+        return ship.latency_port
+    if ship.pier.port is None:
+        raise RuntimeError(f'ship "{ship.name}" has no pier.port for the latency proxy to sit in front of')
+    port = ship.pier.port + LATENCY_PORT_OFFSET
+    if port > 65535:
+        raise RuntimeError(f'ship "{ship.name}": port {ship.pier.port} + {LATENCY_PORT_OFFSET} is past '
+                           f'65535; set latency-port')
+    return port
+
+
+def daemon_latency(host: Host, ship: Ship, msg: str = "") -> str | None:
+    # the daemon's latency proxy state after `msg` (see C_LATENCY), None when no daemon
+    # answers. Ask only a daemon engine_has_latency: an older one ignores the frame.
+    if not host.ssh:
+        return sock_latency(sock_path(ship, host), msg)
+    out = eng(host, ship, "__latency", *msg.split(), check=False).strip()
+    return out or None
+
+
+def latency_brief(state: str | None) -> str | None:
+    # "1000ms :8080 -> :80", "off :8080 -> :80 (direct)", None when there is no proxy
+    if not state or state == "none":
+        return None
+    if state.startswith("error"):
+        return state
+    try:
+        listen, target, ms = (int(x) for x in state.split())
+    except ValueError:
+        return state
+    return f"{ms}ms :{listen} -> :{target}" if ms else f"off :{listen} -> :{target} (direct)"
+
+
+def latency_apply(host: Host, ship: Ship, ms: int) -> str:
+    # start (or retune) the proxy at `ms`; its brief, or raise with the daemon's reason
+    if ship.pier.port is None:
+        raise RuntimeError(f'ship "{ship.name}" has no pier.port for the latency proxy to sit in front of')
+    got = daemon_latency(host, ship, f"set {latency_port(ship)} {ship.pier.port} {ms}")
+    if got is None:
+        raise RuntimeError("the daemon did not answer")
+    if got.startswith("error"):
+        raise RuntimeError(got.removeprefix("error").strip())
+    return latency_brief(got) or got
 
 
 def pier_exists(host: Host, ship: Ship) -> bool:
@@ -1825,6 +1893,7 @@ class ShipState:
     misconfigured: bool = False      # live --http-port disagrees with this config's pier.port
     running_port: int | None = None  # the --http-port the ship is ACTUALLY running on
     version: str | None = None       # engine VERSION baked into the daemon; None when down
+    latency: str | None = None       # the latency proxy's brief; None when it has none
 
 
 def probe_ship(ship: Ship, cfg: Config, host: Host, probe: bool = False) -> ShipState:
@@ -1874,9 +1943,15 @@ def probe_ship(ship: Ship, cfg: Config, host: Host, probe: bool = False) -> Ship
         verdict = "up"
     # here the daemon owns the urbit child, so "daemon up" IS "pier
     # held" — holders carries the child PID for display.
+    latency = None
+    if st and engine_has_latency(st[2]):
+        try:
+            latency = latency_brief(daemon_latency(host, ship))
+        except Exception:
+            latency = None
     return ShipState(ship.name, host.name, daemon_up, pane, dojo, pier,
                      holders, verdict, responsive, http, misconfigured, running_port,
-                     version=st[2] if st else None)
+                     version=st[2] if st else None, latency=latency)
 
 
 # ── command framework ─────────────────────────────────────────────────────────
@@ -2342,6 +2417,8 @@ def print_status(ships: list[Ship], results: list[FanResult], cfg: Config) -> No
         out.append(f"  {paint(ship.name, 'bold', on)}{' ' * (namew - len(ship.name))}   {state}   {ver}")
         out.append(f"    {signals}")
         out.append(f"    host {host_cell}   pier {pier}   code {code}")
+        if v and v.latency:
+            out.append(f"    latency {v.latency}")
         if v and v.misconfigured:
             out.append("    " + paint("↳ " + misconfig_brief(ship, v.running_port), "red", on))
         out.append("")
@@ -2432,6 +2509,7 @@ def print_detail(ship: Ship, cfg: Config) -> None:
         ("verdict", verdict_color(st.verdict, on)),
         ("daemon", daemon_str),
         ("engine", engine_cell(st, on) if st.daemon else "-"),
+        ("latency", latency_detail(ship, st)),
         ("vere", vere),
         ("kelvin", kelvin),
         ("pane", sig(st.pane, on)),
@@ -2448,6 +2526,43 @@ def print_detail(ship: Ship, cfg: Config) -> None:
             sys.stdout.write("\n")
             continue
         sys.stdout.write(k.ljust(w) + "  " + v + "\n")
+
+
+def latency_detail(ship: Ship, st: ShipState) -> str:
+    # the live proxy, else what the config would start
+    if st.latency:
+        return st.latency
+    want = f"config {ship.latency}ms" if ship.latency else ""
+    if st.daemon and not engine_has_latency(st.version):
+        return ", ".join(x for x in [want, "engine too old: engine-upgrade"] if x)
+    return f"none ({want}; `latency on` starts it)" if want and st.daemon else (want or "none")
+
+
+def cmd_latency(a: Parsed) -> None:
+    # show or set the latency proxy in front of the ship's http port; see DelayProxy
+    setting = a.pos[0] if a.pos else None
+    if setting is not None and setting not in ("on", "off") and not setting.isdigit():
+        raise UsageError(a.cmd, f"expected on, off, or a number of ms; got {setting!r}")
+
+    def work(ship, host, log):
+        st = daemon_status(host, ship)
+        if st is None:
+            raise RuntimeError(f"not running — `{INVOKE} {ship.name} run` first")
+        assert_port_match(host, ship, st)
+        if not engine_has_latency(st[2]):
+            raise RuntimeError(
+                f"its daemon runs engine v{st[2]}, which has no latency proxy. "
+                f"`{INVOKE} {ship.name} engine-upgrade` swaps in v{VERSION} in place "
+                f"(urbit is not restarted)")
+        if setting is None:
+            return latency_brief(daemon_latency(host, ship)) or (
+                f"no proxy (`{INVOKE} {ship.name} latency on` starts one on :{latency_port(ship)})")
+        ms = 0 if setting == "off" else (ship.latency or LATENCY_DEFAULT) if setting == "on" else int(setting)
+        brief = latency_apply(host, ship, ms)
+        origin = re.sub(r":\d+$", "", (ship.http or "http://localhost").rstrip("/"))
+        return f"{brief}   {origin}:{latency_port(ship)}"
+
+    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
 
 
 def cmd_attach(a: Parsed) -> None:
@@ -2641,11 +2756,22 @@ def cmd_run(a: Parsed) -> None:
         if ship.pier.persist:
             systemctl(host, "start", unit_name(ship))
             st = wait_daemon(host, ship)
-            return f"running under {unit_name(ship)} (daemon {st[0]} child {st[1]})" + note
+            return f"running under {unit_name(ship)} (daemon {st[0]} child {st[1]})" + run_latency(ship, host) + note
         st = daemon_start(ship, host)
-        return f"running (daemon {st[0]} child {st[1]})"
+        return f"running (daemon {st[0]} child {st[1]})" + run_latency(ship, host)
 
     sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+
+
+def run_latency(ship: Ship, host: Host) -> str:
+    # a freshly started ship whose config sets latency gets its proxy; a failure is a
+    # note on run's verdict, never a failed run (the ship itself came up)
+    if not ship.latency:
+        return ""
+    try:
+        return f", latency {latency_apply(host, ship, ship.latency)}"
+    except Exception as e:
+        return f"\n  latency proxy not started: {e}"
 
 
 def reconcile_unit(ship: Ship, host: Host, log: Callable[[str], None]) -> str:
@@ -2998,6 +3124,9 @@ FIELD_DOC: dict[str, str] = {
     "memo": "vere's persistent memo cache cap, in entries (default 50000)",
     "local": "boot with -L (fake networking): for a COPIED pier whose original still runs",
     "persist": "come up at boot through a systemd user unit that `run` writes (Linux only)",
+    "latency": "ms of round trip a proxy in front of the ship adds, like a hosted ship's; "
+               "`run` turns it on (see help latency)",
+    "latency-port": "where that proxy listens; default the http port + 8000 (80 -> 8080)",
 }
 
 
@@ -3008,7 +3137,7 @@ def cmd_configure(a: Parsed) -> None:
     color = is_tty(sys.stderr)
     bold = lambda s: paint(s, "bold", color)
     gray = lambda s: paint(s, "gray", color)
-    kinds = {"str": "string", "int": "integer", "bool": "bool"}
+    kinds = {"str": "string", "int": "integer", "bool": "bool", "ms": "milliseconds"}
     keys = ["host", *(f.key for f in FIELDS if not f.pier), *(f.key for f in FIELDS if f.pier)]
     w = max(len(k) for k in keys)
 
@@ -3117,7 +3246,8 @@ COMMANDS: list[Cmd] = [
                  "  http     the ship's web address answers GET /~/login\n"
                  "  host     the machine, and the http port the ship binds\n"
                  "  pier     the pier directory\n"
-                 "  code     set: +code comes from the config; live: read from the dojo\n\n"
+                 "  code     set: +code comes from the config; live: read from the dojo\n"
+                 "  latency  the latency proxy in front of the ship, when it has one\n\n"
                  "misconfigured: the ship runs on a different http port than this config's "
                  "pier.port, so the pier belongs to another admiral.toml. This config refuses to "
                  "touch it, even to attach.\n\n"
@@ -3367,6 +3497,31 @@ COMMANDS: list[Cmd] = [
         run=cmd_capture,
     ),
     Cmd(
+        name="latency", summary="put a hosted ship's latency in front of its http port",
+        flags=[], positionals=[Pos("setting", False, "on, off, or a round trip in ms (none: show it)")],
+        details=("A proxy the ship's daemon runs on a port beside the ship's, so a local ship "
+                 "feels like one in the cloud. Point the browser at the proxy's port: every "
+                 "request costs the round trip, half on the way in and half on the way out "
+                 "(±20%). A streamed response (eyre's channel, an SSE page stream, a websocket) "
+                 "stays open, and each chunk arrives that half later, in order. Requests in "
+                 "flight overlap: it is latency, not bandwidth. The proxy forwards bytes as they "
+                 "are, so headers, cookies, Host and redirects pass untouched and login works "
+                 "through it. The ship's own port never moves and the ship never restarts.\n\n"
+                 "  on      start it, or turn it back on, at the config's latency (default "
+                 f"{LATENCY_DEFAULT})\n"
+                 "  off     keep the port, forward directly\n"
+                 "  <ms>    set the round trip\n\n"
+                 "In the ship's table:\n\n"
+                 "  latency = \"1000\"       # ms; run starts the proxy\n"
+                 f"  latency-port = 8080    # default: the http port + {LATENCY_PORT_OFFSET}\n\n"
+                 "status shows it. It needs engine v0.2.0; engine-upgrade swaps an older daemon "
+                 "in place."),
+        examples=[f"{INVOKE} sampel-palnet latency on", f"{INVOKE} sampel-palnet latency 300",
+                  f"{INVOKE} sampel-palnet latency off"],
+        complete=lambda cfg: ["on", "off"],
+        run=cmd_latency,
+    ),
+    Cmd(
         name="attach", summary="a live dojo in your terminal (Ctrl-\\ to detach)",
         flags=[], positionals=[],
         details=("Connect your terminal to the ship's dojo until you detach.\n\n"
@@ -3590,8 +3745,10 @@ def cmd_help(name: str | None = None) -> None:
 HDR = struct.Struct("!BI")
 C_ATTACH, C_DATA, C_WINCH, C_PING, C_KILL, C_UPGRADE = 1, 2, 3, 5, 6, 7  # 4 was whole-ring capture
 C_CAPTURE_AT = 8  # capture ring bytes past a caller-held watermark (0 = the whole ring)
+C_LATENCY = 9     # the latency proxy: "" asks its state, "set <listen> <target> <ms>" sets it
 S_DATA, S_EXIT, S_SNAPSHOT, S_PONG = 1, 2, 3, 4
 S_SNAPSHOT_AT = 5  # reply to C_CAPTURE_AT: 8-byte total-bytes-written + the requested tail
+S_LATENCY = 6      # reply to C_LATENCY: DelayProxy.state() text, or "error <why>"
 WINSZ = struct.Struct("!HHHH")
 RING_MAX = 64 * 1024 * 1024  # scrollback ring cap; oldest bytes drop past this.
 # Sized to hold a full noisy rebuild (a `|commit` of an app that ~&-prints every event)
@@ -3739,6 +3896,10 @@ def engine_run_daemon(path: str, cmd: list[str], winsz: bytes | None) -> None:
             pass
     os.set_blocking(master, False)
 
+    try:
+        os.unlink(path + ".latency")  # a fresh daemon: `run` applies the config's latency
+    except OSError:
+        pass
     listen = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listen.bind(path)
     listen.listen(16)
@@ -3764,6 +3925,177 @@ def engine_adopt(path: str, master: int, pid: int, listen_fd: int) -> None:
     listen = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=listen_fd)
     listen.setblocking(False)
     engine_serve(path, master, pid, listen, ring)
+
+
+class DelayProxy:
+    # The latency proxy: a TCP delay line in front of the ship's http port, so a local
+    # ship feels like a hosted one. It never parses HTTP. Each chunk read from either
+    # side is written to the other `ms/2` later (±JITTER), so a request in plus its
+    # response out costs one `ms` round trip; a streamed response (eyre's SSE channel,
+    # a websocket) pays the one-way delay per chunk, in order. Headers, cookies, Host
+    # and redirects pass byte for byte. Each connection runs on its own, so requests in
+    # flight overlap: this is latency, not bandwidth. ms 0 is off: the port stays up and
+    # forwards directly.
+    #
+    # It lives in the daemon on a thread of its own running an asyncio loop; the
+    # daemon's select loop calls `control` with a C_LATENCY payload.
+    JITTER = 0.2
+    QUEUE = 256  # chunks in flight per direction (64KB each) before reading pauses
+
+    def __init__(self) -> None:
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.server: Any = None
+        self.listen: int | None = None
+        self.target: int | None = None
+        self.ms = 0
+
+    def state(self) -> str:
+        # "none" (no proxy) or "<listen> <target> <ms>"; ms 0 = off
+        return "none" if self.listen is None else f"{self.listen} {self.target} {self.ms}"
+
+    def control(self, msg: str) -> str:
+        # "" -> the state; "set <listen> <target> <ms>" -> (re)configure, then the state;
+        # failures come back as "error <why>"
+        parts = msg.split()
+        if not parts:
+            return self.state()
+        if parts[0] != "set" or len(parts) != 4:
+            return f"error bad latency control {msg!r}"
+        try:
+            listen, target, ms = int(parts[1]), int(parts[2]), int(parts[3])
+        except ValueError:
+            return f"error bad latency control {msg!r}"
+        return self.set(listen, target, ms)
+
+    def set(self, listen: int, target: int, ms: int) -> str:
+        if listen == target:
+            return f"error the proxy can't listen on the ship's own port {target}"
+        if listen != self.listen:
+            # bind HERE, on the caller's thread, so a taken port is reported at once
+            try:
+                sock = self._bind(listen)
+            except OSError as e:
+                return f"error can't listen on :{listen}: {e.strerror or e}"
+            self._start_loop()
+            fut = asyncio.run_coroutine_threadsafe(self._serve(sock), self.loop)
+            try:
+                fut.result(5)
+            except Exception as e:
+                sock.close()
+                return f"error can't serve :{listen}: {e}"
+            self.listen = listen
+        self.target, self.ms = target, max(0, ms)
+        return self.state()
+
+    @staticmethod
+    def _bind(port: int) -> socket.socket:
+        # dual-stack when the box has it, so `localhost` resolving to ::1 lands too.
+        # SO_REUSEADDR lets an upgraded daemon rebind past TIME_WAIT, but on a BSD it
+        # also lets a wildcard bind shadow someone's 127.0.0.1 listener: refuse a port
+        # that already answers.
+        for addr in ("127.0.0.1", "::1"):
+            try:
+                socket.create_connection((addr, port), timeout=0.5).close()
+            except OSError:
+                continue
+            raise OSError(98, f"something already listens on {addr}:{port}")
+        try:
+            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            try:
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("::", port))
+            except OSError:
+                s.close()
+                raise
+        except OSError:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("0.0.0.0", port))
+            except OSError:
+                s.close()
+                raise
+        s.listen(128)
+        s.setblocking(False)
+        return s
+
+    def _start_loop(self) -> None:
+        if self.loop is not None:
+            return
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self.loop.run_forever, name="latency", daemon=True).start()
+
+    async def _serve(self, sock: socket.socket) -> None:
+        old, self.server = self.server, await asyncio.start_server(self._conn, sock=sock)
+        if old is not None:
+            old.close()  # stop accepting on the old port; its open connections finish
+
+    def delay(self) -> float:
+        # one way: half the round trip, jittered
+        if self.ms <= 0:
+            return 0.0
+        return self.ms / 2000.0 * random.uniform(1 - self.JITTER, 1 + self.JITTER)
+
+    async def _conn(self, cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
+        try:
+            ur, uw = await asyncio.open_connection("127.0.0.1", self.target)
+        except OSError:
+            cw.close()
+            return
+
+        def close() -> None:
+            for w in (cw, uw):
+                try:
+                    w.close()
+                except Exception:
+                    pass
+        await asyncio.gather(self._pipe(cr, uw, close), self._pipe(ur, cw, close),
+                             return_exceptions=True)
+        close()
+
+    async def _pipe(self, src: asyncio.StreamReader, dst: asyncio.StreamWriter,
+                    close: Callable[[], None]) -> None:
+        # one direction: a reader stamps each chunk with when it is due, a writer sends
+        # it then. Due times never go backwards, so jitter can't reorder bytes.
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue(self.QUEUE)
+
+        async def pump() -> None:
+            last = 0.0
+            while True:
+                try:
+                    data = await src.read(65536)
+                except Exception:
+                    data = b""
+                last = max(last, loop.time() + self.delay())
+                await q.put((last, data))
+                if not data:
+                    return
+
+        async def send() -> None:
+            while True:
+                due, data = await q.get()
+                wait = due - loop.time()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                if not data:
+                    try:
+                        if dst.can_write_eof():
+                            dst.write_eof()
+                    except Exception:
+                        close()
+                    return
+                dst.write(data)
+                await dst.drain()
+
+        reader = asyncio.ensure_future(pump())
+        try:
+            await send()
+        except Exception:
+            close()  # the far side is gone: drop both, which ends the other direction too
+        finally:
+            reader.cancel()
 
 
 def engine_serve(path: str, master: int, pid: int, listen: socket.socket, ring: bytearray) -> None:
@@ -3846,6 +4178,21 @@ def engine_serve(path: str, master: int, pid: int, listen: socket.socket, ring: 
 
     tee_open()
 
+    # the latency proxy. Its setting lives in `<sock>.latency` so an in-place upgrade
+    # (which re-execs this image and closes its sockets) puts it back; a fresh daemon
+    # starts without one (engine_run_daemon deletes it) and `run` applies the config.
+    proxy = DelayProxy()
+    try:
+        with open(path + ".latency") as f:
+            saved = f.read().split()
+        if len(saved) == 3:
+            got = proxy.set(int(saved[0]), int(saved[1]), int(saved[2]))
+            if got.startswith("error"):
+                with open(path + ".log", "a") as f:
+                    f.write(f"[latency proxy not restored: {got}]\n")
+    except (OSError, ValueError):
+        pass
+
     def safe(c: dict, t: int, data: bytes = b"") -> bool:
         # client socks are non-blocking for the select read loop, but a frame can be
         # large (a 256KB ring snapshot) and sendall on a non-blocking sock raises
@@ -3900,10 +4247,11 @@ def engine_serve(path: str, master: int, pid: int, listen: socket.socket, ring: 
         for fd in list(clients):
             safe(clients[fd], S_EXIT, text.encode())
             drop(fd)
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        for p in (path, path + ".latency"):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
 
     while True:
         for key, _ in sel.select(timeout=1.0):
@@ -3962,6 +4310,15 @@ def engine_serve(path: str, master: int, pid: int, listen: socket.socket, ring: 
                         base = total - len(ring)
                         start = min(max(0, frm - base), len(ring))
                         safe(c, S_SNAPSHOT_AT, struct.pack("!Q", total) + bytes(ring[start:]))
+                    elif t == C_LATENCY:
+                        got = proxy.control(payload.decode("utf-8", "replace"))
+                        if payload and not got.startswith("error"):
+                            try:
+                                with open(path + ".latency", "w") as f:
+                                    f.write(got + "\n")
+                            except OSError:
+                                pass
+                        safe(c, S_LATENCY, got.encode())
                     elif t == C_DATA:
                         try:
                             os.write(master, payload)
@@ -4174,6 +4531,19 @@ def engine_status(sock: str) -> None:
     sys.stdout.write(f"up {pong[0]} {pong[1]} {pong[2]}\n" if pong else "down\n")
 
 
+def sock_latency(sock: str, msg: str = "") -> str | None:
+    # the proxy's state after `msg` (see C_LATENCY), or None when no daemon answers
+    got = sock_request(sock, C_LATENCY, msg.encode(), want=S_LATENCY, timeout=10.0)
+    return None if got is None else got.decode("utf-8", "replace")
+
+
+def engine_latency(sock: str, msg: str) -> None:
+    got = sock_latency(sock, msg)
+    if got is None:
+        die(f"no daemon at {sock}")
+    sys.stdout.write(got + "\n")
+
+
 def engine_kill(sock: str) -> None:
     sock_request(sock, C_KILL)
 
@@ -4241,7 +4611,7 @@ def engine_pty_read(sock: str, offset: int) -> None:
 
 
 ENGINE_SUBS = {"__daemon", "__attach", "__send", "__capture-at",
-               "__status", "__kill", "__upgrade", "__pty-read"}
+               "__status", "__kill", "__upgrade", "__pty-read", "__latency"}
 
 
 def engine_main(argv: list[str]) -> None:
@@ -4280,6 +4650,8 @@ def engine_main(argv: list[str]) -> None:
         return engine_kill(sock)
     if sub == "__upgrade":
         return engine_upgrade(sock)
+    if sub == "__latency":
+        return engine_latency(sock, " ".join(rest))
     die(f"unknown engine subcommand {sub!r}")
 
 

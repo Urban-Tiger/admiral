@@ -15,7 +15,11 @@ import sys
 import tempfile
 import time
 import tomllib
+import socket
+import threading
+import http.client
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -691,6 +695,209 @@ class ConfigFile(unittest.TestCase):
                 A._find_repo()
         finally:
             os.chdir(cwd)
+
+
+class LatencyConfig(ConfigFile):
+    def test_latency_is_ms_as_number_or_string(self):
+        self.assertEqual(self.load('[ships.zod]\nlatency = "1000"\n').ships[0].latency, 1000)
+        self.assertEqual(self.load('[ships.zod]\nlatency = 250\n').ships[0].latency, 250)
+        self.assertIsNone(self.load('[ships.zod]\n').ships[0].latency)
+        for bad in ('"1s"', '-5', 'true', '"x"'):
+            with self.assertRaises(RuntimeError, msg=bad) as cm:
+                self.load(f"[ships.zod]\nlatency = {bad}\n")
+            self.assertIn("milliseconds", str(cm.exception))
+
+    def test_latency_port_defaults_beside_the_ship(self):
+        ship = self.load('[ships.zod]\npier = { port = 80 }\n').ships[0]
+        self.assertEqual(A.latency_port(ship), 8080)
+        ship = self.load('[ships.zod]\nlatency-port = 9000\npier = { port = 80 }\n').ships[0]
+        self.assertEqual(A.latency_port(ship), 9000)
+        with self.assertRaises(RuntimeError):
+            A.latency_port(self.load('[ships.zod]\npier = { port = 60000 }\n').ships[0])
+
+    def test_engine_gate_and_brief(self):
+        self.assertFalse(A.engine_has_latency("0.1.0"))
+        self.assertTrue(A.engine_has_latency("0.2.0"))
+        self.assertFalse(A.engine_has_latency(None))
+        self.assertIsNone(A.latency_brief("none"))
+        self.assertEqual(A.latency_brief("8080 80 1000"), "1000ms :8080 -> :80")
+        self.assertEqual(A.latency_brief("8080 80 0"), "off :8080 -> :80 (direct)")
+
+
+class StubHandler(BaseHTTPRequestHandler):
+    # the ship behind the proxy: GET / answers, POST / echoes, GET /sse streams events
+    # SSE_GAP apart and records when it sent each one
+    SSE_GAP = 0.3
+    sent: list[float] = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path == "/sse":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for i in range(3):
+                if i:
+                    time.sleep(self.SSE_GAP)
+                StubHandler.sent.append(time.monotonic())
+                self.wfile.write(f"data: {i}\n\n".encode())
+                self.wfile.flush()
+            return
+        body = b"hello"
+        self.send_response(200)
+        self.send_header("Set-Cookie", "urbauth=abc; Path=/")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class Latency(unittest.TestCase):
+    MS = 400  # round trip; 200ms each way, ±20%
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stub = ThreadingHTTPServer(("127.0.0.1", 0), StubHandler)
+        threading.Thread(target=cls.stub.serve_forever, daemon=True).start()
+        cls.target = cls.stub.server_address[1]
+        cls.proxy = A.DelayProxy()
+        cls.port = free_port()
+        got = cls.proxy.control(f"set {cls.port} {cls.target} {cls.MS}")
+        assert got == f"{cls.port} {cls.target} {cls.MS}", got
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.stub.shutdown()
+        cls.stub.server_close()
+
+    def setUp(self):
+        self.proxy.set(self.port, self.target, self.MS)
+
+    def request(self, method="GET", path="/", body=None):
+        t0 = time.monotonic()
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request(method, path, body=body, headers={"Host": "ship.example:8080"})
+        r = c.getresponse()
+        data = r.read()
+        c.close()
+        return time.monotonic() - t0, r, data
+
+    def test_get_and_post_each_take_the_round_trip(self):
+        took, r, data = self.request()
+        self.assertEqual((r.status, data), (200, b"hello"))
+        self.assertEqual(r.getheader("Set-Cookie"), "urbauth=abc; Path=/")  # untouched
+        self.assertGreater(took, 0.8 * self.MS / 1000)
+        self.assertLess(took, 1.2 * self.MS / 1000 + 0.2)
+        took, r, data = self.request("POST", "/", b"poke")
+        self.assertEqual(data, b"poke")
+        self.assertGreater(took, 0.8 * self.MS / 1000)
+        self.assertLess(took, 1.2 * self.MS / 1000 + 0.2)
+
+    def test_requests_in_flight_overlap(self):
+        times: list[float] = []
+        t0 = time.monotonic()
+        ts = [threading.Thread(target=lambda: times.append(self.request()[0])) for _ in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(len(times), 4)
+        # four in a row would take 4 round trips; overlapping, about one
+        self.assertLess(time.monotonic() - t0, 1.2 * self.MS / 1000 + 0.3)
+
+    def test_sse_events_arrive_in_order_each_delayed(self):
+        StubHandler.sent = []
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        s.sendall(b"GET /sse HTTP/1.1\r\nHost: ship\r\n\r\n")
+        buf, got = b"", []
+        while len(got) < 3:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            for m in re.finditer(rb"data: (\d+)\n\n", buf):
+                got.append((int(m.group(1)), time.monotonic()))
+            buf = re.sub(rb"(?s).*data: \d+\n\n", b"", buf)
+        s.close()
+        self.assertEqual([i for i, _ in got], [0, 1, 2])
+        one_way = self.MS / 2000
+        for (i, arrived), sent in zip(got, StubHandler.sent):
+            lag = arrived - sent
+            self.assertGreater(lag, 0.8 * one_way, f"event {i}")
+            self.assertLess(lag, 1.2 * one_way + 0.1, f"event {i}")
+        # the stream stays open between events: they arrive their gap apart, not all at once
+        self.assertGreater(got[2][1] - got[0][1], 1.5 * StubHandler.SSE_GAP)
+
+    def test_off_is_direct(self):
+        self.assertEqual(self.proxy.control(f"set {self.port} {self.target} 0"),
+                         f"{self.port} {self.target} 0")
+        took, r, data = self.request()
+        self.assertEqual(data, b"hello")
+        self.assertLess(took, 0.1)
+
+    def test_control_errors(self):
+        self.assertTrue(self.proxy.control("set x y z").startswith("error"))
+        self.assertTrue(self.proxy.control(f"set {self.target} {self.target} 5").startswith("error"))
+        busy = socket.socket()
+        busy.bind(("127.0.0.1", 0))
+        busy.listen(1)
+        try:
+            got = A.DelayProxy().control(f"set {busy.getsockname()[1]} {self.target} 5")
+        finally:
+            busy.close()
+        self.assertTrue(got.startswith("error can't listen"), got)
+        self.assertEqual(self.proxy.control(""), f"{self.port} {self.target} {self.MS}")
+
+
+class LatencyDaemon(unittest.TestCase):
+    # the proxy through a real daemon (holding `sleep`, not urbit): set over the socket,
+    # kept across an in-place upgrade, gone with the daemon
+    def test_set_survives_upgrade(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            sock = os.path.join(d, "s")
+            proc = subprocess.Popen([sys.executable, str(Path(A.__file__)), "__daemon", "--foreground",
+                                     "--sock", sock, "--", "sleep", "60"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                for _ in range(50):
+                    if A.engine_ping(sock):
+                        break
+                    time.sleep(0.1)
+                pid = A.engine_ping(sock)[0]
+                self.assertEqual(A.sock_latency(sock), "none")
+                port, target = free_port(), free_port()
+                want = f"{port} {target} 300"
+                self.assertEqual(A.sock_latency(sock, f"set {port} {target} 300"), want)
+                self.assertEqual(Path(sock + ".latency").read_text().strip(), want)
+                A.sock_request(sock, A.C_UPGRADE)
+                time.sleep(1.0)
+                self.assertEqual(A.engine_ping(sock)[0], pid)  # same process, new image
+                self.assertEqual(A.sock_latency(sock), want)
+                socket.create_connection(("127.0.0.1", port), timeout=2).close()  # listening again
+                A.sock_request(sock, A.C_KILL)
+                proc.wait(15)
+                self.assertFalse(os.path.exists(sock + ".latency"))
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
 
 
 class HarnessDojo(unittest.TestCase):

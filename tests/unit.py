@@ -113,7 +113,7 @@ class ParseArgs(unittest.TestCase):
 
 
 class CommitVerdict(unittest.TestCase):
-    desk = A.Desk("admiral-test")
+    desk = A.Desk("admiral-test", ".")
 
     def test_no_changes(self):
         self.assertEqual(A.commit_verdict(self.desk, ">=\n"), (True, "commit %admiral-test: no changes", []))
@@ -581,8 +581,8 @@ class Engine(unittest.TestCase):
 
     def test_vere_argv(self):
         ship = A.Ship("zod", A.PierConfig(path="/p"))
-        self.assertEqual(A.vere_argv(ship, FakeHost({"test": OSError()}), "roll", "--loom", "31"),
-                         ["urbit", "roll", "--loom", "31", "/p"])
+        with self.assertRaises(RuntimeError):
+            A.vere_argv(ship, FakeHost({"test": OSError()}), "roll")
         self.assertEqual(A.vere_argv(ship, FakeHost({"test": ""}), "next"), ["/p/.run", "next"])
 
     def test_offline_restarts_after_failure(self):
@@ -621,9 +621,11 @@ class Engine(unittest.TestCase):
 
     def test_run_argv(self):
         ship = A.Ship("zod", A.PierConfig(path="/p/zod", port=8080, loom=31, ames=31337, local=True))
-        host = FakeHost({"test": OSError()})  # no <pier>/.run on the host
-        self.assertEqual(A.run_argv(ship, host),
-                         ["urbit", "-L", "--loom", "31", "--http-port", "8080", "-p", "31337", "/p/zod"])
+        self.assertEqual(A.run_argv(ship, FakeHost({"test": ""})),
+                         ["/p/zod/.run", "-L", "--loom", "31", "--http-port", "8080", "-p", "31337", "/p/zod"])
+        with self.assertRaises(RuntimeError) as cm:  # no <pier>/.run: never an `urbit` off PATH
+            A.run_argv(ship, FakeHost({"test": OSError()}))
+        self.assertIn("docked", str(cm.exception))
 
     def test_sock_path_limit(self):
         host = A.Host("local", "/tmp")
@@ -633,9 +635,12 @@ class Engine(unittest.TestCase):
 
 
 class ConfigFile(unittest.TestCase):
+    # a scratch dir holding the config, a pier dir "p" and a desk dir "desk"
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
+        (self.dir / "p").mkdir()
+        (self.dir / "desk").mkdir()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -645,28 +650,104 @@ class ConfigFile(unittest.TestCase):
         p.write_text(text)
         return A.load_config(p)
 
-    def test_minimal(self):
-        cfg = self.load("[ships.zod]\n")
-        self.assertEqual(cfg.ships[0].pier, A.PierConfig())
-        self.assertEqual(cfg.desks, [])
+    def ship(self, extra="", pier="", port=80):
+        # one good ship, plus `extra` lines and `pier` keys
+        return self.load(f'[ships.zod]\nhttp = "http://localhost:{port}"\n'
+                         f'pier = {{ path = "p", port = {port}{pier} }}\n{extra}\n').ships[0]
 
-    def test_rejections(self):
-        cases = {
-            "": '"ships" must be',
-            "[ships.zod]\npier = { prot = 1 }": "unknown key",
-            "[ships.zod]\npier = { port = 70000 }": "1-65535",
-            "[ships.zod]\npier = { local = 1 }": "boolean",
-            "[ships.zod]\ncode = 'nope'": "+code",
-            "[ships.zod]\nhost = 'ghost'": 'not in "hosts"',
-            "[hosts.local]\nssh='a'\nroot='/r'\n[ships.zod]": "reserved",
-            "[hosts.b]\nssh='a'\nroot='rel'\n[ships.zod]": "absolute",
-            "[ships.zod]\nmnemonic = 'one'": "word list",
-            "[ships.zod]\n[[desks]]\nname = 'Bad'": "must match",
-        }
-        for text, msg in cases.items():
-            with self.assertRaises(RuntimeError, msg=text) as cm:
-                self.load(text)
-            self.assertIn(msg, str(cm.exception), text)
+    def refused(self, text, why):
+        with self.assertRaises(A.ConfigError, msg=text) as cm:
+            self.load(text)
+        self.assertIn(why, str(cm.exception), text)
+        return str(cm.exception)
+
+    def test_minimal(self):
+        ship = self.ship()
+        self.assertEqual(ship.pier, A.PierConfig(path="p", port=80))
+        self.assertEqual((ship.http, ship.host, ship.latency), ("http://localhost:80", None, None))
+        self.assertEqual(self.load('[ships.zod]\nhttp = "http://l"\npier = { path = "p", port = 1 }\n').desks, [])
+
+    def test_optional_keys(self):
+        ship = self.ship(pier=", ames = 31337, loom = 31, memo = 1000, local = true, persist = true")
+        self.assertEqual((ship.pier.ames, ship.pier.loom, ship.pier.memo, ship.pier.local, ship.pier.persist),
+                         (31337, 31, 1000, True, True))
+        self.assertFalse(self.ship().pier.persist)
+
+    GOOD = '[ships.zod]\nhttp = "http://l"\npier = { path = "p", port = 1 }\n'
+
+    def test_required_keys(self):
+        self.refused("", '"ships" must be')
+        self.refused('[ships.zod]\npier = { path = "p", port = 1 }\n', "is missing http")
+        self.refused('[ships.zod]\nhttp = "http://l"\n', "is missing pier")
+        self.refused('[ships.zod]\nhttp = "http://l"\npier = { port = 1 }\n', "pier is missing path")
+        self.refused('[ships.zod]\nhttp = "http://l"\npier = { path = "p" }\n', "pier is missing port")
+        self.refused(self.GOOD + "[hosts.b]\nroot = '/r'\n", "is missing ssh")
+        self.refused(self.GOOD + "[hosts.b]\nssh = 'a@b'\n", "is missing root")
+        self.refused(self.GOOD + "[[desks]]\nname = 'house'\n", "is missing src")
+        self.refused(self.GOOD + "[[desks]]\nsrc = 'desk'\n", "is missing name")
+
+    def test_unknown_keys(self):
+        self.refused(self.GOOD + "colour = 1\n", "unknown key(s) colour")
+        self.refused('[ships.zod]\nhttp = "http://l"\npier = { path = "p", port = 1, prot = 1 }\n',
+                     "unknown key(s) prot")
+        self.refused("top = 1\n" + self.GOOD, "unknown top-level key(s) top")
+        self.refused(self.GOOD + "[hosts.b]\nssh = 'a@b'\nroot = '/r'\nuser = 'x'\n", "unknown key(s) user")
+        self.refused(self.GOOD + "[[desks]]\nname = 'house'\nsrc = 'desk'\nmount = 1\n", "unknown key(s) mount")
+
+    def test_wrong_types_and_values(self):
+        bad = lambda pier, why: self.refused(f'[ships.zod]\nhttp = "http://l"\npier = {{ path = "p", {pier} }}\n', why)
+        bad("port = 70000", "1-65535")
+        bad('port = "80"', "1-65535")
+        bad("port = 1, local = 1", "true or false")
+        bad('port = 1, persist = "yes"', "true or false")
+        bad("port = 1, loom = 0", "positive integer")
+        self.refused('[ships.zod]\nhttp = "http://l"\npier = "p"\n', "pier must be a table")
+        self.refused('[ships.zod]\nhttp = "http://l"\npier = false\n', "pier must be a table")
+        self.refused('[ships.zod]\nhttp = "http://l"\npier = { path = "~/p", port = 1 }\n', "not ~")
+        self.refused('[ships.zod]\nhttp = "http://l"\npier = { path = "", port = 1 }\n', "must not be empty")
+        self.refused('[ships.zod]\nhttp = "example.com"\npier = { path = "p", port = 1 }\n', "with its scheme")
+        self.refused(self.GOOD + "code = 'nope'\n", "+code")
+        self.refused(self.GOOD + "mnemonic = 'one'\n", "word list")
+        self.refused(self.GOOD + "[[desks]]\nname = 'Bad'\nsrc = 'desk'\n", "desk name")
+        self.refused(self.GOOD + "[[desks]]\nname = 'house'\nsrc = 5\n", "must be a string")
+        self.refused(self.GOOD + "[hosts.b]\nssh = 'a@b'\nroot = 'rel'\n", "absolute")
+        self.refused(self.GOOD + "desks = 'x'\n", "unknown key(s) desks")  # inside [ships.zod]
+
+    def test_hosts(self):
+        self.refused(self.GOOD + 'host = "ghost"\n', "is not a [hosts.<name>]")
+        self.refused(self.GOOD + 'host = ""\n', "is not a [hosts.<name>]")
+        self.refused(self.GOOD + 'host = "local"\n', "is not a [hosts.<name>]")
+        self.refused(self.GOOD + "host = false\n", "must be a string")
+        self.refused(self.GOOD + "[hosts.local]\nssh='a'\nroot='/r'\n", "reserved")
+        cfg = self.load('[hosts.b]\nssh = "a@b"\nroot = "/r"\n[ships.zod]\nhost = "b"\nhttp = "http://l"\n'
+                        'pier = { path = "not/here/remote", port = 1 }\n')  # a remote pier isn't checked here
+        self.assertEqual(cfg.ships[0].host, "b")
+
+    def test_paths_must_exist(self):
+        self.refused('[ships.zod]\nhttp = "http://l"\npier = { path = "nope", port = 1 }\n', "no directory at")
+        self.refused(self.GOOD + "[[desks]]\nname = 'house'\nsrc = 'nope'\n", "no directory at")
+        self.load(self.GOOD + f"[[desks]]\nname = 'house'\nsrc = '.'\n")
+        self.load(f'[ships.zod]\nhttp = "http://l"\npier = {{ path = "{self.dir / "p"}", port = 1 }}\n')
+
+    def test_desks_once_each(self):
+        self.refused(self.GOOD + "[[desks]]\nname = 'house'\nsrc = 'desk'\n"
+                     "[[desks]]\nname = 'house'\nsrc = 'desk'\n", "listed twice")
+
+    def test_ship_names_are_patp(self):
+        for good in ("zod", "marzod", "sampel-palnet", "moddel-migrev-dolseg", "dozzod-dozzod--dozzod-dozzod"):
+            self.load(self.GOOD.replace("zod]", f"{good}]", 1))
+        for bad in ("bus1", "Zod", "foo", "sampel-palzzz", "samp", "zod-", "a_b"):
+            self.refused(self.GOOD.replace("zod]", f"{bad}]", 1), "must be the ship's @p")
+
+    def test_secrets_are_never_echoed(self):
+        for key, val in (("code", "sekret-value"), ("master-ticket", "sekret value"), ("mnemonic", "Sekret")):
+            msg = self.refused(self.GOOD + f"{key} = '{val}'\n", f".{key} must be")
+            self.assertNotIn("ekret", msg)
+            self.assertIn("value not shown", msg)
+
+    def test_every_refusal_names_the_file_and_table(self):
+        msg = self.refused('[ships.zod]\nhttp = "http://l"\npier = { path = "p", port = 0 }\n', "1-65535")
+        self.assertTrue(msg.startswith('admiral.toml: ships["zod"].pier.port '), msg)
 
     def test_login_page_posts_to_eyre(self):
         page = A.login_page("https://x.urbit.house", "lidlut-tabwed-pillex-ridrup", "/apps/x")
@@ -674,14 +755,6 @@ class ConfigFile(unittest.TestCase):
         self.assertIn('name=password value="lidlut-tabwed-pillex-ridrup"', page)
         self.assertIn('name=redirect value="/apps/x"', page)
         self.assertIn('"', A.login_page("h", 'a"b', "/"))
-
-    def test_persist_is_a_pier_bool(self):
-        cfg = self.load('[ships.zod]\npier = { port = 1, persist = true }\n')
-        self.assertTrue(cfg.ships[0].pier.persist)
-        cfg = self.load('[ships.zod]\npier = { port = 1 }\n')
-        self.assertFalse(cfg.ships[0].pier.persist)
-        with self.assertRaises(RuntimeError):
-            self.load('[ships.zod]\npier = { persist = "yes" }\n')
 
     def test_find_repo_walks_up(self):
         (self.dir / "admiral.toml").write_text("")
@@ -699,29 +772,29 @@ class ConfigFile(unittest.TestCase):
 
 
 class LatencyConfig(ConfigFile):
+    LAT = "latency = {{ ms = {ms}, port = {port} }}"
+
     def test_latency_is_a_table_with_ms_and_port(self):
-        ship = self.load('[ships.zod]\nlatency = { ms = 1000, port = 8080 }\npier = { port = 80 }\n').ships[0]
+        ship = self.ship("latency = { ms = 1000, port = 8080 }")
         self.assertEqual((ship.latency, ship.latency_port), (1000, 8080))
         self.assertEqual(A.latency_want(ship), "8080 80 1000")
-        ship = self.load('[ships.zod]\npier = { port = 80 }\n').ships[0]
-        self.assertIsNone(ship.latency)
-        self.assertEqual(A.latency_want(ship), "none")
-        ship = self.load('[ships.zod]\nlatency = { ms = 0, port = 8080 }\npier = { port = 80 }\n').ships[0]
+        self.assertEqual(A.latency_want(self.ship()), "none")
+        ship = self.ship("latency = { ms = 0, port = 8080 }")
         self.assertIsNone(ship.latency)  # ms 0: no proxy
         self.assertEqual(A.latency_want(ship), "none")
 
     def test_the_old_string_form_is_refused_naming_the_table(self):
         for old in ('"1000"', "1000"):
-            with self.assertRaises(RuntimeError, msg=old) as cm:
-                self.load(f"[ships.zod]\nlatency = {old}\n")
+            with self.assertRaises(A.ConfigError, msg=old) as cm:
+                self.ship(f"latency = {old}")
             self.assertIn("latency = { ms = 1000, port = <port> }", str(cm.exception))
-        with self.assertRaises(RuntimeError) as cm:
-            self.load('[ships.zod]\nlatency = { ms = 1000, port = 9000 }\nlatency-port = 9000\n')
+        with self.assertRaises(A.ConfigError) as cm:
+            self.ship("latency = { ms = 1000, port = 9000 }\nlatency-port = 9000")
         self.assertIn("latency-port is gone", str(cm.exception))
 
     def test_the_port_is_required(self):
-        with self.assertRaises(RuntimeError) as cm:
-            self.load('[ships.zod]\nlatency = { ms = 1000 }\npier = { port = 80 }\n')
+        with self.assertRaises(A.ConfigError) as cm:
+            self.ship("latency = { ms = 1000 }")
         self.assertIn("needs port", str(cm.exception))
         self.assertIn(A.LATENCY_FORM, str(cm.exception))
 
@@ -732,11 +805,11 @@ class LatencyConfig(ConfigFile):
                          ('{ ms = 1000, port = 0 }', "port must be"),
                          ('{ ms = 1000, port = true }', "port must be"),
                          ('{ ms = 1000, port = 8080, jitter = 1 }', "unknown key")):
-            with self.assertRaises(RuntimeError, msg=bad) as cm:
-                self.load(f"[ships.zod]\nlatency = {bad}\npier = {{ port = 80 }}\n")
+            with self.assertRaises(A.ConfigError, msg=bad) as cm:
+                self.ship(f"latency = {bad}")
             self.assertIn(why, str(cm.exception), bad)
-        with self.assertRaises(RuntimeError) as cm:
-            self.load('[ships.zod]\nlatency = { ms = 1000, port = 80 }\npier = { port = 80 }\n')
+        with self.assertRaises(A.ConfigError) as cm:
+            self.ship("latency = { ms = 1000, port = 80 }")
         self.assertIn("own http port", str(cm.exception))
 
     def test_engine_gate_and_brief(self):
@@ -750,7 +823,7 @@ class LatencyConfig(ConfigFile):
         self.assertEqual(A.latency_brief("8080 80 0"), "off :8080 -> :80 (direct)")
 
     def test_detail_says_when_live_differs_from_config(self):
-        ship = self.load('[ships.zod]\nlatency = { ms = 1000, port = 8080 }\npier = { port = 80 }\n').ships[0]
+        ship = self.ship("latency = { ms = 1000, port = 8080 }")
         st = lambda latency, version=A.VERSION: A.ShipState(
             "zod", "local", True, False, False, True, [], "up", True, True, False, 80,
             version=version, latency=latency)
@@ -1023,8 +1096,8 @@ class RcBlocks(unittest.TestCase):
 
 
 class Resolution(unittest.TestCase):
-    cfg = A.Config(ships=[A.Ship("zod", A.PierConfig()), A.Ship("nec", A.PierConfig(), host="drain")],
-                   desks=[A.Desk("base"), A.Desk("other")], hosts={"drain": A.Host("drain", "/r", "u@b")})
+    cfg = A.Config(ships=[A.Ship("zod", A.PierConfig(path="p")), A.Ship("nec", A.PierConfig(path="piers/nec"), host="drain")],
+                   desks=[A.Desk("base", "."), A.Desk("other", ".")], hosts={"drain": A.Host("drain", "/r", "u@b")})
 
     def test_ships(self):
         self.assertIs(A.resolve_ship("~zod", self.cfg), self.cfg.ships[0])
@@ -1043,14 +1116,12 @@ class Resolution(unittest.TestCase):
         self.assertIs(A.host_for(self.cfg.ships[0], self.cfg), A.LOCAL)
         h = A.host_for(self.cfg.ships[1], self.cfg)
         self.assertEqual((h.name, h.ssh, h.root), ("drain", "u@b", "/r"))
-        self.assertEqual(A.pier_dir(self.cfg.ships[1], h), "/r/.piers/nec")
+        self.assertEqual(A.pier_dir(self.cfg.ships[1], h), "/r/piers/nec")
         self.assertEqual(A.pier_dir(A.Ship("x", A.PierConfig(path="/abs")), h), "/abs")
 
     def test_ship_base(self):
-        self.assertEqual(A.ship_base(A.Ship("z", A.PierConfig(), http="example.com/")), "https://example.com")
+        self.assertEqual(A.ship_base(A.Ship("z", A.PierConfig(), http="https://example.com/")), "https://example.com")
         self.assertEqual(A.ship_base(A.Ship("z", A.PierConfig(), http="http://l:80")), "http://l:80")
-        with self.assertRaises(RuntimeError):
-            A.ship_base(A.Ship("z", A.PierConfig()))
 
     def test_sync_flags(self):
         flags = A.sync_flags()
@@ -1070,7 +1141,9 @@ class ExitCodes(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
-        (self.dir / "admiral.toml").write_text('[ships.zod]\npier = { path = "p", port = 18080 }\n')
+        (self.dir / "p").mkdir()
+        (self.dir / "admiral.toml").write_text(
+            '[ships.zod]\nhttp = "http://localhost:18080"\npier = { path = "p", port = 18080 }\n')
 
     def tearDown(self):
         self.tmp.cleanup()

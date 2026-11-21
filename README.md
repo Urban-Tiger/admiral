@@ -34,7 +34,32 @@ cp admiral.example.toml admiral.toml   # then edit it: one [ships.<name>] per sh
 ```
 
 Admiral finds its config by climbing from the current directory to the first
-`admiral.toml` (or `.admiral.toml`). See `admiral.example.toml` for the schema.
+`admiral.toml` (or `.admiral.toml`).
+
+## Config
+
+Every setting comes from the config, and admiral fills in nothing. Before any
+command runs, it checks the whole file and refuses (exit 3) a missing required
+key, an unknown key, a wrong type, a bad value, or a local path that isn't
+there. The error names the file, the table and the key. No command changes a
+setting: you change one by editing the file.
+
+`./admiral.py configure` lists every key, its type, and whether it is
+required. In short:
+
+- `[ships.<name>]`: `<name>` is the ship's @p without `~`. Requires `http`, a
+  full origin with its scheme, and `pier = { path, port }`. The pier path is
+  absolute or relative to the host root, never `~`. For a local ship it must
+  exist. Optional: `host`, `code`, `master-ticket`, `mnemonic`, `latency`, and
+  in `pier`, `ames`, `loom` and `memo` (omitted, vere decides), plus `local`
+  and `persist` (omitted means false).
+- `[hosts.<name>]`: optional remote machines, each with `ssh` and an absolute
+  `root`. A ship with no `host` runs on this machine.
+- `[[desks]]`: optional, each with a `name` and a `src` directory relative to
+  the config. A desk can't be listed twice.
+
+admiral runs docked piers only, through the pier's own `<pier>/.run`, never an
+`urbit` from PATH.
 
 ## Output and exit codes
 

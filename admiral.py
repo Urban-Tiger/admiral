@@ -117,7 +117,6 @@ def _find_repo() -> tuple[Path, str]:
 REPO, CONFIG = _find_repo()
 
 # config-value shapes, checked by load_config's validation.
-SHIP_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")  # ships.<name> map key
 DESK_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")          # desks[].name
 CODE_RE = re.compile(r"^[a-z]{6}(-[a-z]{6}){3}$")        # +code override
 TICKET_RE = re.compile(r"^~?[a-z]{6}(-[a-z]{6})+$")      # master ticket (~ optional, 2+ syllables)
@@ -131,14 +130,52 @@ T_DOJO = 60  # a dojo command's budget; past it a thread is aborted, an event is
 T_CHOP = 900  # roll copies the snapshot into the new epoch — minutes on a big pier
 
 
+# ── @p ───────────────────────────────────────────────────────────────────────
+# a ship's name in the config is its @p without the ~: a galaxy is one suffix
+# ("zod"), every other rank whole words of prefix+suffix ("sampel-palnet"), a comet's
+# halves joined by "--".
+PATP_PRE = (
+    "dozmarbinwansamlitsighidfidlissogdirwacsabwissibrigsoldopmodfoglidhopdardorlorhodfolrintogsilmir"
+    "holpaslacrovlivdalsatlibtabhanticpidtorbolfosdotlosdilforpilramtirwintadbicdifrocwidbisdasmidlop"
+    "rilnardapmolsanlocnovsitnidtipsicropwitnatpanminritpodmottamtolsavposnapnopsomfinfonbanmorworsip"
+    "ronnorbotwicsocwatdolmagpicdavbidbaltimtasmalligsivtagpadsaldivdactansidfabtarmonranniswolmispal"
+    "lasdismaprabtobrollatlonnodnavfignomnibpagsopralbilhaddocridmocpacravripfaltodtiltinhapmicfanpat"
+    "taclabmogsimsonpinlomrictapfirhasbosbatpochactidhavsaplindibhosdabbitbarracparloddosbortochilmac"
+    "tomdigfilfasmithobharmighinradmashalraglagfadtopmophabnilnosmilfopfamdatnoldinhatnacrisfotribhoc"
+    "nimlarfitwalrapsarnalmoslandondanladdovrivbacpollaptalpitnambonrostonfodponsovnocsorlavmatmipfip")
+PATP_SUF = (
+    "zodnecbudwessevpersutletfulpensytdurwepserwylsunrypsyxdyrnuphebpeglupdepdysputlughecryttyvsydnex"
+    "lunmeplutseppesdelsulpedtemledtulmetwenbynhexfebpyldulhetmevruttylwydtepbesdexsefwycburderneppur"
+    "rysrebdennutsubpetrulsynregtydsupsemwynrecmegnetsecmulnymtevwebsummutnyxrextebfushepbenmuswyxsym"
+    "selrucdecwexsyrwetdylmynmesdetbetbeltuxtugmyrpelsyptermebsetdutdegtexsurfeltudnuxruxrenwytnubmed"
+    "lytdusnebrumtynseglyxpunresredfunrevrefmectedrusbexlebduxrynnumpyxrygryxfeptyrtustyclegnemfermer"
+    "tenlusnussyltecmexpubrymtucfyllepdebbermughuttunbylsudpemdevlurdefbusbeprunmelpexdytbyttyplevmyl"
+    "wedducfurfexnulluclennerlexrupnedlecrydlydfenwelnydhusrelrudneshesfetdesretdunlernyrsebhulryllud"
+    "remlysfynwerrycsugnysnyllyndyndemluxfedsedbecmunlyrtesmudnytbyrsenwegfyrmurtelreptegpecnelnevfes")
+PATP_PRES = frozenset(PATP_PRE[i:i + 3] for i in range(0, len(PATP_PRE), 3))
+PATP_SUFS = frozenset(PATP_SUF[i:i + 3] for i in range(0, len(PATP_SUF), 3))
+
+
+def is_patp(name: str) -> bool:
+    # a ship name as the config writes it: an @p without its ~
+    if name in PATP_SUFS:
+        return True
+    halves = name.split("--")
+    if len(halves) > 2:
+        return False
+    words = [w for h in halves for w in h.split("-")]
+    return 0 < len(words) <= 8 and all(
+        len(w) == 6 and w[:3] in PATP_PRES and w[3:] in PATP_SUFS for w in words)
+
+
 # ── domain types ─────────────────────────────────────────────────────────────
 @dataclass
 class PierConfig:
-    path: str | None = None   # pier dir; omit => .piers/<name> (defaulted in pier_dir)
+    path: str | None = None   # pier dir: absolute, or relative to the host root
     port: int | None = None   # http bind port on the box
-    loom: int | None = None   # loom size (memory pages, power of 2) passed at boot
+    loom: int | None = None   # loom size passed at boot; omit => vere's own
     memo: int | None = None   # vere's persistent memo cache, in entries (-M); omit =>
-                              # vere's 50000. clay memoizes every +mint there, and an
+                              # vere's own. clay memoizes every +mint there, and an
                               # entry can be a big type: cap it on a ship that builds
     ames: int | None = None   # ames UDP port; omit => vere picks one, and a different
                               # one each boot. pin it for ships that must reach each
@@ -153,106 +190,13 @@ class PierConfig:
                               # when false, so the host always matches this file.
 
 
-# ── ship fields ──────────────────────────────────────────────────────────────
-# The one table behind everything that handles a ship's settings: config load
-# validates against it and builds the Ship from it. A new setting is one new row.
-# admiral.toml is edited by hand; admiral never writes it.
-@dataclass(frozen=True)
-class Field:
-    key: str                  # TOML key ("master-ticket")
-    attr: str                 # attribute on Ship (or on PierConfig when pier)
-    kind: str                 # "str" | "int" | "bool" | "latency" (the { ms, port } table)
-    hint: str                 # what a good value looks like; the error for a bad one
-    pier: bool = False        # lives in the ship's `pier = { ... }` table
-    lo: int = 1               # int range, inclusive
-    hi: int = 2**31
-    ok: Callable[[str], bool] | None = None  # str check beyond "is a string"
-
-
-FIELDS: list[Field] = [
-    Field("http", "http", "str", 'must be a non-empty hostname or URL (e.g. "example.com")',
-          ok=lambda s: bool(s.strip()) and not re.search(r"\s", s)),
-    Field("path", "path", "str", "must be a string", pier=True),
-    Field("port", "port", "int", "must be an integer 1-65535", pier=True, hi=65535),
-    Field("ames", "ames", "int", "must be an integer 1-65535", pier=True, hi=65535),
-    Field("loom", "loom", "int", "must be a positive integer", pier=True),
-    Field("memo", "memo", "int", "must be a positive integer", pier=True),
-    Field("local", "local", "bool", "must be a boolean", pier=True),
-    Field("persist", "persist", "bool", "must be a boolean", pier=True),
-    Field("code", "code", "str", 'must be a +code key (e.g. "ralnyt-botwyc-batnyt-dozzod")',
-          ok=lambda s: bool(CODE_RE.match(s))),
-    Field("master-ticket", "master_ticket", "str", 'must be a ticket like "~ralnyt-botwyc-batnyt-dozzod"',
-          ok=lambda s: bool(TICKET_RE.match(s))),
-    Field("mnemonic", "mnemonic", "str", "must be a space-separated word list (BIP39 mnemonic)",
-          ok=lambda s: bool(MNEMONIC_RE.match(s))),
-    Field("latency", "latency", "latency", "see latency_error"),
-]
-# every key `pier = { ... }` may carry. Config load rejects anything else — see load_config.
-PIER_KEYS = frozenset(f.key for f in FIELDS if f.pier)
-
-
-def field_error(f: Field, v: Any) -> str | None:
-    # why a typed value is not acceptable for f, or None. None itself is always fine:
-    # every field is optional (an absent `local` reads as false).
-    if v is None:
-        return None
-    if f.kind == "int":
-        bad = not isinstance(v, int) or isinstance(v, bool) or v < f.lo or v > f.hi
-    elif f.kind == "bool":
-        bad = not isinstance(v, bool)
-    elif f.kind == "latency":
-        return latency_error(v)
-    else:
-        bad = not isinstance(v, str) or (f.ok is not None and not f.ok(v))
-    return f"{f.hint}, got {v!r}" if bad else None
-
-
-LATENCY_FORM = "latency = { ms = 1000, port = 8080 }"
-LATENCY_MS_MAX = 600000
-
-
-def latency_error(v: Any) -> str | None:
-    # why `latency` is not a { ms, port } table admiral can run a proxy from, or None.
-    # Both keys are required; ms 0 is a proxy turned off (none runs).
-    def is_int(x: Any) -> bool:
-        return isinstance(x, int) and not isinstance(x, bool)
-    if not isinstance(v, dict):
-        ms = v if is_int(v) else (int(v) if isinstance(v, str) and v.strip().isdigit() else None)
-        form = LATENCY_FORM if ms is None else f"latency = {{ ms = {ms}, port = <port> }}"
-        return f"is a table now, with the proxy's port: write {form}, got {v!r}"
-    unknown = sorted(set(v) - {"ms", "port"})
-    if unknown:
-        return f"has unknown key(s) {', '.join(unknown)} (known: ms, port): write {LATENCY_FORM}"
-    ms, port = v.get("ms"), v.get("port")
-    if ms is None:
-        return f"needs ms, the round trip in milliseconds: write {LATENCY_FORM}"
-    if not is_int(ms) or not 0 <= ms <= LATENCY_MS_MAX:
-        return f"ms must be an integer 0-{LATENCY_MS_MAX} (the round trip), got {ms!r}"
-    if port is None:
-        return f"needs port, where the proxy listens (there is no default): write {LATENCY_FORM}"
-    if not is_int(port) or not 1 <= port <= 65535:
-        return f"port must be an integer 1-65535, got {port!r}"
-    return None
-
-
-def field_get(ship: "Ship", f: Field) -> Any:
-    return getattr(ship.pier if f.pier else ship, f.attr)
-
-
-def make_ship(name: str, host: str | None, values: dict[str, Any]) -> "Ship":
-    # a Ship from field values keyed by attr; a missing or empty value is unset.
-    pier = PierConfig(**{f.attr: (bool(values.get(f.attr)) if f.kind == "bool" else values.get(f.attr))
-                         for f in FIELDS if f.pier})
-    return Ship(name=name, pier=pier, host=host, latency_port=values.get("latency_port"),
-                **{f.attr: values.get(f.attr) or None for f in FIELDS if not f.pier})
-
 @dataclass
 class Ship:
-    name: str                 # map key — the ship name (the selector matches this)
+    name: str                 # map key: the ship's @p without ~ (the selector matches this)
     pier: PierConfig          # pier dir + bind port + loom on its box
-    host: str | None = None   # hosts map key; empty/None => the local machine
-    http: str | None = None   # http origin of the ship's web UI; REQUIRED for web access
-    code: str | None = None   # optional +code override; skips the live dojo read
+    host: str | None = None   # hosts map key; None => the local machine
+    http: str | None = None   # http origin of the ship's web UI, with its scheme
+    code: str | None = None   # optional +code; skips the live dojo read
     master_ticket: str | None = None  # ship master ticket (key material; for boot)
     mnemonic: str | None = None       # BIP39 mnemonic seed phrase (key material)
     latency: int | None = None        # ms of round trip the latency proxy adds (see DelayProxy); None = no proxy
@@ -262,7 +206,7 @@ class Ship:
 @dataclass
 class Desk:
     name: str
-    src: str = "."            # repo subpath; defaulted to "."
+    src: str                  # source dir, relative to the config's directory
 
 
 @dataclass
@@ -293,22 +237,171 @@ class Config:
     hosts: dict[str, Host]    # remote hosts by name; the local machine is implicit
 
 
+# ── the schema ───────────────────────────────────────────────────────────────
+# Every key admiral.toml may hold, in one place: its table, type, whether it is
+# required, any check past the type, and what it means. load_config checks a config
+# against it before any command runs and builds nothing from a key it does not list;
+# `configure` prints it. admiral fills in nothing: a key that is absent is absent (an
+# optional one means "admiral passes nothing", so vere decides, or "off"). A missing
+# required key, an unknown key, a wrong type or a bad value is refused, naming the
+# file, the table, the key and what it wants. admiral.toml is edited by hand; admiral
+# never writes it.
+LATENCY_FORM = "latency = { ms = 1000, port = 8080 }"
+LATENCY_MS_MAX = 600000
+
+
+@dataclass(frozen=True)
+class Key:
+    key: str                  # TOML key ("master-ticket")
+    kind: str                 # "str" | "int" | "bool" | "table"
+    doc: str                  # what it means (configure prints it)
+    required: bool = False
+    lo: int = 1               # int range, inclusive
+    hi: int = 2**31
+    check: Callable[[Any], str | None] | None = None  # past the type: why not, or None
+    secret: bool = False      # key material: an error never echoes the value
+
+
+def _no_tilde(p: str) -> str | None:
+    if not p.strip():
+        return "must not be empty"
+    if p.startswith("~"):
+        return "must be absolute or relative to the host root, not ~ (a remote shell would not expand it)"
+    return None
+
+
+def _origin(u: str) -> str | None:
+    return None if re.match(r"^https?://[^\s/]+(/\S*)?$", u) else (
+        'must be a full origin with its scheme, e.g. "http://localhost:8080" or "https://example.com"')
+
+
+def _matches(rx: re.Pattern, want: str) -> Callable[[str], str | None]:
+    return lambda s: None if rx.match(s) else f"must be {want}"
+
+
+def latency_error(v: Any) -> str | None:
+    # why `latency` is not a { ms, port } table admiral can run a proxy from, or None.
+    # Both keys are required; ms 0 is a proxy turned off (none runs).
+    def is_int(x: Any) -> bool:
+        return isinstance(x, int) and not isinstance(x, bool)
+    if not isinstance(v, dict):
+        ms = v if is_int(v) else (int(v) if isinstance(v, str) and v.strip().isdigit() else None)
+        form = LATENCY_FORM if ms is None else f"latency = {{ ms = {ms}, port = <port> }}"
+        return f"is a table now, with the proxy's port: write {form}, got {v!r}"
+    unknown = sorted(set(v) - {"ms", "port"})
+    if unknown:
+        return f"has unknown key(s) {', '.join(unknown)} (known: ms, port): write {LATENCY_FORM}"
+    ms, port = v.get("ms"), v.get("port")
+    if ms is None:
+        return f"needs ms, the round trip in milliseconds: write {LATENCY_FORM}"
+    if not is_int(ms) or not 0 <= ms <= LATENCY_MS_MAX:
+        return f"ms must be an integer 0-{LATENCY_MS_MAX} (the round trip), got {ms!r}"
+    if port is None:
+        return f"needs port, where the proxy listens (there is no default): write {LATENCY_FORM}"
+    if not is_int(port) or not 1 <= port <= 65535:
+        return f"port must be an integer 1-65535, got {port!r}"
+    return None
+
+
+SHIP_KEYS: list[Key] = [
+    Key("pier", "table", "where the pier is and how it boots: { path, port, ... }", required=True),
+    Key("http", "str", "the ship's web origin with its scheme, e.g. http://localhost:8080 or "
+        "https://example.com", required=True, check=_origin),
+    Key("host", "str", "a [hosts.<name>] the ship runs on; omit for this machine"),
+    Key("code", "str", "its +code (skips the live dojo read)",
+        check=_matches(CODE_RE, 'a +code like "ralnyt-botwyc-batnyt-dozzod"'), secret=True),
+
+    Key("master-ticket", "str", "the ship's master ticket, plain text, for tooling that needs it",
+        check=_matches(TICKET_RE, 'a ticket like "~ralnyt-botwyc-batnyt-dozzod"'), secret=True),
+
+    Key("mnemonic", "str", "its BIP39 seed phrase, plain text, for tooling that needs it",
+        check=_matches(MNEMONIC_RE, "a space-separated word list (BIP39 mnemonic)"), secret=True),
+
+    Key("latency", "table", "a proxy in front of the ship's http port that adds a hosted ship's "
+        "round trip: { ms = 1000, port = 8080 }, both required (port is where it listens; "
+        "ms 0 is none). `run` starts it; `latency reload` applies a change to a running ship",
+        check=latency_error),
+]
+PIER_KEYS: list[Key] = [
+    Key("path", "str", "the pier dir: absolute, or relative to the host root (for a local "
+        "ship, the config's directory)", required=True, check=_no_tilde),
+    Key("port", "int", "the http bind port", required=True, hi=65535),
+    Key("ames", "int", "the ames UDP port; omit and vere picks a new one each boot. Pin it so "
+        "peers' lanes survive a restart", hi=65535),
+    Key("loom", "int", "loom size passed to vere --loom; omit for vere's own"),
+    Key("memo", "int", "vere's persistent memo cache cap, in entries; omit for vere's own"),
+    Key("local", "bool", "boot with -L (fake networking): for a COPIED pier whose original still "
+        "runs. Absent is false"),
+    Key("persist", "bool", "come up at boot through a systemd user unit that `run` writes "
+        "(Linux only). Absent is false"),
+]
+HOST_KEYS: list[Key] = [
+    Key("ssh", "str", "ssh target, e.g. urb@box; `ssh <it>` must work unattended", required=True,
+        check=lambda s: None if s.strip() and not re.search(r"\s", s) else "must be an ssh target like urb@box"),
+    Key("root", "str", "absolute base dir on the box that pier paths are relative to", required=True,
+        check=lambda s: None if s.startswith("/") else "must be an absolute path"),
+]
+DESK_KEYS: list[Key] = [
+    Key("name", "str", "the desk name on the ship", required=True,
+        check=_matches(DESK_NAME_RE, f"a desk name matching {DESK_NAME_RE.pattern}")),
+    Key("src", "str", 'its source dir, relative to the config\'s directory ("." for that '
+        "directory itself)", required=True, check=lambda s: None if s.strip() else "must not be empty"),
+]
+TOP_KEYS = ("ships", "hosts", "desks")
+
+
+def key_error(k: Key, v: Any) -> str | None:
+    # why v is not a value for k, or None
+    if k.kind == "int":
+        if not isinstance(v, int) or isinstance(v, bool) or not k.lo <= v <= k.hi:
+            want = f"an integer {k.lo}-{k.hi}" if k.hi < 2**31 else "a positive integer"
+            return f"must be {want}, got {v!r}"
+        return None
+    if k.kind == "bool":
+        return None if isinstance(v, bool) else f"must be true or false, got {v!r}"
+    if k.kind == "str" and not isinstance(v, str):
+        return f"must be a string, got {v!r}"
+    if k.kind == "table" and not isinstance(v, dict) and k.check is None:
+        return f"must be a table {{ ... }}, got {v!r}"
+    if k.check:
+        why = k.check(v)
+        if why:
+            return why if k.kind == "table" else f"{why}, got {v!r}"
+    return None
+
+
+def check_table(where: str, raw: Any, keys: list[Key]) -> dict[str, Any]:
+    # raw against keys: a table, no key it doesn't list, every required one present,
+    # each value its type. Returns raw; raises ConfigError naming `where` and the key.
+    known = [k.key for k in keys]
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where} must be a table {{ {', '.join(known)} }}, got {raw!r}")
+    unknown = sorted(set(raw) - set(known))
+    if unknown:
+        raise ConfigError(f"{where} has unknown key(s) {', '.join(unknown)} (known: {', '.join(known)})")
+    for k in keys:
+        if k.key not in raw:
+            if k.required:
+                raise ConfigError(f"{where} is missing {k.key}: {k.doc}")
+            continue
+        why = key_error(k, raw[k.key])
+        if why:
+            if k.secret:  # key material: say what's wrong, never echo it
+                why = re.sub(r", got .*$", " (value not shown)", why, flags=re.S)
+            raise ConfigError(f"{where}.{k.key} {why}")
+    return raw
+
+
 # ── config loading + validation ──────────────────────────────────────────────
 def load_config(file: Path | None = None) -> Config:
-    # `file` overrides the walk-up config; tests load fixtures through it.
+    # read and check the whole config before any command runs. `file` overrides the
+    # walk-up config; tests load fixtures through it.
     file = file or REPO / CONFIG
     try:
         raw = file.read_text("utf8")
     except OSError:
         raise ConfigError(
-            f"{file} not found — create it by hand (see admiral.example.toml), e.g.\n"
-            f"  [ships.<name>]\n"
-            f'  http = "http://localhost:<port>"\n'
-            f"  pier = {{ port = <port> }}\n\n"
-            f"  [[desks]]\n"
-            f'  name = "<desk>"\n'
-            f'  src = "."'
-        )
+            f"{file} not found — create it by hand (`{INVOKE} configure` explains every key)")
     try:
         import tomllib  # lazy: the host-side engine runs under whatever python3 the box has
     except ImportError:
@@ -316,88 +409,74 @@ def load_config(file: Path | None = None) -> Config:
     try:
         cfg = tomllib.loads(raw)
     except Exception as e:
-        raise ConfigError(f"{CONFIG}: invalid TOML: {e}")
+        raise ConfigError(f"{file.name}: invalid TOML: {e}")
+    name = file.name
 
+    unknown = sorted(set(cfg) - set(TOP_KEYS))
+    if unknown:
+        raise ConfigError(f"{name} has unknown top-level key(s) {', '.join(unknown)} "
+                          f"(known: {', '.join(TOP_KEYS)})")
     ships_raw = cfg.get("ships")
     if not isinstance(ships_raw, dict) or not ships_raw:
-        raise ConfigError(f'{CONFIG}: "ships" must be a non-empty table of [ships.<name>] entries')
+        raise ConfigError(f'{name}: "ships" must be a non-empty table of [ships.<name>] entries')
+
+    # hosts: OPTIONAL remote machines; the local machine is implicit (a ship with no host)
+    hosts: dict[str, Host] = {}
+    hosts_raw = cfg.get("hosts", {})
+    if not isinstance(hosts_raw, dict):
+        raise ConfigError(f'{name}: "hosts" must be a table of [hosts.<name>] entries')
+    for hname, h in hosts_raw.items():
+        if hname == "local":
+            raise ConfigError(f'{name}: hosts["local"] is reserved — a ship on this machine omits "host"')
+        check_table(f'{name}: hosts["{hname}"]', h, HOST_KEYS)
+        hosts[hname] = Host(hname, h["root"], h["ssh"])
+
+    here = file.parent.resolve()  # the local machine's root: relative local paths start here
+    ships: list[Ship] = []
+    for sname, ship in ships_raw.items():
+        where = f'{name}: ships["{sname}"]'
+        if not is_patp(sname):
+            raise ConfigError(f"{where}: the table's name must be the ship's @p without ~, "
+                              f'e.g. [ships.sampel-palnet] or [ships.zod]')
+        if isinstance(ship, dict) and "latency-port" in ship:
+            raise ConfigError(f"{where}.latency-port is gone: the port goes in the latency table, "
+                              f"{LATENCY_FORM}")
+        check_table(where, ship, SHIP_KEYS)
+        pier = check_table(f"{where}.pier", ship["pier"], PIER_KEYS)
+        host = ship.get("host")
+        if host is not None and host not in hosts:
+            raise ConfigError(f'{where}.host "{host}" is not a [hosts.<name>] '
+                              f'(have: {", ".join(hosts) or "none"}; omit host for this machine)')
+        lat = ship.get("latency")
+        if lat is not None and lat["port"] == pier["port"]:
+            raise ConfigError(f"{where}.latency.port {lat['port']} is the ship's own http port; "
+                              f"the proxy needs a port of its own")
+        if host is None:
+            d = pier["path"] if os.path.isabs(pier["path"]) else os.path.join(here, pier["path"])
+            if not os.path.isdir(d):
+                raise ConfigError(f"{where}.pier.path: no directory at {d}")
+        ships.append(Ship(
+            name=sname, host=host, http=ship["http"], code=ship.get("code"),
+            master_ticket=ship.get("master-ticket"), mnemonic=ship.get("mnemonic"),
+            latency=(lat["ms"] or None) if lat else None, latency_port=lat["port"] if lat else None,
+            pier=PierConfig(path=pier["path"], port=pier["port"], loom=pier.get("loom"),
+                            memo=pier.get("memo"), ames=pier.get("ames"),
+                            local=pier.get("local", False), persist=pier.get("persist", False))))
+
     # desks: OPTIONAL. A config with no desks is valid — it just can't commit.
     desks_raw = cfg.get("desks", [])
     if not isinstance(desks_raw, list):
-        raise ConfigError(f'{CONFIG}: "desks" must be an array of {{ name, src }} entries')
-
-    # hosts: a table of REMOTE machines, keyed by name (the local machine is
-    # implicit — a ship with no "host" runs locally, root = REPO). Validate first
-    # so ships can reference them.
-    hosts: dict[str, Host] = {}
-    hosts_raw = cfg.get("hosts")
-    if hosts_raw is not None:
-        if not isinstance(hosts_raw, dict):
-            raise ConfigError(f'{CONFIG}: "hosts" must be a table of [hosts.<name>] entries')
-        for hname, h in hosts_raw.items():
-            if hname == "local":
-                raise ConfigError(f'{CONFIG}: hosts["local"] is reserved — the local machine is implicit (omit "host", or set it to "local")')
-            if not isinstance(h, dict):
-                raise ConfigError(f'{CONFIG}: hosts["{hname}"] must be a table {{ ssh, root }}')
-            if not h.get("ssh") or not isinstance(h["ssh"], str):
-                raise ConfigError(f'{CONFIG}: hosts["{hname}"] missing "ssh" target')
-            if not h.get("root"):
-                raise ConfigError(f'{CONFIG}: hosts["{hname}"] missing "root" (absolute base dir for piers, e.g. /home/urb)')
-            if not os.path.isabs(h["root"]):
-                raise ConfigError(f'{CONFIG}: hosts["{hname}"].root "{h["root"]}" must be an absolute path')
-            hosts[hname] = Host(hname, h["root"], h["ssh"])
-
-    ships: list[Ship] = []
-    for sname, ship in ships_raw.items():
-        if not isinstance(ship, dict):
-            raise ConfigError(f'{CONFIG}: ships["{sname}"] must be a table {{ pier, http, ... }}')
-        if not SHIP_NAME_RE.match(sname):
-            raise ConfigError(f'{CONFIG}: ship name "{sname}" must match {SHIP_NAME_RE.pattern}')
-        # host: top-level hosts key; empty/"local"/None => the local machine.
-        host = ship.get("host") or None
-        if host is not None and host != "local" and host not in hosts:
-            raise ConfigError(
-                f'{CONFIG}: ships["{sname}"].host "{host}" is not in "hosts" '
-                f'(have: {", ".join(["local", *hosts])})'
-            )
-        # pier: optional table of where the ship's pier lives + its boot params.
-        pier = ship.get("pier") or {}
-        if not isinstance(pier, dict):
-            raise ConfigError(f'{CONFIG}: ships["{sname}"].pier must be a table {{ {", ".join(sorted(PIER_KEYS))} }}')
-        # Reject keys we don't know rather than ignoring them: a typo (or a setting
-        # from a newer admiral) is loud instead of silently doing nothing.
-        unknown = sorted(set(pier) - PIER_KEYS)
-        if unknown:
-            raise ConfigError(
-                f'{CONFIG}: ships["{sname}"].pier has unknown key(s) {", ".join(unknown)} '
-                f'(known: {", ".join(sorted(PIER_KEYS))})')
-        if "latency-port" in ship:
-            raise ConfigError(f'{CONFIG}: ships["{sname}"].latency-port is gone: the port goes in the '
-                               f'latency table, {LATENCY_FORM}')
-        values: dict[str, Any] = {}
-        for f in FIELDS:
-            v = (pier if f.pier else ship).get(f.key)
-            err = field_error(f, v)
-            if err:
-                raise ConfigError(f'{CONFIG}: ships["{sname}"].{"pier." if f.pier else ""}{f.key} {err}')
-            values[f.attr] = v
-        lat = values.pop("latency", None)
-        if lat is not None:
-            if lat["port"] == values.get("port"):
-                raise ConfigError(f'{CONFIG}: ships["{sname}"].latency.port {lat["port"]} is the ship\'s '
-                                   f'own http port; the proxy needs a port of its own')
-            values["latency"], values["latency_port"] = lat["ms"] or None, lat["port"]
-        ships.append(make_ship(sname, host, values))
-
+        raise ConfigError(f'{name}: "desks" must be an array of [[desks]] {{ name, src }} entries')
     desks: list[Desk] = []
     for i, desk in enumerate(desks_raw):
-        if not isinstance(desk, dict):
-            raise ConfigError(f"{CONFIG}: desks[{i}] must be a table {{ name, src }}")
-        if not desk.get("name"):
-            raise ConfigError(f'{CONFIG}: desks[{i}] missing "name"')
-        if not DESK_NAME_RE.match(desk["name"]):
-            raise ConfigError(f'{CONFIG}: desks[{i}].name "{desk["name"]}" must match {DESK_NAME_RE.pattern}')
-        desks.append(Desk(name=desk["name"], src=desk.get("src", ".")))
+        where = f"{name}: desks[{i}]"
+        check_table(where, desk, DESK_KEYS)
+        if any(d.name == desk["name"] for d in desks):
+            raise ConfigError(f'{where}: desk "{desk["name"]}" is listed twice')
+        d = os.path.join(here, desk["src"])
+        if not os.path.isdir(d):
+            raise ConfigError(f'{where}.src: no directory at {d}')
+        desks.append(Desk(name=desk["name"], src=desk["src"]))
 
     cfg = Config(ships=ships, desks=desks, hosts=hosts)
     check_desk_srcs(cfg)
@@ -406,15 +485,13 @@ def load_config(file: Path | None = None) -> Config:
 
 # ── resolution helpers ────────────────────────────────────────────────────────
 def pier_rel(ship: Ship) -> str:
-    # the pier path as configured (or its default) — relative unless absolute/~.
-    return ship.pier.path or f".piers/{ship.name}"
+    # the pier path as configured: absolute, or relative to the host root
+    return ship.pier.path
 
 
 def pier_dir(ship: Ship, host: Host) -> str:
     p = pier_rel(ship)
-    if os.path.isabs(p) or p.startswith("~"):
-        return p
-    return os.path.join(host.root, p)
+    return p if os.path.isabs(p) else os.path.join(host.root, p)
 
 
 def ship_by_name(name: str, cfg: Config) -> Ship | None:
@@ -466,10 +543,13 @@ def ensure_self(host: Host) -> str:
 
 
 def vere_binary(ship: Ship, host: Host) -> str:
-    # a booted pier keeps its own vere binary at <pier>/.run, so prefer that (the
-    # host then needs no `urbit` on PATH); fall back to `urbit`.
+    # the pier's own vere, <pier>/.run. admiral runs docked piers only: it never looks
+    # for an `urbit` on PATH.
     run = os.path.join(pier_dir(ship, host), ".run")
-    return run if host_has_run(host, run) else "urbit"
+    if not host_has_run(host, run):
+        raise RuntimeError(f'ship "{ship.name}": no vere at {run}. admiral runs docked piers; '
+                           f"dock it with `urbit dock <pier>`")
+    return run
 
 
 def run_argv(ship: Ship, host: Host) -> list[str]:
@@ -483,8 +563,7 @@ def run_argv(ship: Ship, host: Host) -> list[str]:
         cmd += ["--loom", str(ship.pier.loom)]
     if ship.pier.memo is not None:
         cmd += ["--keep-cache-limit", str(ship.pier.memo)]
-    if ship.pier.port is not None:
-        cmd += ["--http-port", str(ship.pier.port)]
+    cmd += ["--http-port", str(ship.pier.port)]
     if ship.pier.ames is not None:
         cmd += ["-p", str(ship.pier.ames)]
     cmd.append(pier)
@@ -493,26 +572,13 @@ def run_argv(ship: Ship, host: Host) -> list[str]:
 
 def ship_base(ship: Ship) -> str:
     # the base origin of the ship's web UI (the status probe and harness.py target it):
-    # the configured http origin, scheme defaulting to https. REQUIRED — there is no
-    # localhost:<port> fallback.
-    if not ship.http:
-        raise RuntimeError(
-            f'ship "{ship.name}" has no "http" in {CONFIG} — '
-            f'web access needs an http origin to target (no localhost:<port> fallback)'
-        )
-    d = ship.http.strip().rstrip("/")
-    return d if re.match(r"^https?://", d, re.I) else f"https://{d}"
+    # the configured http origin, which the schema requires with its scheme.
+    return ship.http.rstrip("/")
 
 
-def web_reachable(ship: Ship) -> bool | None:
+def web_reachable(ship: Ship) -> bool:
     # can we reach the ship's http UI? GET <http>/~/login and accept any non-5xx.
-    # None => no "http" origin set so we didn't try (no localhost assumption);
-    # False => http is set but the request failed/timed out/returned 5xx.
-    try:
-        base = ship_base(ship)
-    except Exception:
-        return None
-    url = base.rstrip("/") + "/~/login"
+    url = ship_base(ship) + "/~/login"
     try:
         resp = urllib.request.urlopen(url, timeout=T_HTTP)
         return resp.status < 500
@@ -600,9 +666,8 @@ LOCAL = Host("local", str(REPO))
 
 
 def host_for(ship: Ship, cfg: Config) -> Host:
-    # no host, or the reserved name "local", => the local machine. load_config already
-    # rejected a name that is not in hosts.
-    if not ship.host or ship.host == "local":
+    # no host => the local machine. load_config already refused a name not in hosts.
+    if ship.host is None:
         return LOCAL
     return cfg.hosts[ship.host]
 
@@ -986,7 +1051,7 @@ def engine_has_latency(version: str | None, since: tuple[int, ...] = LATENCY_SIN
 def latency_want(ship: Ship) -> str:
     # the proxy state (DelayProxy.state) this ship's config asks for: "none", or
     # "<listen> <target> <ms>"
-    if not ship.latency or ship.latency_port is None or ship.pier.port is None:
+    if not ship.latency:
         return "none"
     return f"{ship.latency_port} {ship.pier.port} {ship.latency}"
 
@@ -1017,8 +1082,6 @@ def latency_apply(host: Host, ship: Ship, msg: str | None = None) -> str:
     # put the daemon's proxy where the config says (or send `msg`): its brief, or raise
     # with the daemon's reason
     if msg is None:
-        if ship.latency and ship.pier.port is None:
-            raise RuntimeError(f'ship "{ship.name}" has no pier.port for the latency proxy to sit in front of')
         want = latency_want(ship)
         msg = "stop" if want == "none" else f"set {want}"
     got = daemon_latency(host, ship, msg)
@@ -1041,10 +1104,8 @@ def pier_exists(host: Host, ship: Ship) -> bool:
 
 
 def host_has_run(host: Host, run: str) -> bool:
-    # a booted pier keeps its own vere binary at <pier>/.run; prefer it so the host
-    # needs no `urbit` on PATH. host-aware: stat the file on the SHIP's host (remote
-    # too), not the local control machine — else a remote with no `urbit` on PATH
-    # exits 127.
+    # is <pier>/.run there? Stat it on the SHIP's host (remote too), not the local
+    # control machine.
     if not host.ssh:
         return os.path.exists(run)
     try:
@@ -1244,8 +1305,7 @@ def shown_port(p: int | None) -> str:
 def desk_src_dir(desk: Desk) -> str:
     # ALWAYS local — the desk source is this repo checkout, regardless of which box
     # the ship runs on; only the rsync destination is host-routed.
-    src = desk.src or "."
-    return os.path.join(str(REPO), ".") if src == "." else os.path.join(str(REPO), src)
+    return os.path.join(str(REPO), desk.src)
 
 
 def _local_mounts(desk: Desk, cfg: Config) -> list[tuple[Ship, str, str]]:
@@ -1308,10 +1368,10 @@ def self_mounted(ship: Ship, desk: Desk, cfg: Config) -> bool:
 def do_sync(ship: Ship, desk: Desk, cfg: Config) -> None:
     host = host_for(ship, cfg)
     dest_dir = os.path.join(pier_dir(ship, host), desk.name)
-    src = desk.src or "."
+    src = desk.src
     src_dir = desk_src_dir(desk)
-    if src != "." and not os.path.exists(src_dir):
-        raise RuntimeError(f'desk "{desk.name}": source directory not found: {src_dir}')
+    if not os.path.isdir(src_dir):
+        raise ConfigError(f'desk "{desk.name}": source directory not found: {src_dir}')
     if self_mounted(ship, desk, cfg):
         sys.stderr.write(f"{src} is {ship.name}'s %{desk.name} mount; no sync\n")
         return
@@ -2414,7 +2474,7 @@ def print_status(ships: list[Ship], results: list[ShipState | Exception], cfg: C
     out: list[str] = ["", f"  {paint('config', 'gray', on)} {REPO / CONFIG}", ""]
     for ship, r in zip(ships, results):
         host = host_for(ship, cfg)
-        host_cell = f"{host.name}:{ship.pier.port}" if ship.pier.port is not None else host.name
+        host_cell = f"{host.name}:{ship.pier.port}"
         pier = pier_rel(ship)
         code = "set" if ship.code else "live"
         v = r if isinstance(r, ShipState) else None
@@ -2455,8 +2515,11 @@ def print_detail(ship: Ship, cfg: Config) -> None:
 
     # the three versions behind the ship: admiral's engine, vere, and the kelvin its
     # base desk is built for (read from the dojo).
-    vere = host.exec(vere_binary(ship, host), ["--version"], check=False).split("\n")[0]
-    vere = vere.removeprefix("urbit ").strip() or "-"
+    try:
+        vere = host.exec(vere_binary(ship, host), ["--version"], check=False).split("\n")[0]
+        vere = vere.removeprefix("urbit ").strip() or "-"
+    except RuntimeError:
+        vere = "no <pier>/.run"
     kelvin = "-"
     if st.dojo:
         try:
@@ -2466,7 +2529,7 @@ def print_detail(ship: Ship, cfg: Config) -> None:
             kelvin = "? (the dojo did not answer; see slog)"
 
     pier_extra = [
-        f"port {ship.pier.port}" if ship.pier.port is not None else None,
+        f"port {ship.pier.port}",
         f"loom {ship.pier.loom}" if ship.pier.loom is not None else None,
         f"memo {ship.pier.memo}" if ship.pier.memo is not None else None,
     ]
@@ -2578,7 +2641,7 @@ def cmd_latency(a: Parsed) -> None:
             latency_apply(host, ship)
             return "proxy stopped (the config sets none)"
         brief = latency_apply(host, ship)
-        origin = re.sub(r":\d+$", "", (ship.http or "http://localhost").rstrip("/"))
+        origin = re.sub(r":\d+$", "", ship_base(ship))
         return f"{brief}   {origin}:{ship.latency_port}"
 
     on_ship(a, work)
@@ -2900,10 +2963,8 @@ def log_size_kb(host: Host, ship: Ship) -> int:
 def vere_argv(ship: Ship, host: Host, verb: str, *extra: str) -> list[str]:
     # an offline vere utility (roll / chop / next) against the pier. A docked
     # <pier>/.run self-locates its pier and rejects an explicit one ("invalid
-    # command"); only a bare `urbit` needs the pier argument.
-    binary = vere_binary(ship, host)
-    target = [] if binary != "urbit" else [pier_dir(ship, host)]
-    return [binary, verb, *extra, *target]
+    # command").
+    return [vere_binary(ship, host), verb, *extra]
 
 
 def offline(ship: Ship, host: Host, log: Callable[[str], None], what: str,
@@ -3129,65 +3190,46 @@ def _shell_arg(a: Parsed) -> str:
     return shell
 
 
-FIELD_DOC: dict[str, str] = {
-    # one line per config key, for `configure`; FIELDS carries the type and check
-    "host": "a [hosts.<name>] the ship runs on; omit for this machine",
-    "http": "the ship's web origin, e.g. http://localhost:8080 or a public https URL",
-    "code": "its +code (skips the live dojo read)",
-    "master-ticket": "the ship's master ticket, plain text, for tooling that needs it",
-    "mnemonic": "its BIP39 seed phrase, plain text, for tooling that needs it",
-    "path": "pier dir, relative to the host root (here, for a local ship); default .piers/<name>",
-    "port": "the http bind port",
-    "ames": "the ames UDP port; pin it so peers' lanes survive a restart",
-    "loom": "loom size in memory pages, a power of 2",
-    "memo": "vere's persistent memo cache cap, in entries (default 50000)",
-    "local": "boot with -L (fake networking): for a COPIED pier whose original still runs",
-    "persist": "come up at boot through a systemd user unit that `run` writes (Linux only)",
-    "latency": "a proxy in front of the ship's http port that adds a hosted ship's round "
-               "trip: { ms = 1000, port = 8080 }, both required (port is where it listens; "
-               "ms 0 is none). `run` starts it; `latency reload` applies a change to a "
-               "running ship (see help latency)",
-}
-
-
 def cmd_configure(a: Parsed) -> None:
     # explain how to write admiral.toml: where it is looked for, then every table and
-    # key with its meaning and type. Keys come from FIELDS so the list cannot drift
-    # from the loader.
+    # key with its type, whether it is required, and its meaning. Printed from the
+    # schema (SHIP_KEYS, PIER_KEYS, HOST_KEYS, DESK_KEYS) so it cannot drift from the
+    # loader.
     color = is_tty(sys.stdout)
     bold = lambda s: paint(s, "bold", color)
     gray = lambda s: paint(s, "gray", color)
-    kinds = {"str": "string", "int": "integer", "bool": "bool", "latency": "table"}
-    keys = ["host", *(f.key for f in FIELDS if not f.pier), *(f.key for f in FIELDS if f.pier)]
-    w = max(len(k) for k in keys)
+    kinds = {"str": "string", "int": "integer", "bool": "bool", "table": "table"}
+    w = max(len(k.key) for k in [*SHIP_KEYS, *PIER_KEYS, *HOST_KEYS, *DESK_KEYS]) + 2
 
-    def row(key: str, kind: str, indent: str = "  ") -> str:
-        label = indent + key
-        return "\n".join(label_wrap(label, len(indent) + w, f"{kind}. {FIELD_DOC[key]}", HELP_WIDTH))
-    ship_rows = [row("host", "string"), *(row(f.key, kinds[f.kind]) for f in FIELDS if not f.pier)]
-    pier_rows = [row(f.key, kinds[f.kind], "    ") for f in FIELDS if f.pier]
+    def rows(keys: list[Key], indent: str = "  ") -> str:
+        out = []
+        for k in keys:
+            need = "required" if k.required else "optional"
+            out += label_wrap(indent + k.key, len(indent) + w, f"{kinds[k.kind]}, {need}. {k.doc}", HELP_WIDTH)
+        return "\n".join(out)
     sys.stdout.write(f"""
 {bold(f"{CONFIG}: how to write it")}
 
   {NAME} finds its config by climbing from the current directory to the
   first {CONFIG} (or .{CONFIG}), as git finds .git. It never writes the
-  file: every command re-reads and validates it, so a bad key is reported.
+  file, and it fills in nothing: every command checks the whole file first
+  and refuses a missing required key, an unknown key, a wrong type, or a
+  path that isn't there, naming the table and the key.
 
 {bold("[ships.<name>]")}  {gray("one table per ship; <name> is the ship's @p without ~")}
 
-{chr(10).join(ship_rows)}
-  {"pier".ljust(w)}  table. where the pier is and how it boots, inline {{ ... }}:
-{chr(10).join(pier_rows)}
+{rows(SHIP_KEYS)}
 
-{bold("[hosts.<name>]")}  {gray("a remote machine; the local machine is implicit")}
+  {bold("pier = { ... }")}
+{rows(PIER_KEYS, "    ")}
 
-  {"ssh".ljust(w)}  ssh target, e.g. urb@box
-  {"root".ljust(w)}  absolute base dir on the box that pier paths are relative to
+{bold("[hosts.<name>]")}  {gray("optional: a remote machine. A ship with no host runs here")}
 
-{bold("[[desks]]")}  {gray("a desk `commit` can sync into a ship; one entry per desk")}
+{rows(HOST_KEYS)}
 
-  {"name".ljust(w)}  the desk name on the ship
-  {"src".ljust(w)}  its source directory, relative to the config's directory
+{bold("[[desks]]")}  {gray("optional: a desk `commit` can sync into a ship; one entry per desk")}
+
+{rows(DESK_KEYS)}
 
 {bold("example")}
 
@@ -3203,6 +3245,7 @@ def cmd_configure(a: Parsed) -> None:
   host = "box"
   http = "https://marnec-dozzod.example.com"
   pier = {{ path = "piers/marnec-dozzod", port = 8080, persist = true }}
+  latency = {{ ms = 1000, port = 8180 }}
 
   [[desks]]
   name = "my-desk"
@@ -3390,8 +3433,9 @@ COMMANDS: list[Cmd] = [
     Cmd(
         name="run", summary="turn the ship on",
         flags=[], positionals=[],
-        details=("Start the daemon that holds the ship: it runs `urbit <pier>` in a terminal of "
-                 "its own (with the configured loom and http port) and serves a control socket. "
+        details=("Start the daemon that holds the ship: it runs the pier's own vere, "
+                 "<pier>/.run, in a terminal of its own (with the configured http port, and "
+                 "loom, memo and ames when the config sets them) and serves a control socket. "
                  "The daemon outlives your shell. An already-running ship is reported as "
                  "such.\n\n"
                  "The pier must already exist. Create it with the urbit binary, stop it, then "
@@ -3402,7 +3446,9 @@ COMMANDS: list[Cmd] = [
                  "    urbit -w sampel-palnet -k sampel-palnet.key -c piers/sampel-palnet\n"
                  "  a comet:\n"
                  "    urbit -c piers/comet\n\n"
-                 "Once it reaches the dojo, stop it with Ctrl-D in that terminal. Then:\n\n"
+                 "Once it reaches the dojo, stop it with Ctrl-D in that terminal. admiral runs "
+                 "docked piers only, never an `urbit` off PATH: `urbit dock <pier>` docks one "
+                 "that has no .run. Then:\n\n"
                  "  [ships.sampel-palnet]\n"
                  "  http = \"http://localhost:8080\"\n"
                  "  pier = { path = \"piers/sampel-palnet\", port = 8080 }\n\n"
@@ -3642,7 +3688,7 @@ def menu_ships(cfg: Config, gray: Callable[[str], str]) -> str:
         out.append(f"  {hname}")
         w = max(len(s.name) for s in ships)
         for ship in ships:
-            pier = pier_rel(ship) + (f":{ship.pier.port}" if ship.pier.port else "")
+            pier = f"{pier_rel(ship)}:{ship.pier.port}"
             tags = [t for t, on in (("local", ship.pier.local), ("persist", ship.pier.persist)) if on]
             out.append(f"    {ship.name.ljust(w)}  {pier}" + (f"  {gray(', '.join(tags))}" if tags else ""))
     return "\n".join(out)

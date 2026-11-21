@@ -1,6 +1,8 @@
-# admiral config — see `./admiral.py help` and this script's header for the full schema.
-# Copy to admiral.toml and edit for your local ships.
+# admiral config. `./admiral.py configure` explains every key, and which are required.
+# Copy to admiral.toml and edit for your ships. admiral checks the whole file before any
+# command runs and refuses a missing required key, an unknown key or a wrong value.
 
+# [ships.<@p without ~>]: http and pier (with its path and port) are required
 [ships.sampel-palnet]
 http = "http://localhost:8080"
 pier = { path = "piers/sampel-palnet", port = 8080 }
@@ -10,11 +12,22 @@ pier = { path = "piers/sampel-palnet", port = 8080 }
 # pier = { path = "piers/sampel-palnet", port = 8080, persist = true }
 #   persist = true starts the ship at boot through a systemd user unit on its host;
 #   `run` writes and enables the unit (Linux hosts only).
+# pier = { path = "piers/sampel-palnet", port = 8080, ames = 31337, loom = 31, memo = 50000 }
+#   ames pins the UDP port; loom and memo go to vere. Omitted, vere picks.
 # mnemonic = "word word word word word word"
 # master-ticket = "~sampel-ticket-sampel-ticket"
 # code = "lidlut-tabwed-pillex-ridrup"      # +code, without the ~
+# latency = { ms = 1000, port = 16080 }  # a proxy in front of the ship that adds a
+#                      # hosted one's round trip (ms), listening on port; both required.
+#                      # `run` starts it; `latency reload` applies a change live.
 
-# a desk admiral syncs from a source dir with `./admiral.py <ship> commit <name>`
+# a remote machine; a ship on it says host = "box". A ship with no host runs here.
+# [hosts.box]
+# ssh = "urb@box"
+# root = "/home/urb"
+
+# a desk admiral syncs from a source dir with `./admiral.py <ship> commit <name>`;
+# src is required and relative to this file's directory
 [[desks]]
 name = "my-desk"
 src = "desk"

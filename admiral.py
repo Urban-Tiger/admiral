@@ -1463,24 +1463,58 @@ def prompt_state(raw: str) -> tuple[str, str] | None:
     return None
 
 
+def row_bare(state: tuple[str, str] | None) -> bool:
+    # a prompt_state result that is an idle prompt with nothing typed after it
+    return bool(state) and state[0] == "idle" and not state[1].strip()
+
+
 def dojo_prompt(host: Host, ship: Ship) -> tuple[str, str] | None:
-    # empty the input row and read the prompt the dojo shows. Ctrl-A Ctrl-K repaints a
-    # row that held text; on a row already empty it only bells, and the prompt is the
-    # last one painted before. No reaction within a second means arvo is mid-event and
-    # the keys are queued behind it: None.
+    # empty the input row and read the prompt the dojo shows after. What the two keys
+    # print, measured:
+    #
+    #   row holds text   Ctrl-A moves the cursor home (a long line repaints, text and
+    #                    all), then Ctrl-K repaints the prompt bare
+    #   row empty        Ctrl-A prints nothing, Ctrl-K bells: nothing to kill
+    #
+    # So a bell with no prompt painted is a row seen empty, in the mode the last prompt
+    # before it showed. An idle prompt still holding text is Ctrl-A's repaint, or vere
+    # repainting the row under a spinner, and the read goes on to Ctrl-K's. When that
+    # never comes within a second the keys are queued behind an arvo event: the text
+    # still on the row is returned, or None when nothing was painted at all.
     mark = ring_mark(host, ship)
     clear_input(host, ship)
     end = time.monotonic() + 1.0
+    held = None
     while time.monotonic() < end:
         time.sleep(0.08)
         _, raw = capture_at(host, ship, mark)
         state = prompt_state(raw)
-        if state:
-            return state
-        if BELL in raw:
+        if state is None and BELL in raw:
             _, tail = capture_at(host, ship, max(0, mark - 8192))
-            return prompt_state(tail) or ("idle", "")
-    return None
+            before = prompt_state(tail)
+            return before if before and before[0] != "idle" else ("idle", "")
+        if state and (state[0] != "idle" or row_bare(state)):
+            return state
+        held = state
+    return held
+
+
+def dojo_clear(host: Host, ship: Ship, log: Callable[[str], None]) -> None:
+    # the way out of a drive: leave the input row empty for whoever types next. A
+    # command that bails keeps its text on the row (the Enter's event rolled back, the
+    # line with it), and so does a line the editor refused; the next keystrokes, a
+    # person's at `attach` included, land on the end of it. Never raises: it runs under
+    # whatever the drive is already raising, and says so when it cannot see the row empty.
+    try:
+        state = dojo_prompt(host, ship)
+    except Exception as e:
+        log(f"could not clear the dojo's input row: {e}")
+        return
+    if row_bare(state) or (state and state[0] != "idle"):
+        return
+    reads = f"still reads {state[1].strip()!r}" if state else "did not answer"
+    log(f"the dojo's input row {reads}: the ship is computing an event, and the keys "
+        f"that clear the row are typed and queued behind it")
 
 
 def dojo_probe(host: Host, ship: Ship, total: int) -> tuple[str, int, str]:
@@ -1699,6 +1733,10 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
     # A thread is never left behind: a timeout or Ctrl-C aborts it before raising, and a
     # question the command asks is answered (--yes) or cancelled. An event still
     # computing is left to finish, unless `interrupt`.
+    #
+    # Text is never left behind either: every way out ends on an empty input row (see
+    # dojo_clear). A drive that ends OK has seen it empty in its last probe's reaction
+    # and types nothing more.
     check_dojo_input(command)
     host = host_for(ship, cfg)
     if log is None:
@@ -1733,6 +1771,7 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
     echo = f"> {command}"
     busy_from = 0  # index into `raw` past which a "dojo: busy" notice answers OUR send
     accepted, raw = False, ""
+    left_bare = False  # the last probe's reaction showed the input row empty
     try:
         # accept loop: cheap regex-cleaned reads, no pyte. The commit echo is durable
         # (scrollback), so a substring scan of the watermarked tail finds it.
@@ -1876,7 +1915,7 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
             # the last prompt painted, not the last row: an app that ~&-prints on every
             # event paints its junk BELOW the live prompt.
             state = prompt_state(raw[-8192:])
-            prompt_bare = bool(state) and state[0] == "idle" and not state[1].strip()
+            prompt_bare = row_bare(state)
             grace = 1.5 if ">=" in raw else 0.25  # effects can trail a poke ack
             quiet_enough = now - last_change >= grace
             silent = now - last_any >= REPROBE_QUIET and now - last_probe >= REPROBE_QUIET
@@ -1891,6 +1930,9 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
                     if not prompt_bare:
                         log(f"the prompt row read {prompt_row(state)}, but a probe found "
                             f"the dojo idle")
+                    # the dojo answers the probe by repainting the prompt without it,
+                    # so the reaction ends on the row as it stands
+                    left_bare = row_bare(prompt_state(reaction))
                     log("OK")
                     return emit(render_transcript(raw + reaction))
                 # busy, mute, or somebody else's output — not done; re-arm the quiet window.
@@ -1918,11 +1960,11 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
                            + (missed if verdict == "idle" else "") + transcript)
     except KeyboardInterrupt:
         # Ctrl-C or SIGTERM: leave the dojo as we found it. A thread still running is
-        # aborted; one typed but not taken is wiped off the row. An event still
-        # computing is left to finish, unless --interrupt.
+        # aborted; a line typed but not taken is wiped off the row on the way out. An
+        # event still computing is left to finish, unless --interrupt.
         if not accepted:
-            clear_input(host, ship)
-        elif not SPINNER.search(raw[-256:]):
+            raise
+        if not SPINNER.search(raw[-256:]):
             dojo_abort(host, ship)
         elif interrupt and dojo_interrupt(host, ship):
             log("interrupted the command's event (--interrupt)")
@@ -1930,6 +1972,9 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
             log(f"the command's event is still computing; it was not interrupted. "
                 f"`{INVOKE} {ship.name} slog` shows it")
         raise
+    finally:
+        if not left_bare:
+            dojo_clear(host, ship, log)
 
 
 def fetch_code(ship: Ship, cfg: Config, log: Callable[[str], None] | None = None) -> str:
@@ -3331,6 +3376,11 @@ COMMANDS: list[Cmd] = [
                  "line, an unclosed entry, a question nobody answered, a thread still running. A "
                  "running thread gets -t seconds to finish, then it is aborted. When CMD runs a "
                  "thread past -t, it is aborted too, and so is one you Ctrl-C.\n\n"
+                 "After CMD, the dojo's input line is left empty. A command that bails (a scry "
+                 "that fails) and a line the dojo refuses both stay on the line as typed, where "
+                 "the next keystrokes, yours at attach included, would land on the end of them; "
+                 "admiral clears them. Past -t on an event still computing, the clearing keys "
+                 "are typed and take effect when the event ends.\n\n"
                  "An event still computing (the dojo is mute: an eval, or often a gall agent's "
                  "timer) is never interrupted. Past -t admiral gives up, says so, and exits "
                  "nonzero; the event finishes on its own, and slog shows what it is doing. "

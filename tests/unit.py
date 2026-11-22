@@ -234,16 +234,20 @@ class DojoWait(unittest.TestCase):
     # the fake ring has printed by then, and the probe's verdicts are canned. A fake
     # clock, so a 900s wait takes no time. Each probe takes 1s, as a mute one does.
     PROMPT = "\r\n\x1b[K\x1b[u~zod:dojo> \x1b[u"
+    # an idle dojo's answer to the probe, measured: the `)` painted, a bell, and the
+    # prompt repainted without it
+    IDLE = "\x1b[K\x1b[u~zod:dojo> )\x1b[u" + A.BELL + "\x1b[s\r\x1b[K\x1b[u~zod:dojo> \x1b[u"
 
     def setUp(self):
         self.clock, self.script, self.verdicts, self.probes = [0.0], [], [], []
+        self.sent, self.idle = [], self.IDLE
         ring = lambda: "".join(b for t, b in self.script if t <= self.clock[0])
 
         def probe(h, s, total):
             self.probes.append(self.clock[0])
             self.clock[0] += 1.0
             v = self.verdicts.pop(0) if len(self.verdicts) > 1 else self.verdicts[0]
-            return (v, total, A.BELL if v == "idle" else "")
+            return (v, total, self.idle if v == "idle" else "")
         patches = {
             "host_for": lambda s, c: None,
             "daemon_status": lambda h, s: "up",
@@ -251,7 +255,7 @@ class DojoWait(unittest.TestCase):
             "dojo_ready": lambda *a: None,
             "ring_mark": lambda h, s: 0,
             "capture_at": lambda h, s, off: (len(ring()), ring()[off:]),
-            "send_data": lambda h, s, d: None,
+            "send_data": lambda h, s, d: self.sent.append(d),
             "dojo_probe": probe,
         }
         self.saved = {k: getattr(A, k) for k in patches}
@@ -296,6 +300,8 @@ class DojoWait(unittest.TestCase):
         self.assertEqual(self.logs, ["the prompt row read idle, holding '~zod:dojo> stale', "
                                      "but a probe found the dojo idle", "OK"])
         self.assertEqual(len(self.probes), 1)
+        # the probe's reaction showed the row empty, so nothing is typed after it
+        self.assertEqual(self.sent, ["|commit %x\r"])
         last_frame = self.script[-1][0]
         self.assertGreaterEqual(self.probes[0], last_frame + A.REPROBE_QUIET)
         self.assertLess(self.probes[0], last_frame + A.REPROBE_QUIET + 1)
@@ -350,6 +356,207 @@ class DojoWait(unittest.TestCase):
         self.assertIn("holding '~zod:dojo> stale'", str(e.exception))
         self.assertNotIn("OK", self.logs)
         self.assertEqual(len(self.probes), 2)
+
+    def test_ok_with_text_on_the_row_clears_it(self):
+        # a command that bails after its Enter was taken ends idle with its text back
+        # on the row: the probe's `)` is belled off the end of it. The drive is OK (the
+        # transcript says what failed) and the row is emptied on the way out.
+        self.script = [(0.0, self.ECHO + self.PROMPT)]
+        self.idle = ("\x1b[K\x1b[u~zod:dojo> |commit %x)\x1b[u" + A.BELL
+                     + "\x1b[s\r\x1b[K\x1b[u~zod:dojo> |commit %x\x1b[u")
+        self.verdicts = ["idle"]
+        self.run_one(60)
+        self.assertEqual(self.sent, ["|commit %x\r", "\x01\x0b"])
+        self.assertEqual(self.logs[0], "OK")
+
+    def test_timeout_on_a_computing_ship_queues_the_clear(self):
+        # past -t the event is still computing. Should it bail, the line comes back onto
+        # the row, so the clearing keys are typed now, to run behind it, and the log
+        # says the row was not seen empty
+        self.script = [(0.0, self.ECHO)] + self.spin(0.5, 200)
+        self.verdicts = ["mute"]
+        with self.assertRaises(A.Timeout):
+            self.run_one(20)
+        self.assertEqual(self.sent, ["|commit %x\r", "\x01\x0b"])
+        self.assertIn("queued behind it", self.logs[-1])
+
+
+class DojoRow(unittest.TestCase):
+    # the input row after a drive: dojo_prompt and dojo_clear against a console that
+    # answers keystrokes. `answers` maps a sent string to the bytes the dojo prints for
+    # it, or to a list of them, one landing after each read of the ring; a fake clock,
+    # as in DojoWait.
+    CLEAR = "\x01\x0b"
+    BARE = "\x1b[39;1H\x1b[s\r\x1b[K\x1b[u~zod:dojo> \x1b[u\x1b[39;13H\x1b[s"
+
+    def setUp(self):
+        self.clock, self.ring, self.sent, self.answers = [0.0], [""], [], {}
+        late = []
+
+        def send(h, s, data):
+            self.sent.append(data)
+            answer = self.answers.get(data, "")
+            first, *rest = [answer] if isinstance(answer, str) else answer
+            self.ring[0] += first
+            late.extend(rest)
+
+        def capture(h, s, off):
+            got = (len(self.ring[0]), self.ring[0][off:])
+            if late:
+                self.ring[0] += late.pop(0)
+            return got
+        patches = {
+            "host_for": lambda s, c: None,
+            "daemon_status": lambda h, s: "up",
+            "guard_port": lambda h, s: None,
+            "dojo_ready": lambda *a: None,
+            "ring_mark": lambda h, s: len(self.ring[0]),
+            "capture_at": capture,
+            "send_data": send,
+        }
+        self.saved = {k: getattr(A, k) for k in patches}
+        for k, v in patches.items():
+            setattr(A, k, v)
+        self.saved_time = A.time
+        clock = self.clock
+
+        class FakeTime:
+            @staticmethod
+            def monotonic():
+                return clock[0]
+
+            @staticmethod
+            def sleep(s):
+                clock[0] += s
+        A.time = FakeTime
+        self.ship = A.Ship("zod", A.PierConfig())
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(A, k, v)
+        A.time = self.saved_time
+
+    def clear(self):
+        logs = []
+        A.dojo_clear(None, self.ship, logs.append)
+        return logs
+
+    def test_bell_alone_is_an_empty_row(self):
+        # Ctrl-K bells when there is nothing to kill. The row is empty then, whatever
+        # the last paint of it reads as
+        self.ring[0] = "~zod:dojo> ~zod:dojo> stale"
+        self.answers[self.CLEAR] = A.BELL
+        self.assertEqual(A.dojo_prompt(None, self.ship), ("idle", ""))
+        self.assertEqual(self.clear(), [])
+
+    def test_bell_keeps_an_open_entry_or_a_question(self):
+        self.answers[self.CLEAR] = A.BELL
+        self.ring[0] = "~zod:dojo< "
+        self.assertEqual(A.dojo_prompt(None, self.ship), ("open", ""))
+        self.ring[0] = "~zod:dojo: nuke? (y/N)"
+        self.assertEqual(A.dojo_prompt(None, self.ship), ("ask", "nuke? (y/N)"))
+
+    def test_text_is_killed_and_the_row_read_bare(self):
+        # a short line: Ctrl-A only moves the cursor, Ctrl-K repaints the prompt bare
+        self.ring[0] = "~zod:dojo> (add 1"
+        self.answers[self.CLEAR] = "\x1b[39;13H\x1b[s" + self.BARE
+        self.assertEqual(A.dojo_prompt(None, self.ship), ("idle", ""))
+        self.assertEqual(self.clear(), [])
+
+    def test_long_line_repainted_by_ctrl_a_is_read_past(self):
+        # a line wider than the terminal scrolls sideways, and Ctrl-A repaints the row
+        # from its head, text and all, before Ctrl-K's bare prompt (measured on a
+        # 136-column pane). The first repaint is not the answer.
+        head = "\x1b[39;1H\x1b[s\r\x1b[K\x1b[u~zod:dojo> =/  ds  ~(tap in .^((set [te\x1b[u\x1b[39;13H\x1b[s"
+        self.ring[0] = "~zod:dojo> (scot %da now))))))"
+        self.answers[self.CLEAR] = head
+        self.assertEqual(A.dojo_prompt(None, self.ship), ("idle", " =/  ds  ~(tap in .^((set [te"))
+        self.answers[self.CLEAR] = [head, self.BARE]
+        self.assertEqual(A.dojo_prompt(None, self.ship), ("idle", ""))
+
+    def test_no_answer_is_said(self):
+        # arvo mid-event: the keys queue, nothing is painted, and the log says so
+        self.assertIsNone(A.dojo_prompt(None, self.ship))
+        logs = self.clear()
+        self.assertEqual(len(logs), 1)
+        self.assertIn("did not answer", logs[0])
+        self.assertIn("queued behind it", logs[0])
+        # vere repainting the row under a spinner is not an answer either
+        self.answers[self.CLEAR] = "|«behn»" + "\x08" * 7 + "\x1b[39;1H\x1b[K~zod:dojo> (add 1\x1b[u"
+        logs = self.clear()
+        self.assertIn("still reads '(add 1'", logs[0])
+
+    def test_clear_never_raises(self):
+        def dead(h, s, data):
+            raise RuntimeError("no daemon")
+        A.send_data = dead
+        logs = self.clear()
+        self.assertEqual(logs, ["could not clear the dojo's input row: no daemon"])
+
+    def test_bailed_command_leaves_no_text(self):
+        # tests/raw/bail-leftover.raw is a ship's console, byte for byte, across one
+        # `dojo '.^(@ %gx /=nope=/x/noun)'`: a scry that fails. The Enter's event bails,
+        # the dojo puts the line back on the row and prints "failed to process input",
+        # and whoever typed next used to type onto the end of it. The drive raises its
+        # ABORT and empties the row on the way out.
+        raw = RAW.joinpath("bail-leftover.raw").read_bytes().decode("utf-8")
+        command = ".^(@ %gx /=nope=/x/noun)"
+        held = f"~sorreg-migrev-dolseg:dojo> {command}\x1b[u\x1b[6144;53H\x1b[s"
+        cut = raw.rindex(held) + len(held)
+        self.assertEqual(A.prompt_state(raw[:cut]), ("idle", " " + command))
+        self.assertEqual(A.prompt_state(raw), ("idle", ""))
+        self.answers = {command + "\r": raw[:cut], self.CLEAR: raw[cut:]}
+        logs = []
+        with self.assertRaises(RuntimeError) as e:
+            A.dojo_one(self.ship, command, None, timeout=30, log=logs.append)
+        self.assertIn("ABORT: dojo refused the line", str(e.exception))
+        self.assertEqual(self.sent, [command + "\r", self.CLEAR])
+        self.assertEqual(logs, [])
+        self.assertEqual(self.ring[0], raw)
+
+    def test_refused_line_leaves_no_text(self):
+        # a line the editor will not take stays on the row with a bell (measured:
+        # `(add 1` and Enter). The drive raises Refused and empties the row.
+        command = "(add 1"
+        self.answers = {command + "\r": "\x1b[39;1H\x1b[s\r\x1b[K\x1b[u~zod:dojo> (add 1\x1b[u"
+                                         "\x1b[39;19H\x1b[s" + A.BELL,
+                        self.CLEAR: "\x1b[39;13H\x1b[s" + self.BARE}
+        logs = []
+        with self.assertRaises(A.Refused):
+            A.dojo_one(self.ship, command, None, timeout=30, log=logs.append)
+        self.assertEqual(self.sent, [command + "\r", self.CLEAR])
+        self.assertEqual(logs, [])
+        self.assertTrue(A.row_bare(A.prompt_state(self.ring[0])))
+
+    def test_ctrl_c_before_the_line_is_taken_leaves_no_text(self):
+        command = "(add 1 1)"
+        self.answers = {self.CLEAR: self.BARE}
+        real = A.capture_at
+
+        def capture(h, s, off):
+            # the first read of the accept loop is where Ctrl-C lands
+            A.capture_at = real
+            raise KeyboardInterrupt
+        A.capture_at = capture
+        with self.assertRaises(KeyboardInterrupt):
+            A.dojo_one(self.ship, command, None, timeout=30, log=lambda m: None)
+        self.assertEqual(self.sent, [command + "\r", self.CLEAR])
+
+    def test_bail_after_a_timeout_is_cleared_by_the_queued_keys(self):
+        # tests/raw/bail-after-timeout.raw: a command that computes for six seconds and
+        # then fails its scry, driven with -t 2. The drive timed out mid-event with the
+        # probe's `)` and the clearing keys typed behind it. When the event bailed, the
+        # line came back, the `)` was belled off its end, and the queued keys emptied
+        # the row: no driver was there to do it.
+        raw = RAW.joinpath("bail-after-timeout.raw").read_bytes().decode("utf-8")
+        command = "=+  (met 3 (pbk:scr:crypto 'pw' 'salt' 5.000.000 32))  .^(@ %gx /=nope=/x/noun)"
+        probed = raw.index(command + ")")
+        painted = raw.rindex("\x1b[6144;1H", 0, probed)  # where the probe's repaint starts
+        self.assertEqual(A.prompt_state(raw[:painted]), ("idle", " " + command))
+        back = raw.index(A.BELL, probed)
+        cut = raw.index("\x1b[6144;29H", back)  # Ctrl-A: the cursor goes home
+        self.assertEqual(A.prompt_state(raw[:cut]), ("idle", " " + command))
+        self.assertEqual(A.prompt_state(raw), ("idle", ""))
 
 
 class DojoText(unittest.TestCase):

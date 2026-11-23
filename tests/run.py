@@ -93,6 +93,28 @@ def lines(out):
     return out.split("\n")
 
 
+def ring(ship, mark=None):
+    # (total, the console's raw bytes past `mark`); the last 8k when no mark is given
+    cfg = adm.load_config()
+    entry = adm.resolve_ship(ship, cfg)
+    host = adm.host_for(entry, cfg)
+    if mark is None:
+        mark = max(0, adm.ring_mark(host, entry) - 8192)
+    return adm.capture_at(host, entry, mark)
+
+
+def row_empty(ship, secs=10):
+    # the dojo's input row holds nothing, read off the console without typing at it.
+    # A ship busy with an event of its own takes the clearing keys when that ends, so
+    # the row gets `secs` to empty.
+    end = time.monotonic() + secs
+    while not adm.row_bare(adm.prompt_state(ring(ship)[1])):
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.25)
+    return True
+
+
 # ── cli: no ship needed ───────────────────────────────────────────────────────
 @case("cli", "no-first-or-all")
 def _(ship, c):
@@ -389,6 +411,51 @@ def _(ship, c):
     time.sleep(0.3)
     rc, out, err, dt = dojo(ship, "(add 8 8)")
     c.that(out == "16", f"want 16, got {out!r} {err[-300:]}")
+
+
+FAILING_SCRY = ".^(@ %gx /=nope=/x/noun)"  # bails: no agent %nope to answer it
+
+
+@case("dojo", "bail-leaves-no-text")
+def _(ship, c):
+    # a command that bails comes back onto the input row; admiral empties it
+    rc, out, err, dt = dojo(ship, FAILING_SCRY)
+    c.that(rc != 0, f"a failed scry reported success: {out!r}")
+    c.that("failed to process input" in err, f"not reported: {err[-300:]!r}")
+    c.that(row_empty(ship), f"text left on the row: {adm.prompt_state(ring(ship)[1])!r}")
+    rc, out, err, dt = dojo(ship, "(add 12 12)")
+    c.that(out == "24", f"next command: want 24, got {out!r} {err[-300:]}")
+
+
+@case("dojo", "refused-leaves-no-text")
+def _(ship, c):
+    # a line the editor refuses stays on the row as typed; admiral empties it
+    rc, out, err, dt = dojo(ship, "(add 1")
+    c.that(rc != 0, f"an unclosed line reported success: {out!r}")
+    c.that("did NOT run" in err, f"not reported: {err[-300:]!r}")
+    c.that(row_empty(ship), f"text left on the row: {adm.prompt_state(ring(ship)[1])!r}")
+    long_line = f".^(@ %gx /=nope=/x/{'/'.join(['abcdefghij'] * 30)}/noun)"
+    rc, out, err, dt = dojo(ship, long_line)
+    c.that(rc != 0, f"a failed scry reported success: {out!r}")
+    c.that(row_empty(ship), f"a long line left on the row: {adm.prompt_state(ring(ship)[1])!r}")
+
+
+@case("dojo", "bail-after-timeout-leaves-no-text")
+def _(ship, c):
+    # past -t the event is still computing, so the clearing keys queue behind it. When
+    # it bails and the line comes back, they empty the row with no driver there.
+    mark = ring(ship)[0]
+    rc, out, err, dt = dojo(ship, f"=+  {SHORT_EVAL}  {FAILING_SCRY}", "-t", "1")
+    c.that(rc != 0, "timed-out computation reported success")
+    c.that("queued behind it" in err, f"the queued clear went unsaid: {err[:300]!r}")
+    end = time.monotonic() + 120
+    bailed = False
+    while time.monotonic() < end and not bailed:
+        time.sleep(0.5)
+        bailed = "dojo: failed to process input" in ring(ship, mark)[1]
+    c.that(bailed, "the event never bailed")
+    time.sleep(1.0)
+    c.that(row_empty(ship), f"text left on the row: {adm.prompt_state(ring(ship)[1])!r}")
 
 
 @case("dojo", "left-question")

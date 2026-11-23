@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import os
 import re
+import random
+import asyncio
 import sys
 import tty
 import time
@@ -45,7 +47,41 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.1"
+
+# ── exit codes ────────────────────────────────────────────────────────────────
+# Each kind of failure exits with its own code, so a script can tell them apart
+# without parsing the message. main maps an exception's `exit_code` to the exit;
+# anything else exits 1.
+EXIT_FAIL, EXIT_USAGE, EXIT_CONFIG, EXIT_DOWN, EXIT_TIMEOUT, EXIT_REFUSED, EXIT_BUILD = 1, 2, 3, 4, 5, 6, 7
+EXIT_INTERRUPTED = 130
+EXIT_CODES = [  # for help and the README
+    (0, "ok"),
+    (EXIT_FAIL, "failed (anything not below)"),
+    (EXIT_USAGE, "usage: a bad command, flag or argument"),
+    (EXIT_CONFIG, "config: the toml is missing, unreadable, or refused"),
+    (EXIT_DOWN, "the ship's daemon is not running"),
+    (EXIT_TIMEOUT, "timeout: the command did not finish in time"),
+    (EXIT_REFUSED, "refused: the dojo would not take the line"),
+    (EXIT_BUILD, "build failed: commit's verdict is a build error"),
+    (EXIT_INTERRUPTED, "interrupted (Ctrl-C or SIGTERM)"),
+]
+
+
+class ConfigError(RuntimeError):
+    exit_code = EXIT_CONFIG
+
+
+class NotRunning(RuntimeError):
+    exit_code = EXIT_DOWN
+
+
+class Timeout(RuntimeError):
+    exit_code = EXIT_TIMEOUT
+
+
+class Refused(RuntimeError):
+    exit_code = EXIT_REFUSED
 
 # ── identity ──────────────────────────────────────────────────────────────────
 # Name is hardcoded to "admiral". SELF is the script's real on-disk path (the rsync
@@ -71,7 +107,8 @@ def _find_repo() -> tuple[Path, str]:
     for d in (cwd, *cwd.parents):
         found = [n for n in CONFIG_NAMES if (d / n).is_file()]
         if len(found) > 1:
-            sys.exit(f"{d} has both {found[0]} and {found[1]}; keep one")
+            sys.stderr.write(f"{d} has both {found[0]} and {found[1]}; keep one\n")
+            sys.exit(EXIT_CONFIG)
         if found:
             return d, found[0]
     return cwd, CONFIG_NAMES[0]
@@ -80,7 +117,6 @@ def _find_repo() -> tuple[Path, str]:
 REPO, CONFIG = _find_repo()
 
 # config-value shapes, checked by load_config's validation.
-SHIP_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")  # ships.<name> map key
 DESK_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")          # desks[].name
 CODE_RE = re.compile(r"^[a-z]{6}(-[a-z]{6}){3}$")        # +code override
 TICKET_RE = re.compile(r"^~?[a-z]{6}(-[a-z]{6})+$")      # master ticket (~ optional, 2+ syllables)
@@ -94,14 +130,52 @@ T_DOJO = 60  # a dojo command's budget; past it a thread is aborted, an event is
 T_CHOP = 900  # roll copies the snapshot into the new epoch — minutes on a big pier
 
 
+# ── @p ───────────────────────────────────────────────────────────────────────
+# a ship's name in the config is its @p without the ~: a galaxy is one suffix
+# ("zod"), every other rank whole words of prefix+suffix ("sampel-palnet"), a comet's
+# halves joined by "--".
+PATP_PRE = (
+    "dozmarbinwansamlitsighidfidlissogdirwacsabwissibrigsoldopmodfoglidhopdardorlorhodfolrintogsilmir"
+    "holpaslacrovlivdalsatlibtabhanticpidtorbolfosdotlosdilforpilramtirwintadbicdifrocwidbisdasmidlop"
+    "rilnardapmolsanlocnovsitnidtipsicropwitnatpanminritpodmottamtolsavposnapnopsomfinfonbanmorworsip"
+    "ronnorbotwicsocwatdolmagpicdavbidbaltimtasmalligsivtagpadsaldivdactansidfabtarmonranniswolmispal"
+    "lasdismaprabtobrollatlonnodnavfignomnibpagsopralbilhaddocridmocpacravripfaltodtiltinhapmicfanpat"
+    "taclabmogsimsonpinlomrictapfirhasbosbatpochactidhavsaplindibhosdabbitbarracparloddosbortochilmac"
+    "tomdigfilfasmithobharmighinradmashalraglagfadtopmophabnilnosmilfopfamdatnoldinhatnacrisfotribhoc"
+    "nimlarfitwalrapsarnalmoslandondanladdovrivbacpollaptalpitnambonrostonfodponsovnocsorlavmatmipfip")
+PATP_SUF = (
+    "zodnecbudwessevpersutletfulpensytdurwepserwylsunrypsyxdyrnuphebpeglupdepdysputlughecryttyvsydnex"
+    "lunmeplutseppesdelsulpedtemledtulmetwenbynhexfebpyldulhetmevruttylwydtepbesdexsefwycburderneppur"
+    "rysrebdennutsubpetrulsynregtydsupsemwynrecmegnetsecmulnymtevwebsummutnyxrextebfushepbenmuswyxsym"
+    "selrucdecwexsyrwetdylmynmesdetbetbeltuxtugmyrpelsyptermebsetdutdegtexsurfeltudnuxruxrenwytnubmed"
+    "lytdusnebrumtynseglyxpunresredfunrevrefmectedrusbexlebduxrynnumpyxrygryxfeptyrtustyclegnemfermer"
+    "tenlusnussyltecmexpubrymtucfyllepdebbermughuttunbylsudpemdevlurdefbusbeprunmelpexdytbyttyplevmyl"
+    "wedducfurfexnulluclennerlexrupnedlecrydlydfenwelnydhusrelrudneshesfetdesretdunlernyrsebhulryllud"
+    "remlysfynwerrycsugnysnyllyndyndemluxfedsedbecmunlyrtesmudnytbyrsenwegfyrmurtelreptegpecnelnevfes")
+PATP_PRES = frozenset(PATP_PRE[i:i + 3] for i in range(0, len(PATP_PRE), 3))
+PATP_SUFS = frozenset(PATP_SUF[i:i + 3] for i in range(0, len(PATP_SUF), 3))
+
+
+def is_patp(name: str) -> bool:
+    # a ship name as the config writes it: an @p without its ~
+    if name in PATP_SUFS:
+        return True
+    halves = name.split("--")
+    if len(halves) > 2:
+        return False
+    words = [w for h in halves for w in h.split("-")]
+    return 0 < len(words) <= 8 and all(
+        len(w) == 6 and w[:3] in PATP_PRES and w[3:] in PATP_SUFS for w in words)
+
+
 # ── domain types ─────────────────────────────────────────────────────────────
 @dataclass
 class PierConfig:
-    path: str | None = None   # pier dir; omit => .piers/<name> (defaulted in pier_dir)
+    path: str | None = None   # pier dir: absolute, or relative to the host root
     port: int | None = None   # http bind port on the box
-    loom: int | None = None   # loom size (memory pages, power of 2) passed at boot
+    loom: int | None = None   # loom size passed at boot; omit => vere's own
     memo: int | None = None   # vere's persistent memo cache, in entries (-M); omit =>
-                              # vere's 50000. clay memoizes every +mint there, and an
+                              # vere's own. clay memoizes every +mint there, and an
                               # entry can be a big type: cap it on a ship that builds
     ames: int | None = None   # ames UDP port; omit => vere picks one, and a different
                               # one each boot. pin it for ships that must reach each
@@ -116,83 +190,23 @@ class PierConfig:
                               # when false, so the host always matches this file.
 
 
-# ── ship fields ──────────────────────────────────────────────────────────────
-# The one table behind everything that handles a ship's settings: config load
-# validates against it and builds the Ship from it. A new setting is one new row.
-# admiral.toml is edited by hand; admiral never writes it.
-@dataclass(frozen=True)
-class Field:
-    key: str                  # TOML key ("master-ticket")
-    attr: str                 # attribute on Ship (or on PierConfig when pier)
-    kind: str                 # "str" | "int" | "bool"
-    hint: str                 # what a good value looks like; the error for a bad one
-    pier: bool = False        # lives in the ship's `pier = { ... }` table
-    lo: int = 1               # int range, inclusive
-    hi: int = 2**31
-    ok: Callable[[str], bool] | None = None  # str check beyond "is a string"
-
-
-FIELDS: list[Field] = [
-    Field("http", "http", "str", 'must be a non-empty hostname or URL (e.g. "example.com")',
-          ok=lambda s: bool(s.strip()) and not re.search(r"\s", s)),
-    Field("path", "path", "str", "must be a string", pier=True),
-    Field("port", "port", "int", "must be an integer 1-65535", pier=True, hi=65535),
-    Field("ames", "ames", "int", "must be an integer 1-65535", pier=True, hi=65535),
-    Field("loom", "loom", "int", "must be a positive integer", pier=True),
-    Field("memo", "memo", "int", "must be a positive integer", pier=True),
-    Field("local", "local", "bool", "must be a boolean", pier=True),
-    Field("persist", "persist", "bool", "must be a boolean", pier=True),
-    Field("code", "code", "str", 'must be a +code key (e.g. "ralnyt-botwyc-batnyt-dozzod")',
-          ok=lambda s: bool(CODE_RE.match(s))),
-    Field("master-ticket", "master_ticket", "str", 'must be a ticket like "~ralnyt-botwyc-batnyt-dozzod"',
-          ok=lambda s: bool(TICKET_RE.match(s))),
-    Field("mnemonic", "mnemonic", "str", "must be a space-separated word list (BIP39 mnemonic)",
-          ok=lambda s: bool(MNEMONIC_RE.match(s))),
-]
-# every key `pier = { ... }` may carry. Config load rejects anything else — see load_config.
-PIER_KEYS = frozenset(f.key for f in FIELDS if f.pier)
-
-
-def field_error(f: Field, v: Any) -> str | None:
-    # why a typed value is not acceptable for f, or None. None itself is always fine:
-    # every field is optional (an absent `local` reads as false).
-    if v is None:
-        return None
-    if f.kind == "int":
-        bad = not isinstance(v, int) or isinstance(v, bool) or v < f.lo or v > f.hi
-    elif f.kind == "bool":
-        bad = not isinstance(v, bool)
-    else:
-        bad = not isinstance(v, str) or (f.ok is not None and not f.ok(v))
-    return f"{f.hint}, got {v!r}" if bad else None
-
-
-def field_get(ship: "Ship", f: Field) -> Any:
-    return getattr(ship.pier if f.pier else ship, f.attr)
-
-
-def make_ship(name: str, host: str | None, values: dict[str, Any]) -> "Ship":
-    # a Ship from field values keyed by attr; a missing or empty value is unset.
-    pier = PierConfig(**{f.attr: (bool(values.get(f.attr)) if f.kind == "bool" else values.get(f.attr))
-                         for f in FIELDS if f.pier})
-    return Ship(name=name, pier=pier, host=host,
-                **{f.attr: values.get(f.attr) or None for f in FIELDS if not f.pier})
-
 @dataclass
 class Ship:
-    name: str                 # map key — the ship name (the selector matches this)
+    name: str                 # map key: the ship's @p without ~ (the selector matches this)
     pier: PierConfig          # pier dir + bind port + loom on its box
-    host: str | None = None   # hosts map key; empty/None => the local machine
-    http: str | None = None   # http origin of the ship's web UI; REQUIRED for web access
-    code: str | None = None   # optional +code override; skips the live dojo read
+    host: str | None = None   # hosts map key; None => the local machine
+    http: str | None = None   # http origin of the ship's web UI, with its scheme
+    code: str | None = None   # optional +code; skips the live dojo read
     master_ticket: str | None = None  # ship master ticket (key material; for boot)
     mnemonic: str | None = None       # BIP39 mnemonic seed phrase (key material)
+    latency: int | None = None        # ms of round trip the latency proxy adds (see DelayProxy); None = no proxy
+    latency_port: int | None = None   # where the proxy listens; latency.port, required with latency
 
 
 @dataclass
 class Desk:
     name: str
-    src: str = "."            # repo subpath; defaulted to "."
+    src: str                  # source dir, relative to the config's directory
 
 
 @dataclass
@@ -223,22 +237,171 @@ class Config:
     hosts: dict[str, Host]    # remote hosts by name; the local machine is implicit
 
 
+# ── the schema ───────────────────────────────────────────────────────────────
+# Every key admiral.toml may hold, in one place: its table, type, whether it is
+# required, any check past the type, and what it means. load_config checks a config
+# against it before any command runs and builds nothing from a key it does not list;
+# `configure` prints it. admiral fills in nothing: a key that is absent is absent (an
+# optional one means "admiral passes nothing", so vere decides, or "off"). A missing
+# required key, an unknown key, a wrong type or a bad value is refused, naming the
+# file, the table, the key and what it wants. admiral.toml is edited by hand; admiral
+# never writes it.
+LATENCY_FORM = "latency = { ms = 1000, port = 8080 }"
+LATENCY_MS_MAX = 600000
+
+
+@dataclass(frozen=True)
+class Key:
+    key: str                  # TOML key ("master-ticket")
+    kind: str                 # "str" | "int" | "bool" | "table"
+    doc: str                  # what it means (configure prints it)
+    required: bool = False
+    lo: int = 1               # int range, inclusive
+    hi: int = 2**31
+    check: Callable[[Any], str | None] | None = None  # past the type: why not, or None
+    secret: bool = False      # key material: an error never echoes the value
+
+
+def _no_tilde(p: str) -> str | None:
+    if not p.strip():
+        return "must not be empty"
+    if p.startswith("~"):
+        return "must be absolute or relative to the host root, not ~ (a remote shell would not expand it)"
+    return None
+
+
+def _origin(u: str) -> str | None:
+    return None if re.match(r"^https?://[^\s/]+(/\S*)?$", u) else (
+        'must be a full origin with its scheme, e.g. "http://localhost:8080" or "https://example.com"')
+
+
+def _matches(rx: re.Pattern, want: str) -> Callable[[str], str | None]:
+    return lambda s: None if rx.match(s) else f"must be {want}"
+
+
+def latency_error(v: Any) -> str | None:
+    # why `latency` is not a { ms, port } table admiral can run a proxy from, or None.
+    # Both keys are required; ms 0 is a proxy turned off (none runs).
+    def is_int(x: Any) -> bool:
+        return isinstance(x, int) and not isinstance(x, bool)
+    if not isinstance(v, dict):
+        ms = v if is_int(v) else (int(v) if isinstance(v, str) and v.strip().isdigit() else None)
+        form = LATENCY_FORM if ms is None else f"latency = {{ ms = {ms}, port = <port> }}"
+        return f"is a table now, with the proxy's port: write {form}, got {v!r}"
+    unknown = sorted(set(v) - {"ms", "port"})
+    if unknown:
+        return f"has unknown key(s) {', '.join(unknown)} (known: ms, port): write {LATENCY_FORM}"
+    ms, port = v.get("ms"), v.get("port")
+    if ms is None:
+        return f"needs ms, the round trip in milliseconds: write {LATENCY_FORM}"
+    if not is_int(ms) or not 0 <= ms <= LATENCY_MS_MAX:
+        return f"ms must be an integer 0-{LATENCY_MS_MAX} (the round trip), got {ms!r}"
+    if port is None:
+        return f"needs port, where the proxy listens (there is no default): write {LATENCY_FORM}"
+    if not is_int(port) or not 1 <= port <= 65535:
+        return f"port must be an integer 1-65535, got {port!r}"
+    return None
+
+
+SHIP_KEYS: list[Key] = [
+    Key("pier", "table", "where the pier is and how it boots: { path, port, ... }", required=True),
+    Key("http", "str", "the ship's web origin with its scheme, e.g. http://localhost:8080 or "
+        "https://example.com", required=True, check=_origin),
+    Key("host", "str", "a [hosts.<name>] the ship runs on; omit for this machine"),
+    Key("code", "str", "its +code (skips the live dojo read)",
+        check=_matches(CODE_RE, 'a +code like "ralnyt-botwyc-batnyt-dozzod"'), secret=True),
+
+    Key("master-ticket", "str", "the ship's master ticket, plain text, for tooling that needs it",
+        check=_matches(TICKET_RE, 'a ticket like "~ralnyt-botwyc-batnyt-dozzod"'), secret=True),
+
+    Key("mnemonic", "str", "its BIP39 seed phrase, plain text, for tooling that needs it",
+        check=_matches(MNEMONIC_RE, "a space-separated word list (BIP39 mnemonic)"), secret=True),
+
+    Key("latency", "table", "a proxy in front of the ship's http port that adds a hosted ship's "
+        "round trip: { ms = 1000, port = 8080 }, both required (port is where it listens; "
+        "ms 0 is none). `run` starts it; `latency reload` applies a change to a running ship",
+        check=latency_error),
+]
+PIER_KEYS: list[Key] = [
+    Key("path", "str", "the pier dir: absolute, or relative to the host root (for a local "
+        "ship, the config's directory)", required=True, check=_no_tilde),
+    Key("port", "int", "the http bind port", required=True, hi=65535),
+    Key("ames", "int", "the ames UDP port; omit and vere picks a new one each boot. Pin it so "
+        "peers' lanes survive a restart", hi=65535),
+    Key("loom", "int", "loom size passed to vere --loom; omit for vere's own"),
+    Key("memo", "int", "vere's persistent memo cache cap, in entries; omit for vere's own"),
+    Key("local", "bool", "boot with -L (fake networking): for a COPIED pier whose original still "
+        "runs. Absent is false"),
+    Key("persist", "bool", "come up at boot through a systemd user unit that `run` writes "
+        "(Linux only). Absent is false"),
+]
+HOST_KEYS: list[Key] = [
+    Key("ssh", "str", "ssh target, e.g. urb@box; `ssh <it>` must work unattended", required=True,
+        check=lambda s: None if s.strip() and not re.search(r"\s", s) else "must be an ssh target like urb@box"),
+    Key("root", "str", "absolute base dir on the box that pier paths are relative to", required=True,
+        check=lambda s: None if s.startswith("/") else "must be an absolute path"),
+]
+DESK_KEYS: list[Key] = [
+    Key("name", "str", "the desk name on the ship", required=True,
+        check=_matches(DESK_NAME_RE, f"a desk name matching {DESK_NAME_RE.pattern}")),
+    Key("src", "str", 'its source dir, relative to the config\'s directory ("." for that '
+        "directory itself)", required=True, check=lambda s: None if s.strip() else "must not be empty"),
+]
+TOP_KEYS = ("ships", "hosts", "desks")
+
+
+def key_error(k: Key, v: Any) -> str | None:
+    # why v is not a value for k, or None
+    if k.kind == "int":
+        if not isinstance(v, int) or isinstance(v, bool) or not k.lo <= v <= k.hi:
+            want = f"an integer {k.lo}-{k.hi}" if k.hi < 2**31 else "a positive integer"
+            return f"must be {want}, got {v!r}"
+        return None
+    if k.kind == "bool":
+        return None if isinstance(v, bool) else f"must be true or false, got {v!r}"
+    if k.kind == "str" and not isinstance(v, str):
+        return f"must be a string, got {v!r}"
+    if k.kind == "table" and not isinstance(v, dict) and k.check is None:
+        return f"must be a table {{ ... }}, got {v!r}"
+    if k.check:
+        why = k.check(v)
+        if why:
+            return why if k.kind == "table" else f"{why}, got {v!r}"
+    return None
+
+
+def check_table(where: str, raw: Any, keys: list[Key]) -> dict[str, Any]:
+    # raw against keys: a table, no key it doesn't list, every required one present,
+    # each value its type. Returns raw; raises ConfigError naming `where` and the key.
+    known = [k.key for k in keys]
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where} must be a table {{ {', '.join(known)} }}, got {raw!r}")
+    unknown = sorted(set(raw) - set(known))
+    if unknown:
+        raise ConfigError(f"{where} has unknown key(s) {', '.join(unknown)} (known: {', '.join(known)})")
+    for k in keys:
+        if k.key not in raw:
+            if k.required:
+                raise ConfigError(f"{where} is missing {k.key}: {k.doc}")
+            continue
+        why = key_error(k, raw[k.key])
+        if why:
+            if k.secret:  # key material: say what's wrong, never echo it
+                why = re.sub(r", got .*$", " (value not shown)", why, flags=re.S)
+            raise ConfigError(f"{where}.{k.key} {why}")
+    return raw
+
+
 # ── config loading + validation ──────────────────────────────────────────────
 def load_config(file: Path | None = None) -> Config:
-    # `file` overrides the walk-up config; tests load fixtures through it.
+    # read and check the whole config before any command runs. `file` overrides the
+    # walk-up config; tests load fixtures through it.
     file = file or REPO / CONFIG
     try:
         raw = file.read_text("utf8")
     except OSError:
-        raise RuntimeError(
-            f"{file} not found — create it by hand (see admiral.example.toml), e.g.\n"
-            f"  [ships.<name>]\n"
-            f'  http = "http://localhost:<port>"\n'
-            f"  pier = {{ port = <port> }}\n\n"
-            f"  [[desks]]\n"
-            f'  name = "<desk>"\n'
-            f'  src = "."'
-        )
+        raise ConfigError(
+            f"{file} not found — create it by hand (`{INVOKE} configure` explains every key)")
     try:
         import tomllib  # lazy: the host-side engine runs under whatever python3 the box has
     except ImportError:
@@ -246,79 +409,74 @@ def load_config(file: Path | None = None) -> Config:
     try:
         cfg = tomllib.loads(raw)
     except Exception as e:
-        raise RuntimeError(f"{CONFIG}: invalid TOML: {e}")
+        raise ConfigError(f"{file.name}: invalid TOML: {e}")
+    name = file.name
 
+    unknown = sorted(set(cfg) - set(TOP_KEYS))
+    if unknown:
+        raise ConfigError(f"{name} has unknown top-level key(s) {', '.join(unknown)} "
+                          f"(known: {', '.join(TOP_KEYS)})")
     ships_raw = cfg.get("ships")
     if not isinstance(ships_raw, dict) or not ships_raw:
-        raise RuntimeError(f'{CONFIG}: "ships" must be a non-empty table of [ships.<name>] entries')
+        raise ConfigError(f'{name}: "ships" must be a non-empty table of [ships.<name>] entries')
+
+    # hosts: OPTIONAL remote machines; the local machine is implicit (a ship with no host)
+    hosts: dict[str, Host] = {}
+    hosts_raw = cfg.get("hosts", {})
+    if not isinstance(hosts_raw, dict):
+        raise ConfigError(f'{name}: "hosts" must be a table of [hosts.<name>] entries')
+    for hname, h in hosts_raw.items():
+        if hname == "local":
+            raise ConfigError(f'{name}: hosts["local"] is reserved — a ship on this machine omits "host"')
+        check_table(f'{name}: hosts["{hname}"]', h, HOST_KEYS)
+        hosts[hname] = Host(hname, h["root"], h["ssh"])
+
+    here = file.parent.resolve()  # the local machine's root: relative local paths start here
+    ships: list[Ship] = []
+    for sname, ship in ships_raw.items():
+        where = f'{name}: ships["{sname}"]'
+        if not is_patp(sname):
+            raise ConfigError(f"{where}: the table's name must be the ship's @p without ~, "
+                              f'e.g. [ships.sampel-palnet] or [ships.zod]')
+        if isinstance(ship, dict) and "latency-port" in ship:
+            raise ConfigError(f"{where}.latency-port is gone: the port goes in the latency table, "
+                              f"{LATENCY_FORM}")
+        check_table(where, ship, SHIP_KEYS)
+        pier = check_table(f"{where}.pier", ship["pier"], PIER_KEYS)
+        host = ship.get("host")
+        if host is not None and host not in hosts:
+            raise ConfigError(f'{where}.host "{host}" is not a [hosts.<name>] '
+                              f'(have: {", ".join(hosts) or "none"}; omit host for this machine)')
+        lat = ship.get("latency")
+        if lat is not None and lat["port"] == pier["port"]:
+            raise ConfigError(f"{where}.latency.port {lat['port']} is the ship's own http port; "
+                              f"the proxy needs a port of its own")
+        if host is None:
+            d = pier["path"] if os.path.isabs(pier["path"]) else os.path.join(here, pier["path"])
+            if not os.path.isdir(d):
+                raise ConfigError(f"{where}.pier.path: no directory at {d}")
+        ships.append(Ship(
+            name=sname, host=host, http=ship["http"], code=ship.get("code"),
+            master_ticket=ship.get("master-ticket"), mnemonic=ship.get("mnemonic"),
+            latency=(lat["ms"] or None) if lat else None, latency_port=lat["port"] if lat else None,
+            pier=PierConfig(path=pier["path"], port=pier["port"], loom=pier.get("loom"),
+                            memo=pier.get("memo"), ames=pier.get("ames"),
+                            local=pier.get("local", False), persist=pier.get("persist", False))))
+
     # desks: OPTIONAL. A config with no desks is valid — it just can't commit.
     desks_raw = cfg.get("desks", [])
     if not isinstance(desks_raw, list):
-        raise RuntimeError(f'{CONFIG}: "desks" must be an array of {{ name, src }} entries')
-
-    # hosts: a table of REMOTE machines, keyed by name (the local machine is
-    # implicit — a ship with no "host" runs locally, root = REPO). Validate first
-    # so ships can reference them.
-    hosts: dict[str, Host] = {}
-    hosts_raw = cfg.get("hosts")
-    if hosts_raw is not None:
-        if not isinstance(hosts_raw, dict):
-            raise RuntimeError(f'{CONFIG}: "hosts" must be a table of [hosts.<name>] entries')
-        for hname, h in hosts_raw.items():
-            if hname == "local":
-                raise RuntimeError(f'{CONFIG}: hosts["local"] is reserved — the local machine is implicit (omit "host", or set it to "local")')
-            if not isinstance(h, dict):
-                raise RuntimeError(f'{CONFIG}: hosts["{hname}"] must be a table {{ ssh, root }}')
-            if not h.get("ssh") or not isinstance(h["ssh"], str):
-                raise RuntimeError(f'{CONFIG}: hosts["{hname}"] missing "ssh" target')
-            if not h.get("root"):
-                raise RuntimeError(f'{CONFIG}: hosts["{hname}"] missing "root" (absolute base dir for piers, e.g. /home/urb)')
-            if not os.path.isabs(h["root"]):
-                raise RuntimeError(f'{CONFIG}: hosts["{hname}"].root "{h["root"]}" must be an absolute path')
-            hosts[hname] = Host(hname, h["root"], h["ssh"])
-
-    ships: list[Ship] = []
-    for sname, ship in ships_raw.items():
-        if not isinstance(ship, dict):
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"] must be a table {{ pier, http, ... }}')
-        if not SHIP_NAME_RE.match(sname):
-            raise RuntimeError(f'{CONFIG}: ship name "{sname}" must match {SHIP_NAME_RE.pattern}')
-        # host: top-level hosts key; empty/"local"/None => the local machine.
-        host = ship.get("host") or None
-        if host is not None and host != "local" and host not in hosts:
-            raise RuntimeError(
-                f'{CONFIG}: ships["{sname}"].host "{host}" is not in "hosts" '
-                f'(have: {", ".join(["local", *hosts])})'
-            )
-        # pier: optional table of where the ship's pier lives + its boot params.
-        pier = ship.get("pier") or {}
-        if not isinstance(pier, dict):
-            raise RuntimeError(f'{CONFIG}: ships["{sname}"].pier must be a table {{ {", ".join(sorted(PIER_KEYS))} }}')
-        # Reject keys we don't know rather than ignoring them: a typo (or a setting
-        # from a newer admiral) is loud instead of silently doing nothing.
-        unknown = sorted(set(pier) - PIER_KEYS)
-        if unknown:
-            raise RuntimeError(
-                f'{CONFIG}: ships["{sname}"].pier has unknown key(s) {", ".join(unknown)} '
-                f'(known: {", ".join(sorted(PIER_KEYS))})')
-        values: dict[str, Any] = {}
-        for f in FIELDS:
-            v = (pier if f.pier else ship).get(f.key)
-            err = field_error(f, v)
-            if err:
-                raise RuntimeError(f'{CONFIG}: ships["{sname}"].{"pier." if f.pier else ""}{f.key} {err}')
-            values[f.attr] = v
-        ships.append(make_ship(sname, host, values))
-
+        raise ConfigError(f'{name}: "desks" must be an array of [[desks]] {{ name, src }} entries')
     desks: list[Desk] = []
     for i, desk in enumerate(desks_raw):
-        if not isinstance(desk, dict):
-            raise RuntimeError(f"{CONFIG}: desks[{i}] must be a table {{ name, src }}")
-        if not desk.get("name"):
-            raise RuntimeError(f'{CONFIG}: desks[{i}] missing "name"')
-        if not DESK_NAME_RE.match(desk["name"]):
-            raise RuntimeError(f'{CONFIG}: desks[{i}].name "{desk["name"]}" must match {DESK_NAME_RE.pattern}')
-        desks.append(Desk(name=desk["name"], src=desk.get("src", ".")))
+        where = f"{name}: desks[{i}]"
+        check_table(where, desk, DESK_KEYS)
+        if any(d.name == desk["name"] for d in desks):
+            raise ConfigError(f'{where}: desk "{desk["name"]}" is listed twice')
+        d = os.path.join(here, desk["src"])
+        if not os.path.isdir(d):
+            raise ConfigError(f'{where}.src: no directory at {d}')
+        desks.append(Desk(name=desk["name"], src=desk["src"]))
 
     cfg = Config(ships=ships, desks=desks, hosts=hosts)
     check_desk_srcs(cfg)
@@ -327,15 +485,13 @@ def load_config(file: Path | None = None) -> Config:
 
 # ── resolution helpers ────────────────────────────────────────────────────────
 def pier_rel(ship: Ship) -> str:
-    # the pier path as configured (or its default) — relative unless absolute/~.
-    return ship.pier.path or f".piers/{ship.name}"
+    # the pier path as configured: absolute, or relative to the host root
+    return ship.pier.path
 
 
 def pier_dir(ship: Ship, host: Host) -> str:
     p = pier_rel(ship)
-    if os.path.isabs(p) or p.startswith("~"):
-        return p
-    return os.path.join(host.root, p)
+    return p if os.path.isabs(p) else os.path.join(host.root, p)
 
 
 def ship_by_name(name: str, cfg: Config) -> Ship | None:
@@ -387,10 +543,13 @@ def ensure_self(host: Host) -> str:
 
 
 def vere_binary(ship: Ship, host: Host) -> str:
-    # a booted pier keeps its own vere binary at <pier>/.run, so prefer that (the
-    # host then needs no `urbit` on PATH); fall back to `urbit`.
+    # the pier's own vere, <pier>/.run. admiral runs docked piers only: it never looks
+    # for an `urbit` on PATH.
     run = os.path.join(pier_dir(ship, host), ".run")
-    return run if host_has_run(host, run) else "urbit"
+    if not host_has_run(host, run):
+        raise RuntimeError(f'ship "{ship.name}": no vere at {run}. admiral runs docked piers; '
+                           f"dock it with `urbit dock <pier>`")
+    return run
 
 
 def run_argv(ship: Ship, host: Host) -> list[str]:
@@ -404,8 +563,7 @@ def run_argv(ship: Ship, host: Host) -> list[str]:
         cmd += ["--loom", str(ship.pier.loom)]
     if ship.pier.memo is not None:
         cmd += ["--keep-cache-limit", str(ship.pier.memo)]
-    if ship.pier.port is not None:
-        cmd += ["--http-port", str(ship.pier.port)]
+    cmd += ["--http-port", str(ship.pier.port)]
     if ship.pier.ames is not None:
         cmd += ["-p", str(ship.pier.ames)]
     cmd.append(pier)
@@ -414,26 +572,13 @@ def run_argv(ship: Ship, host: Host) -> list[str]:
 
 def ship_base(ship: Ship) -> str:
     # the base origin of the ship's web UI (the status probe and harness.py target it):
-    # the configured http origin, scheme defaulting to https. REQUIRED — there is no
-    # localhost:<port> fallback.
-    if not ship.http:
-        raise RuntimeError(
-            f'ship "{ship.name}" has no "http" in {CONFIG} — '
-            f'web access needs an http origin to target (no localhost:<port> fallback)'
-        )
-    d = ship.http.strip().rstrip("/")
-    return d if re.match(r"^https?://", d, re.I) else f"https://{d}"
+    # the configured http origin, which the schema requires with its scheme.
+    return ship.http.rstrip("/")
 
 
-def web_reachable(ship: Ship) -> bool | None:
+def web_reachable(ship: Ship) -> bool:
     # can we reach the ship's http UI? GET <http>/~/login and accept any non-5xx.
-    # None => no "http" origin set so we didn't try (no localhost assumption);
-    # False => http is set but the request failed/timed out/returned 5xx.
-    try:
-        base = ship_base(ship)
-    except Exception:
-        return None
-    url = base.rstrip("/") + "/~/login"
+    url = ship_base(ship) + "/~/login"
     try:
         resp = urllib.request.urlopen(url, timeout=T_HTTP)
         return resp.status < 500
@@ -456,21 +601,12 @@ def resolve_ship(name: str, cfg: Config) -> Ship:
     return ship
 
 
-def select_ships(selector: str | None, cfg: Config) -> list[Ship]:
-    # None only from a bare `admiral`, which shows the status of every ship.
-    if selector is None:
-        return cfg.ships
-    return [resolve_ship(selector, cfg)]
-
-
 def resolve_desk(name: str, cfg: Config) -> Desk:
     if not cfg.desks:
         raise RuntimeError(
             f'{CONFIG} has no desks — nothing to commit. '
             f'Add a [[desks]] entry to enable committing.'
         )
-    if not name:
-        return cfg.desks[0]
     desk = next((d for d in cfg.desks if d.name == name), None)
     if not desk:
         raise RuntimeError(
@@ -514,7 +650,7 @@ def shq(s: str) -> str:
 # ssh connection multiplexing: the FIRST exec to a host opens a master connection;
 # every later exec within ControlPersist reuses it over the existing socket. This
 # is what makes the ~9 probes/ship a status run fires cost one handshake. Every
-# flag is bounded so one unreachable/auth-prompting host can't wedge a fan forever.
+# flag is bounded so one unreachable/auth-prompting host can't wedge status forever.
 # The control socket name is DERIVED from this file's stem, never hardcoded.
 SSH_MUX = [
     "-o", "BatchMode=yes",
@@ -530,9 +666,8 @@ LOCAL = Host("local", str(REPO))
 
 
 def host_for(ship: Ship, cfg: Config) -> Host:
-    # no host, or the reserved name "local", => the local machine. load_config already
-    # rejected a name that is not in hosts.
-    if not ship.host or ship.host == "local":
+    # no host => the local machine. load_config already refused a name not in hosts.
+    if ship.host is None:
         return LOCAL
     return cfg.hosts[ship.host]
 
@@ -554,7 +689,7 @@ def local_capture_at(ship: Ship, host: Host, offset: int) -> tuple[int, str]:
     sock = sock_path(ship, host)
     got = sock_capture_at(sock, offset)
     if got is None:
-        raise RuntimeError(f'ship "{ship.name}" daemon not running (no daemon at {sock})')
+        raise NotRunning(f'ship "{ship.name}" daemon not running (no daemon at {sock})')
     return (got[0], got[1].decode("utf-8", "replace"))
 
 
@@ -841,7 +976,7 @@ def capture_at(host: Host, ship: Ship, offset: int) -> tuple[int, str]:
     try:
         return (int(head, 16), tail)
     except ValueError:
-        raise RuntimeError(f'ship "{ship.name}" daemon not running (no daemon at '
+        raise NotRunning(f'ship "{ship.name}" daemon not running (no daemon at '
                            f'{sock_path(ship, host)})')
 
 
@@ -902,6 +1037,61 @@ def daemon_status(host: Host, ship: Ship) -> tuple[int, int, str] | None:
         return None
 
 
+LATENCY_SINCE = (0, 2, 0)       # the first engine whose daemon has the latency proxy
+LATENCY_STOP_SINCE = (0, 2, 1)  # the first that can stop it (C_LATENCY "stop")
+
+
+def engine_has_latency(version: str | None, since: tuple[int, ...] = LATENCY_SINCE) -> bool:
+    try:
+        return tuple(int(x) for x in (version or "").split(".")) >= since
+    except ValueError:
+        return False
+
+
+def latency_want(ship: Ship) -> str:
+    # the proxy state (DelayProxy.state) this ship's config asks for: "none", or
+    # "<listen> <target> <ms>"
+    if not ship.latency:
+        return "none"
+    return f"{ship.latency_port} {ship.pier.port} {ship.latency}"
+
+
+def daemon_latency(host: Host, ship: Ship, msg: str = "") -> str | None:
+    # the daemon's latency proxy state after `msg` (see C_LATENCY), None when no daemon
+    # answers. Ask only a daemon engine_has_latency: an older one ignores the frame.
+    if not host.ssh:
+        return sock_latency(sock_path(ship, host), msg)
+    out = eng(host, ship, "__latency", *msg.split(), check=False).strip()
+    return out or None
+
+
+def latency_brief(state: str | None) -> str | None:
+    # "1000ms :8080 -> :80", "off :8080 -> :80 (direct)", None when there is no proxy
+    if not state or state == "none":
+        return None
+    if state.startswith("error"):
+        return state
+    try:
+        listen, target, ms = (int(x) for x in state.split())
+    except ValueError:
+        return state
+    return f"{ms}ms :{listen} -> :{target}" if ms else f"off :{listen} -> :{target} (direct)"
+
+
+def latency_apply(host: Host, ship: Ship, msg: str | None = None) -> str:
+    # put the daemon's proxy where the config says (or send `msg`): its brief, or raise
+    # with the daemon's reason
+    if msg is None:
+        want = latency_want(ship)
+        msg = "stop" if want == "none" else f"set {want}"
+    got = daemon_latency(host, ship, msg)
+    if got is None:
+        raise RuntimeError("the daemon did not answer")
+    if got.startswith("error"):
+        raise RuntimeError(got.removeprefix("error").strip())
+    return latency_brief(got) or "none"
+
+
 def pier_exists(host: Host, ship: Ship) -> bool:
     d = pier_dir(ship, host)
     if not host.ssh:
@@ -914,10 +1104,8 @@ def pier_exists(host: Host, ship: Ship) -> bool:
 
 
 def host_has_run(host: Host, run: str) -> bool:
-    # a booted pier keeps its own vere binary at <pier>/.run; prefer it so the host
-    # needs no `urbit` on PATH. host-aware: stat the file on the SHIP's host (remote
-    # too), not the local control machine — else a remote with no `urbit` on PATH
-    # exits 127.
+    # is <pier>/.run there? Stat it on the SHIP's host (remote too), not the local
+    # control machine.
     if not host.ssh:
         return os.path.exists(run)
     try:
@@ -1117,8 +1305,7 @@ def shown_port(p: int | None) -> str:
 def desk_src_dir(desk: Desk) -> str:
     # ALWAYS local — the desk source is this repo checkout, regardless of which box
     # the ship runs on; only the rsync destination is host-routed.
-    src = desk.src or "."
-    return os.path.join(str(REPO), ".") if src == "." else os.path.join(str(REPO), src)
+    return os.path.join(str(REPO), desk.src)
 
 
 def _local_mounts(desk: Desk, cfg: Config) -> list[tuple[Ship, str, str]]:
@@ -1141,7 +1328,7 @@ def mount_owner(desk: Desk, cfg: Config) -> Ship | None:
     src = os.path.realpath(desk_src_dir(desk))
     owners = [ship for ship, _, mount in _local_mounts(desk, cfg) if mount == src]
     if len(owners) > 1:
-        raise RuntimeError(f'desk "{desk.name}": source {desk.src} is the %{desk.name} mount of '
+        raise ConfigError(f'desk "{desk.name}": source {desk.src} is the %{desk.name} mount of '
                            f'{", ".join(s.name for s in owners)}; ships can\'t share a pier')
     return owners[0] if owners else None
 
@@ -1154,7 +1341,7 @@ def check_desk_srcs(cfg: Config) -> None:
         src = os.path.realpath(desk_src_dir(desk))
         for ship, pier, mount in _local_mounts(desk, cfg):
             if src != mount and os.path.commonpath([src, pier]) == pier:
-                raise RuntimeError(
+                raise ConfigError(
                     f'{CONFIG}: desk "{desk.name}" src {desk.src} is inside {ship.name}\'s pier '
                     f'but isn\'t its %{desk.name} mount ({mount})')
         mount_owner(desk, cfg)
@@ -1181,10 +1368,10 @@ def self_mounted(ship: Ship, desk: Desk, cfg: Config) -> bool:
 def do_sync(ship: Ship, desk: Desk, cfg: Config) -> None:
     host = host_for(ship, cfg)
     dest_dir = os.path.join(pier_dir(ship, host), desk.name)
-    src = desk.src or "."
+    src = desk.src
     src_dir = desk_src_dir(desk)
-    if src != "." and not os.path.exists(src_dir):
-        raise RuntimeError(f'desk "{desk.name}": source directory not found: {src_dir}')
+    if not os.path.isdir(src_dir):
+        raise ConfigError(f'desk "{desk.name}": source directory not found: {src_dir}')
     if self_mounted(ship, desk, cfg):
         sys.stderr.write(f"{src} is {ship.name}'s %{desk.name} mount; no sync\n")
         return
@@ -1256,12 +1443,12 @@ def unrepaint(raw: str) -> str:
 def check_dojo_input(command: str) -> None:
     # refuse what the dojo cannot take as one typed line, before a keystroke is sent.
     if "\n" in command or "\r" in command:
-        raise RuntimeError(
+        raise Refused(
             "dojo input has a newline. The dojo reads one line: the first part runs and\n"
             "the rest types into whatever that left open. Put multi-line source in a desk\n"
             "file and read it from there.")
     if len(command) > DOJO_INPUT_MAX:
-        raise RuntimeError(
+        raise Refused(
             f"dojo input is {len(command)} chars; admiral types at most {DOJO_INPUT_MAX} "
             f"(the terminal drops\nkeystrokes past 1023). Split it across dojo variables, "
             f"one call each\n(=a \"...\"  =b \"...\"  then (weld a b)), or put it in a desk file.")
@@ -1276,24 +1463,58 @@ def prompt_state(raw: str) -> tuple[str, str] | None:
     return None
 
 
+def row_bare(state: tuple[str, str] | None) -> bool:
+    # a prompt_state result that is an idle prompt with nothing typed after it
+    return bool(state) and state[0] == "idle" and not state[1].strip()
+
+
 def dojo_prompt(host: Host, ship: Ship) -> tuple[str, str] | None:
-    # empty the input row and read the prompt the dojo shows. Ctrl-A Ctrl-K repaints a
-    # row that held text; on a row already empty it only bells, and the prompt is the
-    # last one painted before. No reaction within a second means arvo is mid-event and
-    # the keys are queued behind it: None.
+    # empty the input row and read the prompt the dojo shows after. What the two keys
+    # print, measured:
+    #
+    #   row holds text   Ctrl-A moves the cursor home (a long line repaints, text and
+    #                    all), then Ctrl-K repaints the prompt bare
+    #   row empty        Ctrl-A prints nothing, Ctrl-K bells: nothing to kill
+    #
+    # So a bell with no prompt painted is a row seen empty, in the mode the last prompt
+    # before it showed. An idle prompt still holding text is Ctrl-A's repaint, or vere
+    # repainting the row under a spinner, and the read goes on to Ctrl-K's. When that
+    # never comes within a second the keys are queued behind an arvo event: the text
+    # still on the row is returned, or None when nothing was painted at all.
     mark = ring_mark(host, ship)
     clear_input(host, ship)
     end = time.monotonic() + 1.0
+    held = None
     while time.monotonic() < end:
         time.sleep(0.08)
         _, raw = capture_at(host, ship, mark)
         state = prompt_state(raw)
-        if state:
-            return state
-        if BELL in raw:
+        if state is None and BELL in raw:
             _, tail = capture_at(host, ship, max(0, mark - 8192))
-            return prompt_state(tail) or ("idle", "")
-    return None
+            before = prompt_state(tail)
+            return before if before and before[0] != "idle" else ("idle", "")
+        if state and (state[0] != "idle" or row_bare(state)):
+            return state
+        held = state
+    return held
+
+
+def dojo_clear(host: Host, ship: Ship, log: Callable[[str], None]) -> None:
+    # the way out of a drive: leave the input row empty for whoever types next. A
+    # command that bails keeps its text on the row (the Enter's event rolled back, the
+    # line with it), and so does a line the editor refused; the next keystrokes, a
+    # person's at `attach` included, land on the end of it. Never raises: it runs under
+    # whatever the drive is already raising, and says so when it cannot see the row empty.
+    try:
+        state = dojo_prompt(host, ship)
+    except Exception as e:
+        log(f"could not clear the dojo's input row: {e}")
+        return
+    if row_bare(state) or (state and state[0] != "idle"):
+        return
+    reads = f"still reads {state[1].strip()!r}" if state else "did not answer"
+    log(f"the dojo's input row {reads}: the ship is computing an event, and the keys "
+        f"that clear the row are typed and queued behind it")
 
 
 def dojo_probe(host: Host, ship: Ship, total: int) -> tuple[str, int, str]:
@@ -1512,12 +1733,16 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
     # A thread is never left behind: a timeout or Ctrl-C aborts it before raising, and a
     # question the command asks is answered (--yes) or cancelled. An event still
     # computing is left to finish, unless `interrupt`.
+    #
+    # Text is never left behind either: every way out ends on an empty input row (see
+    # dojo_clear). A drive that ends OK has seen it empty in its last probe's reaction
+    # and types nothing more.
     check_dojo_input(command)
     host = host_for(ship, cfg)
     if log is None:
         log = lambda m: sys.stderr.write(m + "\n")
     if daemon_status(host, ship) is None:
-        raise RuntimeError(f'ship "{ship.name}" daemon not running — `{INVOKE} {ship.name} run` first')
+        raise NotRunning(f'ship "{ship.name}" daemon not running — `{INVOKE} {ship.name} run` first')
     guard_port(host, ship)  # don't drive a pier this config has the wrong port for
 
     # rsync the desk source while the dojo settles; joined before |commit needs the
@@ -1546,6 +1771,7 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
     echo = f"> {command}"
     busy_from = 0  # index into `raw` past which a "dojo: busy" notice answers OUR send
     accepted, raw = False, ""
+    left_bare = False  # the last probe's reaction showed the input row empty
     try:
         # accept loop: cheap regex-cleaned reads, no pyte. The commit echo is durable
         # (scrollback), so a substring scan of the watermarked tail finds it.
@@ -1604,10 +1830,10 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
                 # order, so text that has been ECHOED was echoed by an arvo that already
                 # processed the Enter. A PARTIAL paint with no bell is arvo still working
                 # through the keystrokes — waiting on it is not a refusal.
-                raise RuntimeError(dojo_reject_report(command, painted, tail_n(clean_pane(raw), 20)))
+                raise Refused(dojo_reject_report(command, painted, tail_n(clean_pane(raw), 20)))
             time.sleep(0.08)
         if not accepted:
-            raise RuntimeError(dojo_reject_report(command, painted, tail_n(clean_pane(raw), 20)))
+            raise Refused(dojo_reject_report(command, painted, tail_n(clean_pane(raw), 20)))
 
         # the command only starts RUNNING here, so it gets the whole timeout.
         deadline = time.monotonic() + timeout
@@ -1689,7 +1915,7 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
             # the last prompt painted, not the last row: an app that ~&-prints on every
             # event paints its junk BELOW the live prompt.
             state = prompt_state(raw[-8192:])
-            prompt_bare = bool(state) and state[0] == "idle" and not state[1].strip()
+            prompt_bare = row_bare(state)
             grace = 1.5 if ">=" in raw else 0.25  # effects can trail a poke ack
             quiet_enough = now - last_change >= grace
             silent = now - last_any >= REPROBE_QUIET and now - last_probe >= REPROBE_QUIET
@@ -1704,6 +1930,9 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
                     if not prompt_bare:
                         log(f"the prompt row read {prompt_row(state)}, but a probe found "
                             f"the dojo idle")
+                    # the dojo answers the probe by repainting the prompt without it,
+                    # so the reaction ends on the row as it stands
+                    left_bare = row_bare(prompt_state(reaction))
                     log("OK")
                     return emit(render_transcript(raw + reaction))
                 # busy, mute, or somebody else's output — not done; re-arm the quiet window.
@@ -1717,25 +1946,25 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
         transcript = tail_n(render_transcript(raw), 30)
         if verdict == "mute":
             if interrupt and dojo_interrupt(host, ship):
-                raise RuntimeError(f"TIMEOUT after {timeout}s — interrupted the command "
+                raise Timeout(f"TIMEOUT after {timeout}s — interrupted the command "
                                    f"(--interrupt)\n" + transcript)
-            raise RuntimeError(f"TIMEOUT: {still_computing(ship, timeout, ship.name in _interrupted)}\n"
+            raise Timeout(f"TIMEOUT: {still_computing(ship, timeout, ship.name in _interrupted)}\n"
                                + transcript)
         if verdict == "busy":
             dojo_abort(host, ship)
         missed = (f"the dojo is idle now, so admiral missed the command's end: its prompt "
                   f"read {prompt_row(prompt_state(raw[-8192:]))}.\nCheck the result by hand; "
                   f"this is an admiral bug worth reporting with the slog.\n")
-        raise RuntimeError(f"TIMEOUT after {timeout}s"
+        raise Timeout(f"TIMEOUT after {timeout}s"
                            + (" — aborted the command" if verdict == "busy" else "") + "\n"
                            + (missed if verdict == "idle" else "") + transcript)
     except KeyboardInterrupt:
         # Ctrl-C or SIGTERM: leave the dojo as we found it. A thread still running is
-        # aborted; one typed but not taken is wiped off the row. An event still
-        # computing is left to finish, unless --interrupt.
+        # aborted; a line typed but not taken is wiped off the row on the way out. An
+        # event still computing is left to finish, unless --interrupt.
         if not accepted:
-            clear_input(host, ship)
-        elif not SPINNER.search(raw[-256:]):
+            raise
+        if not SPINNER.search(raw[-256:]):
             dojo_abort(host, ship)
         elif interrupt and dojo_interrupt(host, ship):
             log("interrupted the command's event (--interrupt)")
@@ -1743,6 +1972,9 @@ def dojo_one(ship: Ship, command: str, cfg: Config, *, timeout: int = T_DOJO,
             log(f"the command's event is still computing; it was not interrupted. "
                 f"`{INVOKE} {ship.name} slog` shows it")
         raise
+    finally:
+        if not left_bare:
+            dojo_clear(host, ship, log)
 
 
 def fetch_code(ship: Ship, cfg: Config, log: Callable[[str], None] | None = None) -> str:
@@ -1757,56 +1989,14 @@ def fetch_code(ship: Ship, cfg: Config, log: Callable[[str], None] | None = None
     return m.group(0)
 
 
-# ── fan: run a per-ship fn across selected ships in parallel ──────────────────
-@dataclass
-class FanResult:
-    ship: str
-    ok: bool
-    log: str
-    value: Any = None
-    err: str | None = None
-
-
-def fan(ships: list[Ship], cfg: Config,
-        fn: Callable[[Ship, Host, Callable[[str], None]], Any]) -> list[FanResult]:
-    def work(ship: Ship) -> FanResult:
-        host = host_for(ship, cfg)
-        lines: list[str] = []
-        log = lambda m: lines.append(m)
-        try:
-            value = fn(ship, host, log)
-            return FanResult(ship.name, True, "\n".join(lines), value=value)
-        except Exception as e:
-            return FanResult(ship.name, False, "\n".join(lines), err=str(e))
-    # one ship runs inline, so Ctrl-C lands in its own thread and can clean up.
-    if len(ships) == 1:
-        return [work(ships[0])]
-    with ThreadPoolExecutor(max_workers=max(1, min(16, len(ships)))) as ex:
-        return list(ex.map(work, ships))
-
-
-def fan_exit(results: list[FanResult]) -> int:
-    # the one exit-code rule for every fanned command: nonzero iff any ship failed.
-    return 1 if any(not r.ok for r in results) else 0
-
-
-def report(results: list[FanResult], header: Any = None) -> int:
-    # the one printer for a fanned command: status log + errors -> stderr, each ship's
-    # output -> stdout. With several ships a `=== ship: x ===` line precedes each; it
-    # goes to `header` (stderr by default, so stdout stays the bare output; slog and
-    # capture put it on stdout so a grep over many ships keeps its labels). Returns the
-    # exit code.
-    header = header or sys.stderr
-    many = len(results) > 1
-    for r in results:
-        if many:
-            header.write(f"=== ship: {r.ship} ===\n")
-        err = "\n".join(x for x in [r.log, "" if r.ok else (r.err or "")] if x)
-        if err:
-            sys.stderr.write(err + "\n")
-        if r.ok and r.value:
-            sys.stdout.write(r.value.rstrip("\n") + "\n")
-    return fan_exit(results)
+# ── on_ship: every command but status acts on the one ship it names ──────────
+def on_ship(a: Parsed, fn: Callable[[Ship, Host, Callable[[str], None]], str | None]) -> None:
+    # run fn against the named ship: its progress log goes to stderr as it happens, what
+    # it returns to stdout. A failure raises to main, which prints it and exits 1.
+    ship = resolve_ship(a.selector, a.cfg)
+    out = fn(ship, host_for(ship, a.cfg), lambda m: sys.stderr.write(m + "\n"))
+    if out:
+        sys.stdout.write(out.rstrip("\n") + "\n")
 
 
 # ── probes: read a ship's actual state (read-only) ────────────────────────────
@@ -1825,6 +2015,7 @@ class ShipState:
     misconfigured: bool = False      # live --http-port disagrees with this config's pier.port
     running_port: int | None = None  # the --http-port the ship is ACTUALLY running on
     version: str | None = None       # engine VERSION baked into the daemon; None when down
+    latency: str | None = None       # the latency proxy's brief; None when it has none
 
 
 def probe_ship(ship: Ship, cfg: Config, host: Host, probe: bool = False) -> ShipState:
@@ -1874,9 +2065,15 @@ def probe_ship(ship: Ship, cfg: Config, host: Host, probe: bool = False) -> Ship
         verdict = "up"
     # here the daemon owns the urbit child, so "daemon up" IS "pier
     # held" — holders carries the child PID for display.
+    latency = None
+    if st and engine_has_latency(st[2]):
+        try:
+            latency = latency_brief(daemon_latency(host, ship))
+        except Exception:
+            latency = None
     return ShipState(ship.name, host.name, daemon_up, pane, dojo, pier,
                      holders, verdict, responsive, http, misconfigured, running_port,
-                     version=st[2] if st else None)
+                     version=st[2] if st else None, latency=latency)
 
 
 # ── command framework ─────────────────────────────────────────────────────────
@@ -1939,8 +2136,10 @@ def usage_line(c: Cmd) -> str:
 
 
 class UsageError(Exception):
-    def __init__(self, cmd: Cmd, msg: str):
-        super().__init__(f"{msg}\n{usage_line(cmd)}\nSee: {INVOKE} help {cmd.name}")
+    exit_code = EXIT_USAGE
+
+    def __init__(self, cmd: Cmd | None, msg: str):
+        super().__init__(msg if cmd is None else f"{msg}\n{usage_line(cmd)}\nSee: {INVOKE} help {cmd.name}")
 
 
 def find_flag(c: Cmd, tok: str) -> Flag | None:
@@ -2010,7 +2209,7 @@ def cmd_dojo(a: Parsed) -> None:
         return truncate_output(dojo_one(ship, command, a.cfg, timeout=timeout, log=log, yes=yes,
                                         interrupt=interrupt), ship)
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 COMMIT_ERROR = re.compile(r"^(crud: |syntax error|bail: |-find\.|-mint|nest-fail|mint-|"
@@ -2108,6 +2307,7 @@ def cmd_commit(a: Parsed, pick: bool = False) -> None:
             if late:
                 out = out + "\n" + late
         ok, verdict, reloaded = commit_verdict(desk, out)
+        code = 0 if ok else EXIT_BUILD
         # a desk that just reloaded an agent is running; only an idle verdict needs +vats
         if ok and not reloaded and desk_suspended(ship, desk, a.cfg, timeout, interrupt):
             verdict += (f"\nwarning: %{desk.name} is suspended, so nothing it commits runs. "
@@ -2115,20 +2315,15 @@ def cmd_commit(a: Parsed, pick: bool = False) -> None:
         if ok and pick:
             ok, picked = collect_garbage(ship, desk, a.cfg, timeout, log, interrupt)
             verdict += "\n" + picked
-        return (ok, out, verdict)
+            code = 0 if ok else EXIT_FAIL
+        return (code, out, verdict)
 
-    [r] = fan([ship], a.cfg, work)
-    if r.log:
-        sys.stderr.write(r.log + "\n")
-    if not r.ok:
-        sys.stderr.write((r.err or "") + "\n")
-        sys.exit(1)
-    ok, out, verdict = r.value
+    code, out, verdict = work(ship, host_for(ship, a.cfg), lambda m: sys.stderr.write(m + "\n"))
     if out:
         sys.stdout.write(out + "\n")
         sys.stdout.flush()  # the verdict is the LAST line, even through a pipe
-    sys.stderr.write(paint(verdict, "green" if ok else "red", is_tty(sys.stderr)) + "\n")
-    sys.exit(0 if ok else 1)
+    sys.stderr.write(paint(verdict, "red" if code else "green", is_tty(sys.stderr)) + "\n")
+    sys.exit(code)
 
 
 def collect_garbage(ship: Ship, desk: Desk, cfg: Config, timeout: int, log,
@@ -2155,9 +2350,7 @@ def cmd_commit_pick(a: Parsed) -> None:
 
 
 def cmd_code(a: Parsed) -> None:
-    results = fan(select_ships(a.selector, a.cfg), a.cfg,
-                  lambda ship, host, log: fetch_code(ship, a.cfg, log))
-    sys.exit(report(results))
+    on_ship(a, lambda ship, host, log: fetch_code(ship, a.cfg, log))
 
 
 def login_page(base: str, code: str, path: str) -> str:
@@ -2194,7 +2387,7 @@ def cmd_open(a: Parsed) -> None:
             raise RuntimeError(f"no browser could be opened — sign in at {base}/~/login with code {code}")
         return f"opened {base}{path}, signed in"
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 def cmd_exec(a: Parsed) -> None:
@@ -2209,8 +2402,7 @@ def cmd_exec(a: Parsed) -> None:
         cmd = command.replace("{pier}", pier_dir(ship, host)).replace("{root}", host.root)
         return host.exec("sh", ["-c", cmd], timeout_ms=timeout * 1000).rstrip("\n")
 
-    results = fan(select_ships(a.selector, a.cfg), a.cfg, work)
-    sys.exit(report(results))
+    on_ship(a, work)
 
 
 def cmd_slog(a: Parsed) -> None:
@@ -2227,7 +2419,7 @@ def cmd_slog(a: Parsed) -> None:
         try:
             counter = re.compile(count)
         except re.error as e:
-            die(f"--count: bad regex {count!r} ({e})")
+            raise UsageError(None, f"--count: bad regex {count!r} ({e})")
 
     def work(ship, host, log):
         if raw:
@@ -2246,13 +2438,13 @@ def cmd_slog(a: Parsed) -> None:
 
     if follow:
         return slog_follow(a, work)
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work), header=sys.stdout))
+    on_ship(a, work)
 
 
 def parse_since(s: str) -> float:
     m = re.fullmatch(r"(\d+)([smhd])", s.strip())
     if not m:
-        die(f"--since: want <n>[smhd] (e.g. 5m, 2h), got {s!r}")
+        raise UsageError(None, f"--since: want <n>[smhd] (e.g. 5m, 2h), got {s!r}")
     return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
 
 
@@ -2260,10 +2452,7 @@ def slog_follow(a: Parsed, work) -> None:
     # poll-and-print. The tee is a FILE, so following it is just re-syncing the
     # watermark — no subscription, no reconnect, and it resumes cleanly across a
     # daemon restart because the file (and our offset into it) outlive the process.
-    ships = select_ships(a.selector, a.cfg)
-    if len(ships) != 1:
-        die("slog -f: follow one ship at a time")
-    ship = ships[0]
+    ship = resolve_ship(a.selector, a.cfg)
     host = host_for(ship, a.cfg)
     seen = 0
     try:
@@ -2281,8 +2470,6 @@ def slog_follow(a: Parsed, work) -> None:
 
 
 def cmd_capture(a: Parsed) -> None:
-    # routed through the one scheduler so capture handles + reports per-ship
-    # failures like every other multi-ship command.
     nlines = a.flags.get("-n") or 0
 
     def work(ship, host, log):
@@ -2292,7 +2479,7 @@ def cmd_capture(a: Parsed) -> None:
             return tail_n(capture_pane(host, ship, LINE_BYTES * nlines).rstrip("\n"), nlines)
         return capture_pane(host, ship)  # the daemon's whole scrollback ring buffer
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work), header=sys.stdout))
+    on_ship(a, work)
 
 
 def cmd_status(a: Parsed) -> None:
@@ -2301,47 +2488,54 @@ def cmd_status(a: Parsed) -> None:
     cfg = a.cfg
     if a.selector is not None:
         return print_detail(resolve_ship(a.selector, cfg), cfg)
-    ships = select_ships(None, cfg)
-    results = fan(ships, cfg,
-                  lambda ship, host, log: probe_ship(ship, cfg, host))
+    ships = cfg.ships
+
+    def probe(ship: Ship) -> ShipState | Exception:
+        try:
+            return probe_ship(ship, cfg, host_for(ship, cfg))
+        except Exception as e:
+            return e
+    with ThreadPoolExecutor(max_workers=min(16, len(ships))) as ex:
+        results = list(ex.map(probe, ships))  # in config order
     print_status(ships, results, cfg)
-    sys.exit(fan_exit(results))
+    sys.exit(1 if any(isinstance(r, Exception) for r in results) else 0)
 
 
-def print_status(ships: list[Ship], results: list[FanResult], cfg: Config) -> None:
+def print_status(ships: list[Ship], results: list[ShipState | Exception], cfg: Config) -> None:
     # One card per ship: the live signals (STATE / version / daemon / dojo / http)
     # joined with the static config inventory (host:port, pier, code) — everything
     # knowable about a ship in one place. A card (not a wide table) so a long pier
-    # path can't push the line past 80 cols. fan() preserves input order, so ships
-    # zip 1:1 with results.
+    # path can't push the line past 80 cols. results zip 1:1 with ships; an Exception
+    # is a ship whose probe failed.
     on = is_tty(sys.stdout)
 
     def ver_cell(v: ShipState) -> str:
         return engine_cell(v, on) if v.daemon else paint("-", "red", on)
 
     namew = max((len(s.name) for s in ships), default=0)
-    statew = max((len(r.value.verdict) for r in results if r.ok and r.value),
-                 default=0)
+    statew = max((len(r.verdict) for r in results if isinstance(r, ShipState)), default=0)
     statew = max(statew, len("error"))
 
     out: list[str] = ["", f"  {paint('config', 'gray', on)} {REPO / CONFIG}", ""]
     for ship, r in zip(ships, results):
         host = host_for(ship, cfg)
-        host_cell = f"{host.name}:{ship.pier.port}" if ship.pier.port is not None else host.name
+        host_cell = f"{host.name}:{ship.pier.port}"
         pier = pier_rel(ship)
         code = "set" if ship.code else "live"
-        v: ShipState | None = r.value if (r.ok and r.value is not None) else None
+        v = r if isinstance(r, ShipState) else None
 
         # pad the PLAIN verdict to width, then color, so ANSI codes never skew it.
         word = v.verdict if v else "error"
         state = verdict_color(word, on) + " " * (statew - len(word))
-        ver = ver_cell(v) if v else paint(f"error: {r.err or ''}", "red", on)
+        ver = ver_cell(v) if v else paint(f"error: {r}", "red", on)
         signals = (f"daemon {sig(v.daemon, on)}   dojo {sig(v.dojo, on)}   http {sig(v.http, on)}"
                    if v else "daemon -   dojo -   http -")
 
         out.append(f"  {paint(ship.name, 'bold', on)}{' ' * (namew - len(ship.name))}   {state}   {ver}")
         out.append(f"    {signals}")
         out.append(f"    host {host_cell}   pier {pier}   code {code}")
+        if v and v.latency:
+            out.append(f"    latency {v.latency}")
         if v and v.misconfigured:
             out.append("    " + paint("↳ " + misconfig_brief(ship, v.running_port), "red", on))
         out.append("")
@@ -2366,8 +2560,11 @@ def print_detail(ship: Ship, cfg: Config) -> None:
 
     # the three versions behind the ship: admiral's engine, vere, and the kelvin its
     # base desk is built for (read from the dojo).
-    vere = host.exec(vere_binary(ship, host), ["--version"], check=False).split("\n")[0]
-    vere = vere.removeprefix("urbit ").strip() or "-"
+    try:
+        vere = host.exec(vere_binary(ship, host), ["--version"], check=False).split("\n")[0]
+        vere = vere.removeprefix("urbit ").strip() or "-"
+    except RuntimeError:
+        vere = "no <pier>/.run"
     kelvin = "-"
     if st.dojo:
         try:
@@ -2377,7 +2574,7 @@ def print_detail(ship: Ship, cfg: Config) -> None:
             kelvin = "? (the dojo did not answer; see slog)"
 
     pier_extra = [
-        f"port {ship.pier.port}" if ship.pier.port is not None else None,
+        f"port {ship.pier.port}",
         f"loom {ship.pier.loom}" if ship.pier.loom is not None else None,
         f"memo {ship.pier.memo}" if ship.pier.memo is not None else None,
     ]
@@ -2432,6 +2629,7 @@ def print_detail(ship: Ship, cfg: Config) -> None:
         ("verdict", verdict_color(st.verdict, on)),
         ("daemon", daemon_str),
         ("engine", engine_cell(st, on) if st.daemon else "-"),
+        ("latency", latency_detail(ship, st)),
         ("vere", vere),
         ("kelvin", kelvin),
         ("pane", sig(st.pane, on)),
@@ -2450,6 +2648,50 @@ def print_detail(ship: Ship, cfg: Config) -> None:
         sys.stdout.write(k.ljust(w) + "  " + v + "\n")
 
 
+def latency_detail(ship: Ship, st: ShipState) -> str:
+    # the live proxy, and whether it is what the config asks for
+    want = latency_want(ship)
+    wanted = latency_brief(want)
+    if not st.daemon:
+        return f"config {wanted}" if wanted else "none"
+    if not engine_has_latency(st.version):
+        return f"config {wanted}, engine too old: engine-upgrade" if wanted else "none"
+    live = st.latency or "none"
+    if live == (wanted or "none"):
+        return live
+    return f"{live} (config: {wanted or 'none'}; `latency reload` applies it)"
+
+
+def cmd_latency(a: Parsed) -> None:
+    # bring a running daemon's latency proxy to what the config says: start it, change
+    # its ms or port, or stop it. Config is the only setting; see DelayProxy.
+    if a.pos[0] != "reload":
+        raise UsageError(a.cmd, f"expected reload; got {a.pos[0]!r} (the config sets latency: {LATENCY_FORM})")
+
+    def work(ship, host, log):
+        st = daemon_status(host, ship)
+        if st is None:
+            raise NotRunning(f"not running — `{INVOKE} {ship.name} run` starts it with its proxy")
+        assert_port_match(host, ship, st)
+        upgrade = (f"`{INVOKE} {ship.name} engine-upgrade` swaps in v{VERSION} in place "
+                   f"(urbit is not restarted)")
+        if not engine_has_latency(st[2]):
+            raise RuntimeError(f"its daemon runs engine v{st[2]}, which has no latency proxy. {upgrade}")
+        want = latency_want(ship)
+        if want == "none":
+            if (daemon_latency(host, ship) or "none") == "none":
+                return "no proxy (the config sets none)"
+            if not engine_has_latency(st[2], LATENCY_STOP_SINCE):
+                raise RuntimeError(f"its daemon runs engine v{st[2]}, which can't stop the proxy. {upgrade}")
+            latency_apply(host, ship)
+            return "proxy stopped (the config sets none)"
+        brief = latency_apply(host, ship)
+        origin = re.sub(r":\d+$", "", ship_base(ship))
+        return f"{brief}   {origin}:{ship.latency_port}"
+
+    on_ship(a, work)
+
+
 def cmd_attach(a: Parsed) -> None:
     # Attach the terminal to the ship's dojo by running THIS file's __attach engine
     # client ON the ship's host: local => a direct exec that inherits your terminal;
@@ -2460,7 +2702,7 @@ def cmd_attach(a: Parsed) -> None:
     ship = resolve_ship(a.selector, cfg)
     host = host_for(ship, cfg)
     if daemon_status(host, ship) is None:
-        raise RuntimeError(
+        raise NotRunning(
             f'ship "{ship.name}" daemon not running — `{INVOKE} {ship.name} run` first')
     guard_port(host, ship)  # a wrong-port config may not even attach to this pier
     eng(host, ship, "__attach", inherit=True)
@@ -2641,11 +2883,22 @@ def cmd_run(a: Parsed) -> None:
         if ship.pier.persist:
             systemctl(host, "start", unit_name(ship))
             st = wait_daemon(host, ship)
-            return f"running under {unit_name(ship)} (daemon {st[0]} child {st[1]})" + note
+            return f"running under {unit_name(ship)} (daemon {st[0]} child {st[1]})" + run_latency(ship, host) + note
         st = daemon_start(ship, host)
-        return f"running (daemon {st[0]} child {st[1]})"
+        return f"running (daemon {st[0]} child {st[1]})" + run_latency(ship, host)
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
+
+
+def run_latency(ship: Ship, host: Host) -> str:
+    # a freshly started ship whose config sets latency gets its proxy; a failure is a
+    # note on run's verdict, never a failed run (the ship itself came up)
+    if not ship.latency:
+        return ""
+    try:
+        return f", latency {latency_apply(host, ship)}"
+    except Exception as e:
+        return f"\n  latency proxy not started: {e}"
 
 
 def reconcile_unit(ship: Ship, host: Host, log: Callable[[str], None]) -> str:
@@ -2671,7 +2924,7 @@ def reconcile_unit(ship: Ship, host: Host, log: Callable[[str], None]) -> str:
         systemctl(host, "daemon-reload")
     return ""
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 def cmd_exit(a: Parsed) -> None:
@@ -2685,7 +2938,7 @@ def cmd_exit(a: Parsed) -> None:
         eng(host, ship, "__kill", check=False)
         return "exited"
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 def cmd_engine_upgrade(a: Parsed) -> None:
@@ -2717,7 +2970,7 @@ def cmd_engine_upgrade(a: Parsed) -> None:
         raise RuntimeError(f"engine did not swap (still v{running}); the daemon's .log says why — "
                            f"`{INVOKE} {ship.name} exit` then `run` restarts it onto the new tool")
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 def event_log_dir(ship: Ship, host: Host) -> str:
@@ -2755,10 +3008,8 @@ def log_size_kb(host: Host, ship: Ship) -> int:
 def vere_argv(ship: Ship, host: Host, verb: str, *extra: str) -> list[str]:
     # an offline vere utility (roll / chop / next) against the pier. A docked
     # <pier>/.run self-locates its pier and rejects an explicit one ("invalid
-    # command"); only a bare `urbit` needs the pier argument.
-    binary = vere_binary(ship, host)
-    target = [] if binary != "urbit" else [pier_dir(ship, host)]
-    return [binary, verb, *extra, *target]
+    # command").
+    return [vere_binary(ship, host), verb, *extra]
 
 
 def offline(ship: Ship, host: Host, log: Callable[[str], None], what: str,
@@ -2824,7 +3075,7 @@ def cmd_chop(a: Parsed) -> None:
 
         return offline(ship, host, log, "chop", op)
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 def cmd_vere_upgrade(a: Parsed) -> None:
@@ -2843,7 +3094,7 @@ def cmd_vere_upgrade(a: Parsed) -> None:
 
         return offline(ship, host, log, "next", op)
 
-    sys.exit(report(fan(select_ships(a.selector, a.cfg), a.cfg, work)))
+    on_ship(a, work)
 
 
 # ── shell tab-completion (hidden subcommands) ─────────────────────────────────
@@ -2984,61 +3235,46 @@ def _shell_arg(a: Parsed) -> str:
     return shell
 
 
-FIELD_DOC: dict[str, str] = {
-    # one line per config key, for `configure`; FIELDS carries the type and check
-    "host": "a [hosts.<name>] the ship runs on; omit for this machine",
-    "http": "the ship's web origin, e.g. http://localhost:8080 or a public https URL",
-    "code": "its +code (skips the live dojo read)",
-    "master-ticket": "the ship's master ticket, plain text, for tooling that needs it",
-    "mnemonic": "its BIP39 seed phrase, plain text, for tooling that needs it",
-    "path": "pier dir, relative to the host root (here, for a local ship); default .piers/<name>",
-    "port": "the http bind port",
-    "ames": "the ames UDP port; pin it so peers' lanes survive a restart",
-    "loom": "loom size in memory pages, a power of 2",
-    "memo": "vere's persistent memo cache cap, in entries (default 50000)",
-    "local": "boot with -L (fake networking): for a COPIED pier whose original still runs",
-    "persist": "come up at boot through a systemd user unit that `run` writes (Linux only)",
-}
-
-
 def cmd_configure(a: Parsed) -> None:
     # explain how to write admiral.toml: where it is looked for, then every table and
-    # key with its meaning and type. Keys come from FIELDS so the list cannot drift
-    # from the loader.
-    color = is_tty(sys.stderr)
+    # key with its type, whether it is required, and its meaning. Printed from the
+    # schema (SHIP_KEYS, PIER_KEYS, HOST_KEYS, DESK_KEYS) so it cannot drift from the
+    # loader.
+    color = is_tty(sys.stdout)
     bold = lambda s: paint(s, "bold", color)
     gray = lambda s: paint(s, "gray", color)
-    kinds = {"str": "string", "int": "integer", "bool": "bool"}
-    keys = ["host", *(f.key for f in FIELDS if not f.pier), *(f.key for f in FIELDS if f.pier)]
-    w = max(len(k) for k in keys)
+    kinds = {"str": "string", "int": "integer", "bool": "bool", "table": "table"}
+    w = max(len(k.key) for k in [*SHIP_KEYS, *PIER_KEYS, *HOST_KEYS, *DESK_KEYS]) + 2
 
-    def row(key: str, kind: str, indent: str = "  ") -> str:
-        label = indent + key
-        return "\n".join(label_wrap(label, len(indent) + w, f"{kind}. {FIELD_DOC[key]}", HELP_WIDTH))
-    ship_rows = [row("host", "string"), *(row(f.key, kinds[f.kind]) for f in FIELDS if not f.pier)]
-    pier_rows = [row(f.key, kinds[f.kind], "    ") for f in FIELDS if f.pier]
-    sys.stderr.write(f"""
+    def rows(keys: list[Key], indent: str = "  ") -> str:
+        out = []
+        for k in keys:
+            need = "required" if k.required else "optional"
+            out += label_wrap(indent + k.key, len(indent) + w, f"{kinds[k.kind]}, {need}. {k.doc}", HELP_WIDTH)
+        return "\n".join(out)
+    sys.stdout.write(f"""
 {bold(f"{CONFIG}: how to write it")}
 
   {NAME} finds its config by climbing from the current directory to the
   first {CONFIG} (or .{CONFIG}), as git finds .git. It never writes the
-  file: every command re-reads and validates it, so a bad key is reported.
+  file, and it fills in nothing: every command checks the whole file first
+  and refuses a missing required key, an unknown key, a wrong type, or a
+  path that isn't there, naming the table and the key.
 
 {bold("[ships.<name>]")}  {gray("one table per ship; <name> is the ship's @p without ~")}
 
-{chr(10).join(ship_rows)}
-  {"pier".ljust(w)}  table. where the pier is and how it boots, inline {{ ... }}:
-{chr(10).join(pier_rows)}
+{rows(SHIP_KEYS)}
 
-{bold("[hosts.<name>]")}  {gray("a remote machine; the local machine is implicit")}
+  {bold("pier = { ... }")}
+{rows(PIER_KEYS, "    ")}
 
-  {"ssh".ljust(w)}  ssh target, e.g. urb@box
-  {"root".ljust(w)}  absolute base dir on the box that pier paths are relative to
+{bold("[hosts.<name>]")}  {gray("optional: a remote machine. A ship with no host runs here")}
 
-{bold("[[desks]]")}  {gray("a desk `commit` can sync into a ship; one entry per desk")}
+{rows(HOST_KEYS)}
 
-  {"name".ljust(w)}  the desk name on the ship
-  {"src".ljust(w)}  its source directory, relative to the config's directory
+{bold("[[desks]]")}  {gray("optional: a desk `commit` can sync into a ship; one entry per desk")}
+
+{rows(DESK_KEYS)}
 
 {bold("example")}
 
@@ -3054,6 +3290,7 @@ def cmd_configure(a: Parsed) -> None:
   host = "box"
   http = "https://marnec-dozzod.example.com"
   pier = {{ path = "piers/marnec-dozzod", port = 8080, persist = true }}
+  latency = {{ ms = 1000, port = 8180 }}
 
   [[desks]]
   name = "my-desk"
@@ -3117,7 +3354,8 @@ COMMANDS: list[Cmd] = [
                  "  http     the ship's web address answers GET /~/login\n"
                  "  host     the machine, and the http port the ship binds\n"
                  "  pier     the pier directory\n"
-                 "  code     set: +code comes from the config; live: read from the dojo\n\n"
+                 "  code     set: +code comes from the config; live: read from the dojo\n"
+                 "  latency  the latency proxy in front of the ship, when it has one\n\n"
                  "misconfigured: the ship runs on a different http port than this config's "
                  "pier.port, so the pier belongs to another admiral.toml. This config refuses to "
                  "touch it, even to attach.\n\n"
@@ -3138,6 +3376,11 @@ COMMANDS: list[Cmd] = [
                  "line, an unclosed entry, a question nobody answered, a thread still running. A "
                  "running thread gets -t seconds to finish, then it is aborted. When CMD runs a "
                  "thread past -t, it is aborted too, and so is one you Ctrl-C.\n\n"
+                 "After CMD, the dojo's input line is left empty. A command that bails (a scry "
+                 "that fails) and a line the dojo refuses both stay on the line as typed, where "
+                 "the next keystrokes, yours at attach included, would land on the end of them; "
+                 "admiral clears them. Past -t on an event still computing, the clearing keys "
+                 "are typed and take effect when the event ends.\n\n"
                  "An event still computing (the dojo is mute: an eval, or often a gall agent's "
                  "timer) is never interrupted. Past -t admiral gives up, says so, and exits "
                  "nonzero; the event finishes on its own, and slog shows what it is doing. "
@@ -3240,8 +3483,9 @@ COMMANDS: list[Cmd] = [
     Cmd(
         name="run", summary="turn the ship on",
         flags=[], positionals=[],
-        details=("Start the daemon that holds the ship: it runs `urbit <pier>` in a terminal of "
-                 "its own (with the configured loom and http port) and serves a control socket. "
+        details=("Start the daemon that holds the ship: it runs the pier's own vere, "
+                 "<pier>/.run, in a terminal of its own (with the configured http port, and "
+                 "loom, memo and ames when the config sets them) and serves a control socket. "
                  "The daemon outlives your shell. An already-running ship is reported as "
                  "such.\n\n"
                  "The pier must already exist. Create it with the urbit binary, stop it, then "
@@ -3252,7 +3496,9 @@ COMMANDS: list[Cmd] = [
                  "    urbit -w sampel-palnet -k sampel-palnet.key -c piers/sampel-palnet\n"
                  "  a comet:\n"
                  "    urbit -c piers/comet\n\n"
-                 "Once it reaches the dojo, stop it with Ctrl-D in that terminal. Then:\n\n"
+                 "Once it reaches the dojo, stop it with Ctrl-D in that terminal. admiral runs "
+                 "docked piers only, never an `urbit` off PATH: `urbit dock <pier>` docks one "
+                 "that has no .run. Then:\n\n"
                  "  [ships.sampel-palnet]\n"
                  "  http = \"http://localhost:8080\"\n"
                  "  pier = { path = \"piers/sampel-palnet\", port = 8080 }\n\n"
@@ -3367,6 +3613,29 @@ COMMANDS: list[Cmd] = [
         run=cmd_capture,
     ),
     Cmd(
+        name="latency", summary="apply the config's latency proxy to a running ship",
+        flags=[], positionals=[Pos("action", True, "reload: bring the running proxy to the config")],
+        details=("The config sets a proxy in front of the ship's http port, so a local ship "
+                 "feels like one in the cloud:\n\n"
+                 f"  {LATENCY_FORM}    # round trip in ms; the port it listens on\n\n"
+                 "Both keys are required. No latency key, or ms = 0, is no proxy. `run` starts "
+                 "it with a fresh daemon. `latency reload` brings a running daemon to the "
+                 "config: it starts the proxy, changes its ms or port, or stops it. Nothing "
+                 "else sets it.\n\n"
+                 "Point the browser at the proxy's port: every request costs the round trip, "
+                 "half on the way in and half on the way out (±20%). A streamed response "
+                 "(eyre's channel, an SSE page stream, a websocket) stays open, and each chunk "
+                 "arrives that half later, in order. Requests in flight overlap: it is latency, "
+                 "not bandwidth. The proxy forwards bytes as they are, so headers, cookies, Host "
+                 "and redirects pass untouched and login works through it. The ship's own port "
+                 "never moves and the ship never restarts.\n\n"
+                 "status shows it. It needs engine v0.2.0 (v0.2.1 to stop it); engine-upgrade "
+                 "swaps an older daemon in place."),
+        examples=[f"{INVOKE} sampel-palnet latency reload"],
+        complete=lambda cfg: ["reload"],
+        run=cmd_latency,
+    ),
+    Cmd(
         name="attach", summary="a live dojo in your terminal (Ctrl-\\ to detach)",
         flags=[], positionals=[],
         details=("Connect your terminal to the ship's dojo until you detach.\n\n"
@@ -3469,14 +3738,14 @@ def menu_ships(cfg: Config, gray: Callable[[str], str]) -> str:
         out.append(f"  {hname}")
         w = max(len(s.name) for s in ships)
         for ship in ships:
-            pier = pier_rel(ship) + (f":{ship.pier.port}" if ship.pier.port else "")
+            pier = f"{pier_rel(ship)}:{ship.pier.port}"
             tags = [t for t, on in (("local", ship.pier.local), ("persist", ship.pier.persist)) if on]
             out.append(f"    {ship.name.ljust(w)}  {pier}" + (f"  {gray(', '.join(tags))}" if tags else ""))
     return "\n".join(out)
 
 
 def help_menu() -> None:
-    color = is_tty(sys.stderr)
+    color = is_tty(sys.stdout)
     red = lambda s: paint(s, "red", color)
     gray = lambda s: paint(s, "gray", color)
     bold = lambda s: paint(s, "bold", color)
@@ -3522,7 +3791,8 @@ def help_menu() -> None:
                 config += "\nDesks\n" + "\n".join(f"  {d.name.ljust(dw)}  {d.src}" for d in cfg.desks) + "\n"
             config += "\nShips\n" + menu_ships(cfg, gray)
 
-    sys.stderr.write(f"""
+    exits = "\n".join(f"  {str(n).rjust(3)}  {what}" for n, what in EXIT_CODES)
+    sys.stdout.write(f"""
 {bold(f"{CLI}: urbit ship manager")} {gray(f"v{VERSION}")}
 
 Commands
@@ -3532,6 +3802,10 @@ Commands
   {gray(f"{inv} <ship> <command> [opts]")}
 
 {table}
+
+Exit codes
+
+{exits}
 
 {config}
 
@@ -3543,12 +3817,11 @@ def cmd_help(name: str | None = None) -> None:
         return help_menu()
     c = by_name(name)
     W = HELP_WIDTH
-    color = is_tty(sys.stderr)
+    color = is_tty(sys.stdout)
     bold = lambda s: paint(s, "bold", color)
     gray = lambda s: paint(s, "gray", color)
     if not c:
-        sys.stderr.write(f'no command "{name}"; {INVOKE} help lists them\n')
-        sys.exit(1)
+        raise UsageError(None, f'no command "{name}"; {INVOKE} help lists them')
     out: list[str] = [""]
     head = f"{CLI} {c.name}"
     for i, l in enumerate(wrap(f"{head} — {c.summary}", W)):
@@ -3573,7 +3846,7 @@ def cmd_help(name: str | None = None) -> None:
         for e in c.examples:
             out.append("  " + gray(e))
         out.append("")
-    sys.stderr.write("\n".join(out) + "\n")
+    sys.stdout.write("\n".join(out) + "\n")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3590,8 +3863,11 @@ def cmd_help(name: str | None = None) -> None:
 HDR = struct.Struct("!BI")
 C_ATTACH, C_DATA, C_WINCH, C_PING, C_KILL, C_UPGRADE = 1, 2, 3, 5, 6, 7  # 4 was whole-ring capture
 C_CAPTURE_AT = 8  # capture ring bytes past a caller-held watermark (0 = the whole ring)
+C_LATENCY = 9     # the latency proxy: "" asks its state, "set <listen> <target> <ms>" sets it,
+                  # "stop" closes its port (v0.2.1)
 S_DATA, S_EXIT, S_SNAPSHOT, S_PONG = 1, 2, 3, 4
 S_SNAPSHOT_AT = 5  # reply to C_CAPTURE_AT: 8-byte total-bytes-written + the requested tail
+S_LATENCY = 6      # reply to C_LATENCY: DelayProxy.state() text, or "error <why>"
 WINSZ = struct.Struct("!HHHH")
 RING_MAX = 64 * 1024 * 1024  # scrollback ring cap; oldest bytes drop past this.
 # Sized to hold a full noisy rebuild (a `|commit` of an app that ~&-prints every event)
@@ -3739,6 +4015,10 @@ def engine_run_daemon(path: str, cmd: list[str], winsz: bytes | None) -> None:
             pass
     os.set_blocking(master, False)
 
+    try:
+        os.unlink(path + ".latency")  # a fresh daemon: `run` applies the config's latency
+    except OSError:
+        pass
     listen = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listen.bind(path)
     listen.listen(16)
@@ -3764,6 +4044,190 @@ def engine_adopt(path: str, master: int, pid: int, listen_fd: int) -> None:
     listen = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=listen_fd)
     listen.setblocking(False)
     engine_serve(path, master, pid, listen, ring)
+
+
+class DelayProxy:
+    # The latency proxy: a TCP delay line in front of the ship's http port, so a local
+    # ship feels like a hosted one. It never parses HTTP. Each chunk read from either
+    # side is written to the other `ms/2` later (±JITTER), so a request in plus its
+    # response out costs one `ms` round trip; a streamed response (eyre's SSE channel,
+    # a websocket) pays the one-way delay per chunk, in order. Headers, cookies, Host
+    # and redirects pass byte for byte. Each connection runs on its own, so requests in
+    # flight overlap: this is latency, not bandwidth. ms 0 is off: the port stays up and
+    # forwards directly.
+    #
+    # It lives in the daemon on a thread of its own running an asyncio loop; the
+    # daemon's select loop calls `control` with a C_LATENCY payload.
+    JITTER = 0.2
+    QUEUE = 256  # chunks in flight per direction (64KB each) before reading pauses
+
+    def __init__(self) -> None:
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.server: Any = None
+        self.listen: int | None = None
+        self.target: int | None = None
+        self.ms = 0
+
+    def state(self) -> str:
+        # "none" (no proxy) or "<listen> <target> <ms>"; ms 0 = off
+        return "none" if self.listen is None else f"{self.listen} {self.target} {self.ms}"
+
+    def control(self, msg: str) -> str:
+        # "" -> the state; "set <listen> <target> <ms>" -> (re)configure, then the state;
+        # "stop" -> close the port ("none"); failures come back as "error <why>"
+        parts = msg.split()
+        if not parts:
+            return self.state()
+        if parts == ["stop"]:
+            return self.stop()
+        if parts[0] != "set" or len(parts) != 4:
+            return f"error bad latency control {msg!r}"
+        try:
+            listen, target, ms = int(parts[1]), int(parts[2]), int(parts[3])
+        except ValueError:
+            return f"error bad latency control {msg!r}"
+        return self.set(listen, target, ms)
+
+    def set(self, listen: int, target: int, ms: int) -> str:
+        if listen == target:
+            return f"error the proxy can't listen on the ship's own port {target}"
+        if listen != self.listen:
+            # bind HERE, on the caller's thread, so a taken port is reported at once
+            try:
+                sock = self._bind(listen)
+            except OSError as e:
+                return f"error can't listen on :{listen}: {e.strerror or e}"
+            self._start_loop()
+            fut = asyncio.run_coroutine_threadsafe(self._serve(sock), self.loop)
+            try:
+                fut.result(5)
+            except Exception as e:
+                sock.close()
+                return f"error can't serve :{listen}: {e}"
+            self.listen = listen
+        self.target, self.ms = target, max(0, ms)
+        return self.state()
+
+    def stop(self) -> str:
+        # stop accepting; connections already open finish on their own
+        if self.server is not None and self.loop is not None:
+            async def close() -> None:
+                self.server.close()
+            asyncio.run_coroutine_threadsafe(close(), self.loop).result(5)
+            self.server = None
+        self.listen = self.target = None
+        self.ms = 0
+        return self.state()
+
+    @staticmethod
+    def _bind(port: int) -> socket.socket:
+        # dual-stack when the box has it, so `localhost` resolving to ::1 lands too.
+        # SO_REUSEADDR lets an upgraded daemon rebind past TIME_WAIT, but on a BSD it
+        # also lets a wildcard bind shadow someone's 127.0.0.1 listener: refuse a port
+        # that already answers.
+        for addr in ("127.0.0.1", "::1"):
+            try:
+                socket.create_connection((addr, port), timeout=0.5).close()
+            except OSError:
+                continue
+            raise OSError(98, f"something already listens on {addr}:{port}")
+        try:
+            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            try:
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("::", port))
+            except OSError:
+                s.close()
+                raise
+        except OSError:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("0.0.0.0", port))
+            except OSError:
+                s.close()
+                raise
+        s.listen(128)
+        s.setblocking(False)
+        return s
+
+    def _start_loop(self) -> None:
+        if self.loop is not None:
+            return
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self.loop.run_forever, name="latency", daemon=True).start()
+
+    async def _serve(self, sock: socket.socket) -> None:
+        old, self.server = self.server, await asyncio.start_server(self._conn, sock=sock)
+        if old is not None:
+            old.close()  # stop accepting on the old port; its open connections finish
+
+    def delay(self) -> float:
+        # one way: half the round trip, jittered
+        if self.ms <= 0:
+            return 0.0
+        return self.ms / 2000.0 * random.uniform(1 - self.JITTER, 1 + self.JITTER)
+
+    async def _conn(self, cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
+        try:
+            ur, uw = await asyncio.open_connection("127.0.0.1", self.target)
+        except OSError:
+            cw.close()
+            return
+
+        def close() -> None:
+            for w in (cw, uw):
+                try:
+                    w.close()
+                except Exception:
+                    pass
+        await asyncio.gather(self._pipe(cr, uw, close), self._pipe(ur, cw, close),
+                             return_exceptions=True)
+        close()
+
+    async def _pipe(self, src: asyncio.StreamReader, dst: asyncio.StreamWriter,
+                    close: Callable[[], None]) -> None:
+        # one direction: a reader stamps each chunk with when it is due, a writer sends
+        # it then. Due times never go backwards, so jitter can't reorder bytes.
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue(self.QUEUE)
+
+        async def pump() -> None:
+            last = 0.0
+            while True:
+                try:
+                    data = await src.read(65536)
+                except Exception:
+                    data = b""
+                last = max(last, loop.time() + self.delay())
+                await q.put((last, data))
+                if not data:
+                    return
+
+        async def send() -> None:
+            while True:
+                due, data = await q.get()
+                wait = due - loop.time()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                if not data:
+                    try:
+                        if dst.can_write_eof():
+                            dst.write_eof()
+                    except Exception:
+                        close()
+                    return
+                dst.write(data)
+                await dst.drain()
+
+        reader = asyncio.ensure_future(pump())
+        try:
+            await send()
+        except Exception:
+            close()  # the far side is gone: drop both, which ends the other direction too
+        finally:
+            reader.cancel()
 
 
 def engine_serve(path: str, master: int, pid: int, listen: socket.socket, ring: bytearray) -> None:
@@ -3846,6 +4310,21 @@ def engine_serve(path: str, master: int, pid: int, listen: socket.socket, ring: 
 
     tee_open()
 
+    # the latency proxy. Its setting lives in `<sock>.latency` so an in-place upgrade
+    # (which re-execs this image and closes its sockets) puts it back; a fresh daemon
+    # starts without one (engine_run_daemon deletes it) and `run` applies the config.
+    proxy = DelayProxy()
+    try:
+        with open(path + ".latency") as f:
+            saved = f.read().split()
+        if len(saved) == 3:
+            got = proxy.set(int(saved[0]), int(saved[1]), int(saved[2]))
+            if got.startswith("error"):
+                with open(path + ".log", "a") as f:
+                    f.write(f"[latency proxy not restored: {got}]\n")
+    except (OSError, ValueError):
+        pass
+
     def safe(c: dict, t: int, data: bytes = b"") -> bool:
         # client socks are non-blocking for the select read loop, but a frame can be
         # large (a 256KB ring snapshot) and sendall on a non-blocking sock raises
@@ -3900,10 +4379,11 @@ def engine_serve(path: str, master: int, pid: int, listen: socket.socket, ring: 
         for fd in list(clients):
             safe(clients[fd], S_EXIT, text.encode())
             drop(fd)
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        for p in (path, path + ".latency"):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
 
     while True:
         for key, _ in sel.select(timeout=1.0):
@@ -3962,6 +4442,18 @@ def engine_serve(path: str, master: int, pid: int, listen: socket.socket, ring: 
                         base = total - len(ring)
                         start = min(max(0, frm - base), len(ring))
                         safe(c, S_SNAPSHOT_AT, struct.pack("!Q", total) + bytes(ring[start:]))
+                    elif t == C_LATENCY:
+                        got = proxy.control(payload.decode("utf-8", "replace"))
+                        if payload and not got.startswith("error"):
+                            try:
+                                if got == "none":
+                                    os.unlink(path + ".latency")
+                                else:
+                                    with open(path + ".latency", "w") as f:
+                                        f.write(got + "\n")
+                            except OSError:
+                                pass
+                        safe(c, S_LATENCY, got.encode())
                     elif t == C_DATA:
                         try:
                             os.write(master, payload)
@@ -4174,6 +4666,19 @@ def engine_status(sock: str) -> None:
     sys.stdout.write(f"up {pong[0]} {pong[1]} {pong[2]}\n" if pong else "down\n")
 
 
+def sock_latency(sock: str, msg: str = "") -> str | None:
+    # the proxy's state after `msg` (see C_LATENCY), or None when no daemon answers
+    got = sock_request(sock, C_LATENCY, msg.encode(), want=S_LATENCY, timeout=10.0)
+    return None if got is None else got.decode("utf-8", "replace")
+
+
+def engine_latency(sock: str, msg: str) -> None:
+    got = sock_latency(sock, msg)
+    if got is None:
+        die(f"no daemon at {sock}")
+    sys.stdout.write(got + "\n")
+
+
 def engine_kill(sock: str) -> None:
     sock_request(sock, C_KILL)
 
@@ -4241,7 +4746,7 @@ def engine_pty_read(sock: str, offset: int) -> None:
 
 
 ENGINE_SUBS = {"__daemon", "__attach", "__send", "__capture-at",
-               "__status", "__kill", "__upgrade", "__pty-read"}
+               "__status", "__kill", "__upgrade", "__pty-read", "__latency"}
 
 
 def engine_main(argv: list[str]) -> None:
@@ -4280,6 +4785,8 @@ def engine_main(argv: list[str]) -> None:
         return engine_kill(sock)
     if sub == "__upgrade":
         return engine_upgrade(sock)
+    if sub == "__latency":
+        return engine_latency(sock, " ".join(rest))
     die(f"unknown engine subcommand {sub!r}")
 
 
@@ -4314,7 +4821,7 @@ def main() -> None:
 
     selector = argv[0]
     if by_name(selector):
-        raise RuntimeError(f"`{selector}` needs a ship first: {INVOKE} <ship> {' '.join(argv)}")
+        raise UsageError(None, f"`{selector}` needs a ship first: {INVOKE} <ship> {' '.join(argv)}")
     # no command after the selector → status (the default command).
     subcmd = argv[1] if len(argv) > 1 else "status"
     args = argv[2:]
@@ -4323,7 +4830,7 @@ def main() -> None:
     cmd = by_name(subcmd)
     if not cmd or not cmd.ship:
         subs = "|".join(c.name for c in COMMANDS if c.ship)
-        raise RuntimeError(f'Unknown subcommand "{subcmd}" ({subs})  —  try: {INVOKE} help')
+        raise UsageError(None, f'Unknown subcommand "{subcmd}" ({subs})  —  try: {INVOKE} help')
     cfg = load_config()
     flags, pos = parse_args(cmd, args)
     return cmd.run(Parsed(cmd=cmd, selector=selector, cfg=cfg, flags=flags, pos=pos))
@@ -4341,7 +4848,10 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.stderr.write("interrupted\n")
-        sys.exit(130)
+        sys.exit(EXIT_INTERRUPTED)
+    except subprocess.TimeoutExpired as e:
+        sys.stderr.write(f"TIMEOUT after {e.timeout:g}s: {' '.join(map(str, e.cmd or []))[:200]}\n")
+        sys.exit(EXIT_TIMEOUT)
     except Exception as e:
         sys.stderr.write(str(e) + "\n")
-        sys.exit(1)
+        sys.exit(getattr(e, "exit_code", EXIT_FAIL))

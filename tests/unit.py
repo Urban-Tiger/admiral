@@ -978,6 +978,39 @@ class ConfigFile(unittest.TestCase):
             os.chdir(cwd)
 
 
+class ExcludeConfig(ConfigFile):
+    DESK = "[[desks]]\nname = 'house'\nsrc = 'desk'\n"
+
+    def ex(self, value):
+        return self.load(self.GOOD + f"exclude = {value}\n" + self.DESK).ships[0]
+
+    def test_exclude_is_a_list_per_desk(self):
+        self.assertEqual(self.ship().exclude, {})
+        ship = self.ex('{ house = ["lib/t.hoon", "test/"] }')
+        self.assertEqual(ship.exclude, {"house": ["lib/t.hoon", "test/"]})
+
+    def test_sync_leaves_excluded_paths_out_on_the_sender_alone(self):
+        desk = A.Desk(name="house", src="desk")
+        flags = A.sync_flags(self.ex('{ house = ["lib/t.hoon", "test/"] }'), desk)
+        self.assertIn("--filter=-s /lib/t.hoon", flags)
+        self.assertIn("--filter=-s /test/", flags)
+        self.assertLess(flags.index("--filter=-s /test/"), flags.index("--filter=:- .gitignore"))
+        self.assertFalse([f for f in A.sync_flags(self.ship(), desk) if f.startswith("--filter=-s")])
+
+    def test_bad_excludes(self):
+        for bad, why in (('"lib"', "table of desk"),
+                         ('{ house = "lib" }', "non-empty list"),
+                         ('{ house = [] }', "non-empty list"),
+                         ('{ house = [1] }', "non-empty string"),
+                         ('{ house = ["/lib"] }', "relative"),
+                         ('{ house = ["a/../b"] }', "relative"),
+                         ('{ house = [".git"] }', "relative"),
+                         ('{ ghost = ["lib"] }', "not a [[desks]] name")):
+            with self.assertRaises(A.ConfigError, msg=bad) as cm:
+                self.ex(bad)
+            self.assertIn(why, str(cm.exception), bad)
+
+
 class LatencyConfig(ConfigFile):
     LAT = "latency = {{ ms = {ms}, port = {port} }}"
 
@@ -1331,7 +1364,7 @@ class Resolution(unittest.TestCase):
         self.assertEqual(A.ship_base(A.Ship("z", A.PierConfig(), http="http://l:80")), "http://l:80")
 
     def test_sync_flags(self):
-        flags = A.sync_flags()
+        flags = A.sync_flags(A.Ship(name="zod", pier=A.PierConfig(path="p", port=1)), A.Desk("d", "d"))
         self.assertIn("--exclude=.*", flags)
         self.assertIn("--exclude=admiral.toml", flags)
         self.assertIn("--delete", flags)

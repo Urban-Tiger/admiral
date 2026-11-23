@@ -20,6 +20,9 @@ pier = { path = "piers/sampel-palnet", port = 8080 }
 # latency = { ms = 1000, port = 16080 }  # a proxy in front of the ship that adds a
 #                      # hosted one's round trip (ms), listening on port; both required.
 #                      # `run` starts it; `latency reload` applies a change live.
+# exclude = { my-desk = ["lib/test.hoon", "tests/"] }  # paths a commit leaves out of
+#                      # that desk on this ship, relative to its src; the sync deletes them
+#                      # from the ship if they are there.
 
 # a remote machine; a ship on it says host = "box". A ship with no host runs here.
 # [hosts.box]

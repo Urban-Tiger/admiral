@@ -42,7 +42,7 @@ import textwrap
 import html
 import urllib.error
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -201,6 +201,7 @@ class Ship:
     mnemonic: str | None = None       # BIP39 mnemonic seed phrase (key material)
     latency: int | None = None        # ms of round trip the latency proxy adds (see DelayProxy); None = no proxy
     latency_port: int | None = None   # where the proxy listens; latency.port, required with latency
+    exclude: dict[str, list[str]] = field(default_factory=dict)  # desk name -> paths its sync leaves out
 
 
 @dataclass
@@ -279,6 +280,28 @@ def _matches(rx: re.Pattern, want: str) -> Callable[[str], str | None]:
     return lambda s: None if rx.match(s) else f"must be {want}"
 
 
+EXCLUDE_FORM = 'exclude = { my-desk = ["lib/test.hoon", "tests/"] }'
+
+
+def exclude_error(v: Any) -> str | None:
+    # why `exclude` is not a { desk = [path, ...] } table of paths in each desk's source,
+    # or None. A path is relative to the desk's src; a trailing / means a directory.
+    if not isinstance(v, dict):
+        return f"must be a table of desk = [paths]: write {EXCLUDE_FORM}, got {v!r}"
+    for desk, paths in v.items():
+        if not DESK_NAME_RE.match(desk):
+            return f"key {desk!r} must be a desk name matching {DESK_NAME_RE.pattern}"
+        if not isinstance(paths, list) or not paths:
+            return f"{desk} must be a non-empty list of paths: write {EXCLUDE_FORM}, got {paths!r}"
+        for path in paths:
+            if not isinstance(path, str) or not path.strip("/").strip():
+                return f"{desk}: each path must be a non-empty string, got {path!r}"
+            if path.startswith("/") or ".." in path.split("/") or path.startswith("."):
+                return (f"{desk}: {path!r} must be relative to the desk's src, without a "
+                        f"leading / or . and with no ..")
+    return None
+
+
 def latency_error(v: Any) -> str | None:
     # why `latency` is not a { ms, port } table admiral can run a proxy from, or None.
     # Both keys are required; ms 0 is a proxy turned off (none runs).
@@ -321,6 +344,11 @@ SHIP_KEYS: list[Key] = [
         "round trip: { ms = 1000, port = 8080 }, both required (port is where it listens; "
         "ms 0 is none). `run` starts it; `latency reload` applies a change to a running ship",
         check=latency_error),
+
+    Key("exclude", "table", "paths a commit's sync leaves out of each desk on this ship, "
+        f"relative to the desk's src (a trailing / for a directory): {EXCLUDE_FORM}. The sync "
+        "deletes an excluded file already on the ship, so the commit remounts",
+        check=exclude_error),
 ]
 PIER_KEYS: list[Key] = [
     Key("path", "str", "the pier dir: absolute, or relative to the host root (for a local "
@@ -459,6 +487,7 @@ def load_config(file: Path | None = None) -> Config:
             name=sname, host=host, http=ship["http"], code=ship.get("code"),
             master_ticket=ship.get("master-ticket"), mnemonic=ship.get("mnemonic"),
             latency=(lat["ms"] or None) if lat else None, latency_port=lat["port"] if lat else None,
+            exclude=ship.get("exclude", {}),
             pier=PierConfig(path=pier["path"], port=pier["port"], loom=pier.get("loom"),
                             memo=pier.get("memo"), ames=pier.get("ames"),
                             local=pier.get("local", False), persist=pier.get("persist", False))))
@@ -477,6 +506,12 @@ def load_config(file: Path | None = None) -> Config:
         if not os.path.isdir(d):
             raise ConfigError(f'{where}.src: no directory at {d}')
         desks.append(Desk(name=desk["name"], src=desk["src"]))
+
+    for ship in ships:
+        for dname in ship.exclude:
+            if not any(d.name == dname for d in desks):
+                raise ConfigError(f'{name}: ships["{ship.name}"].exclude.{dname} is not a '
+                                  f'[[desks]] name (have: {", ".join(d.name for d in desks) or "none"})')
 
     cfg = Config(ships=ships, desks=desks, hosts=hosts)
     check_desk_srcs(cfg)
@@ -1347,7 +1382,7 @@ def check_desk_srcs(cfg: Config) -> None:
         mount_owner(desk, cfg)
 
 
-def sync_flags() -> list[str]:
+def sync_flags(ship: Ship, desk: Desk) -> list[str]:
     # honor .gitignore so a sync publishes exactly the tracked desk source — never
     # build output, deps, or editor cruft. Also drop every dotfile and dot-dir at any
     # depth (vere never ingests them, so copying one only costs the transfer — .git,
@@ -1356,7 +1391,12 @@ def sync_flags() -> list[str]:
     # --checksum compares content, not rsync's default size+mtime quick check: a
     # rebuild can rewrite a file to the same size (lodge-ui's index.html only swaps
     # hashed asset names), and with a matching mtime the quick check skips it.
-    return ["-avL", "--checksum", "--delete", "--filter=:- .gitignore", "--exclude=.*",
+    # The ship's exclude list for this desk hides paths on the sending side alone (-s),
+    # so --delete still prunes them from a mount that already has them; an --exclude
+    # would protect them there. Anchored at the desk root, ahead of every other rule.
+    return ["-avL", "--checksum", "--delete",
+            *(f"--filter=-s /{p}" for p in ship.exclude.get(desk.name, [])),
+            "--filter=:- .gitignore", "--exclude=.*",
             *(f"--exclude={n}" for n in CONFIG_NAMES), f"--exclude={CLI}"]
 
 
@@ -1377,7 +1417,7 @@ def do_sync(ship: Ship, desk: Desk, cfg: Config) -> None:
         return
     host_mkdirp(host, dest_dir)
     sys.stderr.write(f"Syncing {src} -> {dest_dir if not host.ssh else host.ssh + ':' + dest_dir}...\n")
-    rsync_dirs(LOCAL, src_dir, host, dest_dir, sync_flags())
+    rsync_dirs(LOCAL, src_dir, host, dest_dir, sync_flags(ship, desk))
 
 
 def pending_deletes(ship: Ship, desk: Desk, cfg: Config) -> list[str]:
@@ -1386,7 +1426,7 @@ def pending_deletes(ship: Ship, desk: Desk, cfg: Config) -> list[str]:
     if self_mounted(ship, desk, cfg) or not os.path.exists(desk_src_dir(desk)):
         return []
     dest_dir = os.path.join(pier_dir(ship, host), desk.name)
-    out = rsync_dirs(LOCAL, desk_src_dir(desk), host, dest_dir, ["-n", "-i", *sync_flags()],
+    out = rsync_dirs(LOCAL, desk_src_dir(desk), host, dest_dir, ["-n", "-i", *sync_flags(ship, desk)],
                      capture=True)
     return [l.split(None, 1)[1] for l in out.splitlines() if l.startswith("*deleting")]
 
@@ -3433,6 +3473,8 @@ COMMANDS: list[Cmd] = [
                  "    src = \"mydesk\"\n"
                  f"  {INVOKE} <ship> commit mydesk\n"
                  f"  {INVOKE} <ship> dojo '|install our %mydesk'\n\n"
+                 "A ship's exclude list in the config leaves paths out of its sync of a desk, "
+                 "and deletes them from the ship if they are there.\n\n"
                  "When the source IS the ship's mounted desk (a checkout inside the pier, config "
                  "in .admiral.toml), that ship skips the rsync and refuses --remount."),
         examples=[f"{INVOKE} sampel-palnet commit base", f"{INVOKE} sampel-palnet commit --remount base"],

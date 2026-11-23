@@ -1422,13 +1422,21 @@ def do_sync(ship: Ship, desk: Desk, cfg: Config) -> None:
 
 def pending_deletes(ship: Ship, desk: Desk, cfg: Config) -> list[str]:
     # the files a sync would delete from the ship's mount: a dry run of do_sync's rsync.
+    # A directory is not one: clay tracks no directories, so an empty one left in the
+    # mount needs no remount, and the plain sync removes it.
     host = host_for(ship, cfg)
     if self_mounted(ship, desk, cfg) or not os.path.exists(desk_src_dir(desk)):
         return []
     dest_dir = os.path.join(pier_dir(ship, host), desk.name)
     out = rsync_dirs(LOCAL, desk_src_dir(desk), host, dest_dir, ["-n", "-i", *sync_flags(ship, desk)],
                      capture=True)
-    return [l.split(None, 1)[1] for l in out.splitlines() if l.startswith("*deleting")]
+    return deleted_files(out)
+
+
+def deleted_files(itemized: str) -> list[str]:
+    # the files an rsync -i run deletes, leaving out directories (a trailing /)
+    return [p for l in itemized.splitlines() if l.startswith("*deleting")
+            for p in [l.split(None, 1)[1]] if not p.endswith("/")]
 
 
 # ── dojo driver: drive one dojo pane (host-routed) ────────────────────────────

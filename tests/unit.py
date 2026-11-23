@@ -997,6 +997,12 @@ class ExcludeConfig(ConfigFile):
         self.assertLess(flags.index("--filter=-s /test/"), flags.index("--filter=:- .gitignore"))
         self.assertFalse([f for f in A.sync_flags(self.ship(), desk) if f.startswith("--filter=-s")])
 
+    def test_empty_directories_are_no_deletes(self):
+        # clay tracks no directories: an empty one left in the mount wants no remount
+        out = "*deleting test/a/f\n*deleting test/a/\n*deleting test/\n.d..t.... lib/\n"
+        self.assertEqual(A.deleted_files(out), ["test/a/f"])
+        self.assertEqual(A.deleted_files("*deleting test/was/\n*deleting test/\n"), [])
+
     def test_bad_excludes(self):
         for bad, why in (('"lib"', "table of desk"),
                          ('{ house = "lib" }', "non-empty list"),

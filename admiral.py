@@ -2244,6 +2244,18 @@ def cmd_dojo(a: Parsed) -> None:
     timeout = a.flags.get("-t") or T_DOJO
     yes = bool(a.flags.get("--yes"))
     interrupt = bool(a.flags.get("--interrupt"))
+    if a.flags.get("--commit"):
+        # commit first; a failed commit prints its transcript and stops before CMD.
+        # A clean one prints only its verdict (stderr), leaving stdout to CMD's output.
+        desk = resolve_desk(a.flags["--commit"], a.cfg)
+        ship = resolve_ship(a.selector, a.cfg)
+        code, out, verdict = commit_desk(ship, desk, a.cfg, timeout=T_COMMIT, interrupt=interrupt)
+        if code and out:
+            sys.stdout.write(out + "\n")
+            sys.stdout.flush()
+        sys.stderr.write(paint(verdict, "red" if code else "green", is_tty(sys.stderr)) + "\n")
+        if code:
+            sys.exit(code)
 
     def work(ship, host, log):
         return truncate_output(dojo_one(ship, command, a.cfg, timeout=timeout, log=log, yes=yes,
@@ -2311,54 +2323,58 @@ def ring_settle(host: Host, ship: Ship, mark: int, quiet: float = 1.0, limit: fl
     return "\n".join(r for r in rows if r and not DOJO_NOISE.match(r))
 
 
-def cmd_commit(a: Parsed, pick: bool = False) -> None:
-    desk = resolve_desk(a.pos[0], a.cfg)
-    remount = bool(a.flags.get("--remount"))
-    interrupt = bool(a.flags.get("--interrupt"))
-    timeout = a.flags.get("-t") or T_COMMIT
-    ship = resolve_ship(a.selector, a.cfg)
-    if remount and self_mounted(ship, desk, a.cfg):
+def commit_desk(ship: Ship, desk: Desk, cfg: Config, *, timeout: int, remount: bool = False,
+                interrupt: bool = False, pick: bool = False) -> tuple[int, str, str]:
+    # sync `desk` into `ship` and |commit it: (exit code, the transcript, the verdict).
+    if remount and self_mounted(ship, desk, cfg):
         # |unmount deletes the mount's tracked files and subdirs — here, the checkout.
         raise RuntimeError(f"--remount refused: %{desk.name}'s source is the mount on "
                            f"{ship.name}, and |unmount would delete it")
+    host = host_for(ship, cfg)
+    log = lambda m: sys.stderr.write(m + "\n")
+    # The desk stays mounted across commits, so rsync writes straight into the live
+    # unix-synced mount. A sync that DELETES races that mount: clay writes the file
+    # back before |commit reads the diff, and the delete never lands. So a delete
+    # remounts first — |unmount -> |mount -> rsync -> |commit — and so does
+    # --remount (a first commit, or a wedged mount).
+    deletes = pending_deletes(ship, desk, cfg)
+    if deletes:
+        log(f"the sync deletes {len(deletes)} file{'s' if len(deletes) > 1 else ''} "
+            f"({', '.join(deletes[:3])}{', …' if len(deletes) > 3 else ''}); remounting")
+    if remount or deletes:
+        dojo_one(ship, f"|unmount %{desk.name}", cfg, timeout=timeout, log=log,
+                 interrupt=interrupt)
+        dojo_one(ship, f"|mount %{desk.name}", cfg, timeout=timeout, log=log,
+                 interrupt=interrupt)
+    out = dojo_one(ship, f"|commit %{desk.name}", cfg, timeout=timeout, desk=desk, log=log,
+                   interrupt=interrupt)
+    # the commit itself returns at hood's ack; gall's reloads and build errors follow
+    # in later events. Wait for the console to go quiet so they count toward THIS
+    # commit's verdict rather than leaking into the next command's transcript.
+    if any(l.startswith(("+ /", "- /", ": /")) for l in out.split("\n")):
+        late = ring_settle(host, ship, ring_mark(host, ship))
+        if late:
+            out = out + "\n" + late
+    ok, verdict, reloaded = commit_verdict(desk, out)
+    code = 0 if ok else EXIT_BUILD
+    # a desk that just reloaded an agent is running; only an idle verdict needs +vats
+    if ok and not reloaded and desk_suspended(ship, desk, cfg, timeout, interrupt):
+        verdict += (f"\nwarning: %{desk.name} is suspended, so nothing it commits runs. "
+                    f"Start it: {INVOKE} {ship.name} dojo '|revive %{desk.name}'")
+    if ok and pick:
+        ok, picked = collect_garbage(ship, desk, cfg, timeout, log, interrupt)
+        verdict += "\n" + picked
+        code = 0 if ok else EXIT_FAIL
+    return (code, out, verdict)
 
-    def work(ship, host, log):
-        # The desk stays mounted across commits, so rsync writes straight into the live
-        # unix-synced mount. A sync that DELETES races that mount: clay writes the file
-        # back before |commit reads the diff, and the delete never lands. So a delete
-        # remounts first — |unmount -> |mount -> rsync -> |commit — and so does
-        # --remount (a first commit, or a wedged mount).
-        deletes = pending_deletes(ship, desk, a.cfg)
-        if deletes:
-            log(f"the sync deletes {len(deletes)} file{'s' if len(deletes) > 1 else ''} "
-                f"({', '.join(deletes[:3])}{', …' if len(deletes) > 3 else ''}); remounting")
-        if remount or deletes:
-            dojo_one(ship, f"|unmount %{desk.name}", a.cfg, timeout=timeout, log=log,
-                     interrupt=interrupt)
-            dojo_one(ship, f"|mount %{desk.name}", a.cfg, timeout=timeout, log=log,
-                     interrupt=interrupt)
-        out = dojo_one(ship, f"|commit %{desk.name}", a.cfg, timeout=timeout, desk=desk, log=log,
-                       interrupt=interrupt)
-        # the commit itself returns at hood's ack; gall's reloads and build errors follow
-        # in later events. Wait for the console to go quiet so they count toward THIS
-        # commit's verdict rather than leaking into the next command's transcript.
-        if any(l.startswith(("+ /", "- /", ": /")) for l in out.split("\n")):
-            late = ring_settle(host, ship, ring_mark(host, ship))
-            if late:
-                out = out + "\n" + late
-        ok, verdict, reloaded = commit_verdict(desk, out)
-        code = 0 if ok else EXIT_BUILD
-        # a desk that just reloaded an agent is running; only an idle verdict needs +vats
-        if ok and not reloaded and desk_suspended(ship, desk, a.cfg, timeout, interrupt):
-            verdict += (f"\nwarning: %{desk.name} is suspended, so nothing it commits runs. "
-                        f"Start it: {INVOKE} {ship.name} dojo '|revive %{desk.name}'")
-        if ok and pick:
-            ok, picked = collect_garbage(ship, desk, a.cfg, timeout, log, interrupt)
-            verdict += "\n" + picked
-            code = 0 if ok else EXIT_FAIL
-        return (code, out, verdict)
 
-    code, out, verdict = work(ship, host_for(ship, a.cfg), lambda m: sys.stderr.write(m + "\n"))
+def cmd_commit(a: Parsed, pick: bool = False) -> None:
+    desk = resolve_desk(a.pos[0], a.cfg)
+    ship = resolve_ship(a.selector, a.cfg)
+    code, out, verdict = commit_desk(
+        ship, desk, a.cfg, timeout=a.flags.get("-t") or T_COMMIT,
+        remount=bool(a.flags.get("--remount")), interrupt=bool(a.flags.get("--interrupt")),
+        pick=pick)
     if out:
         sys.stdout.write(out + "\n")
         sys.stdout.flush()  # the verdict is the LAST line, even through a pipe
@@ -3407,6 +3423,8 @@ COMMANDS: list[Cmd] = [
         name="dojo", summary="run a dojo command and print what it printed",
         flags=[Flag("-t", "int", f"seconds to wait for the dojo and for CMD (default {T_DOJO})", ph="<secs>"),
                Flag("--yes", "bool", "answer y when CMD asks a (y/N) question"),
+               Flag("--commit", "str", "commit this desk first (as `commit` does); a failed "
+                    "commit stops before CMD", ph="<desk>"),
                Flag("--interrupt", "bool", "past -t, send ONE Ctrl-C to an event still computing; "
                     "a second interrupt of a timer event exits vere")],
         positionals=[Pos("CMD", True, "the dojo command, quoted as one argument")],
@@ -3442,7 +3460,8 @@ COMMANDS: list[Cmd] = [
                  "                     or one key, not a whole map"),
         examples=[f"{INVOKE} sampel-palnet dojo '(add 2 2)'", f"{INVOKE} sampel-palnet dojo -t 60 '+vats'",
                   f"{INVOKE} sampel-palnet dojo -- '-time ~s1'",
-                  f"{INVOKE} sampel-palnet dojo --yes '|nuke %my-app'"],
+                  f"{INVOKE} sampel-palnet dojo --yes '|nuke %my-app'",
+                  f"{INVOKE} sampel-palnet dojo --commit mydesk ':my-app +dbug'"],
         run=cmd_dojo,
     ),
     Cmd(
